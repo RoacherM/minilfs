@@ -1,6 +1,7 @@
 // Project & session bindings (adapted from dsh/packages/host/src/binding.js),
 // plus per-project file locks and host-index manifests for P0-1 / P0-6 / P1-6.
-import { existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { acquireLock, acquireLockSync } from "./lock.ts";
 import { basename, join } from "node:path";
 
 export interface ProjectRecord {
@@ -9,6 +10,8 @@ export interface ProjectRecord {
   volume: string;
   image?: string;
   mainRef: string;
+  /** main in the Store may lag the host (a publish after apply failed): resync on next start */
+  mainStale?: boolean;
   created: number;
   updatedAt: number;
 }
@@ -49,32 +52,6 @@ export function nameFromFolder(folder: string): string {
   return NAME_RE.test(base) ? base : "project";
 }
 
-function acquireDirLock(lockDir: string, timeoutMs = 15_000): () => void {
-  mkdirSync(join(lockDir, ".."), { recursive: true });
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    try {
-      mkdirSync(lockDir);
-      break;
-    } catch (error: any) {
-      if (error?.code !== "EEXIST") throw error;
-      try {
-        if (Date.now() - statSync(lockDir).mtimeMs > 15_000) {
-          rmdirSync(lockDir);
-          continue;
-        }
-      } catch {
-        continue;
-      }
-      if (Date.now() > deadline) throw Object.assign(new Error(`lock busy: ${lockDir}`), { code: "Busy" });
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-    }
-  }
-  return () => {
-    try { rmdirSync(lockDir); } catch {}
-  };
-}
-
 export class BindingStore {
   readonly stateDir: string;
   readonly file: string;
@@ -107,7 +84,8 @@ export class BindingStore {
 
   update<T>(change: (data: BindingsData) => T): T {
     if (this.depth > 0) return change(this._data);
-    const release = acquireDirLock(this.lockDir);
+    const lock = acquireLockSync(this.lockDir);
+    const release = () => lock.release();
     this.depth++;
     try {
       this.stamp = null;
@@ -132,11 +110,11 @@ export class BindingStore {
   /** Serializes project-level mutations (init, host-drift sync, apply + publish) across processes. */
   async withProjectLock<T>(projectName: string, fn: () => Promise<T>, timeoutMs = 60_000): Promise<T> {
     const lockDir = join(this.stateDir, "locks", `${projectName}.lock`);
-    const release = acquireDirLock(lockDir, timeoutMs);
+    const lock = await acquireLock(lockDir, timeoutMs);
     try {
       return await fn();
     } finally {
-      release();
+      lock.release();
     }
   }
 
@@ -175,6 +153,12 @@ export class BindingStore {
         d.projects[name].mainRef = mainRef;
         d.projects[name].updatedAt = Date.now();
       }
+    });
+  }
+
+  setMainStale(name: string, stale: boolean): void {
+    this.update((d) => {
+      if (d.projects[name]) d.projects[name].mainStale = stale;
     });
   }
 

@@ -9,7 +9,7 @@ import { type BoxSpec, createProjectClient, ensureStoreBox } from "./port/client
 
 export interface Workspace { sandbox: string; path: string; image?: string }
 export interface Checkpoint { origins: string[]; label: string; commit: string | null; branch: string; changed: boolean; at: number }
-export interface ApplyResult { applied: string[]; skipped: string[]; conflicts: string[]; unchanged: string[] }
+export interface ApplyResult { applied: string[]; skipped: string[]; conflicts: string[]; unchanged: string[]; warnings: string[] }
 export interface OpenOptions {
   reason?: "startup" | "reload" | "new" | "resume" | "fork";
   resumeBinding?: { project?: string; baseBranch?: string; workBranch?: string; baseRef?: string; headCommit?: string | null };
@@ -27,6 +27,10 @@ export class LayerfsError extends Error {
 }
 
 type Log = (msg: string) => void;
+const RUNNER_ON_HOST = new URL("./port/pi-lfs-run.sh", import.meta.url);
+const RUNNER_IN_CONTAINER = "/run/pi-lfs/pi-lfs-run.sh";
+/** Extra secrets never readable outside the project, on top of config.excludes. */
+const OUTSIDE_SECRET_PATTERNS = [".ssh/", ".aws/", ".gnupg/", ".docker/config.json", ".kube/", ".config/gh/", "auth.json", ".git-credentials"];
 const sha = (b: Buffer | string) => createHash("sha256").update(b).digest("hex");
 
 /**
@@ -136,8 +140,10 @@ export class LayerfsSession {
   }
 
   private async initProjectForFolder(imageId: string): Promise<ProjectRecord> {
-    const name = this.bindings.freeProjectName(this.cwd, this.boxSpec.home);
-    return this.bindings.withProjectLock(name, async () => {
+    // One global init lock: the free project name is chosen inside it (two folders with the
+    // same basename starting at once must not get the same project name).
+    return this.bindings.withProjectLock("_init", async () => {
+      const name = this.bindings.freeProjectName(this.cwd, this.boxSpec.home);
       const again = this.bindings.byFolder(this.cwd);
       if (again && await this.isProjectAlive(again)) {
         const client = await createProjectClient(this.boxSpec, again);
@@ -150,9 +156,17 @@ export class LayerfsSession {
       const staged = join(this.config.root, "staging", `${name}-${created}`);
       await fsp.mkdir(staged, { recursive: true });
       try {
-        const rs = await runLocal("rsync", ["-a", ...this.config.excludes.map((e) => `--exclude=${e}`), `${this.cwd}/`, `${staged}/`]);
+        const rs = await runLocal("rsync", ["-a", ...rsyncExcludeArgs(this.config.excludes), `${this.cwd}/`, `${staged}/`]);
         if (rs.code !== 0) throw new LayerfsError("Failed", `staging copy failed: ${rs.stderr.slice(0, 400)}`);
-        const hostIndex = await scanHostDirectory(this.cwd, this.config.excludes);
+        // Index the staged copy, i.e. exactly what is imported (impl review P1-7); keep host mtimes
+        // so the next start can use the fast path for unchanged files.
+        const stagedScan = await scanHostDirectory(staged, this.config.excludes, {}, true);
+        const hostIndex: HostIndex = {};
+        for (const [rel, ent] of Object.entries(stagedScan.index)) {
+          // rsync -a keeps mtimes: the staged mtime is the host mtime at copy time. If the host file
+          // changed after the copy, its mtime differs and the next scan re-hashes it.
+          hostIndex[rel] = ent;
+        }
         const lwwPath = join(staged, ".lww");
         const hadLww = await fsp.access(lwwPath).then(() => true, () => false);
         if (!hadLww) await fsp.writeFile(lwwPath, "%include .gitignore\n");
@@ -179,24 +193,31 @@ export class LayerfsSession {
     });
   }
 
-  /** P0-6 fix: detects host file edits / git pull outside Pi and syncs them into `"main"` before forking. */
-  async syncHostDriftIntoMain(): Promise<{ synced: string[] }> {
+  /**
+   * Detects host edits made outside Pi (editor, git pull) and syncs them into "main" before forking
+   * (design P0-6). Implementation review fixes: a failed step aborts the sync instead of publishing
+   * a partial result (P1-5); unreadable directories abort instead of looking deleted (P1-6); each
+   * file is read once and the same bytes are hashed and stored (P1-8); `full` re-hashes everything
+   * (mtime-preserving copies, P1-9); a project flagged mainStale is compared in full.
+   */
+  async syncHostDriftIntoMain(options: { full?: boolean } = {}): Promise<{ synced: string[] }> {
     return this.bindings.withProjectLock(this.projectRecord.name, async () => {
-      const prev = this.bindings.readHostIndex(this.projectRecord.name);
-      const curr = await scanHostDirectory(this.cwd, this.config.excludes, prev);
+      const full = options.full || Boolean(this.bindings.byName(this.projectRecord.name)?.mainStale);
+      // Full mode compares the host against main's actual content, not against the host index:
+      // after a failed publish the index matches the host while main lags behind (impl review P0-2).
+      const prev = full ? await this.mainIndex() : this.bindings.readHostIndex(this.projectRecord.name);
+      const scanned = await scanHostDirectory(this.cwd, this.config.excludes, full ? {} : prev, true);
+      const curr = scanned.index;
       const changed: string[] = [];
       const removed: string[] = [];
       for (const [rel, ent] of Object.entries(curr)) {
         const old = prev[rel];
-        if (!old || old.kind !== ent.kind || old.sig !== ent.sig || (ent.kind === "file" && old.mode !== ent.mode)) {
-          changed.push(rel);
-        }
+        if (!old || !sameSig(old, ent)) changed.push(rel);
       }
-      for (const rel of Object.keys(prev)) {
-        if (!curr[rel]) removed.push(rel);
-      }
+      for (const rel of Object.keys(prev)) if (!curr[rel]) removed.push(rel);
       if (!changed.length && !removed.length) {
         this.bindings.writeHostIndex(this.projectRecord.name, curr);
+        if (full) this.bindings.setMainStale(this.projectRecord.name, false);
         return { synced: [] };
       }
 
@@ -204,56 +225,67 @@ export class LayerfsSession {
       await this.lfs.branch.fork(syncBranch, "main");
       const storeOps: any[] = [];
       const mountJobs: Array<{ rel: string; entry: HostEntry }> = [];
-
-      for (const rel of removed) {
-        storeOps.push({ op: "rm", path: `/${rel}` });
-      }
+      for (const rel of removed) storeOps.push({ op: "rm", path: `/${rel}` });
       for (const rel of changed) {
         const ent = curr[rel];
         const prevEnt = prev[rel];
-        const modeChanged = ent.kind === "file" && ((prevEnt && prevEnt.mode !== ent.mode) || (!prevEnt && ((ent.mode ?? 0o644) & 0o111) !== 0));
-        if (ent.kind === "symlink" || modeChanged || prevEnt?.kind === "symlink") {
+        const exec = ((ent.mode ?? 0o644) & 0o111) !== 0;
+        if (ent.kind === "symlink" || prevEnt?.kind === "symlink" || exec || (prevEnt?.mode !== undefined && ((prevEnt.mode ^ (ent.mode ?? 0o644)) & 0o111))) {
           mountJobs.push({ rel, entry: ent });
         } else {
           const dir = posix.dirname(`/${rel}`);
           if (dir !== "/") storeOps.push({ op: "mkdir", path: dir });
-          const bytes = await fsp.readFile(join(this.cwd, rel));
-          storeOps.push({ op: "write", path: `/${rel}`, bytes });
+          storeOps.push({ op: "write", path: `/${rel}`, bytes: scanned.bytes.get(rel) ?? (await fsp.readFile(join(this.cwd, rel))) });
         }
       }
-
       if (storeOps.length) {
-        await this.lfs.fs.apply(syncBranch, storeOps, "sync host drift").catch(async () => {
-          for (const rel of changed) {
-            if (!mountJobs.some((m) => m.rel === rel)) mountJobs.push({ rel, entry: curr[rel] });
-          }
-          for (const rel of removed) {
-            await this.lfs.fs.rm(syncBranch, `/${rel}`, "sync rm").catch(() => {});
-          }
-        });
+        // one atomic Commit; any refusal (incl. Unknown) aborts the sync before publish
+        await this.lfs.fs.apply(syncBranch, storeOps, "sync host drift");
       }
-
       if (mountJobs.length) {
         await this.withMountedBranch(syncBranch, true, "sync host special files", async (ctr, ident, wsPath) => {
           for (const { rel, entry } of mountJobs) {
             const dst = posix.join(wsPath, rel);
-            if (entry.kind === "symlink") {
-              const target = entry.sig.slice("link:".length);
-              await this.dexec(ctr, ident, `mkdir -p "$(dirname "$1")" && rm -rf "$1" && ln -s "$2" "$1"`, [dst, target]);
-            } else {
-              const bytes = await fsp.readFile(join(this.cwd, rel));
-              const modeOct = ((entry.mode ?? 0o644) & 0o7777).toString(8);
-              await this.dexec(ctr, ident, `mkdir -p "$(dirname "$1")" && rm -f "$1" && cat > "$1" && chmod "$2" "$1"`, [dst, modeOct], bytes);
-            }
+            const r = entry.kind === "symlink"
+              ? await this.dexec(ctr, ident, `mkdir -p "$(dirname "$1")" && rm -rf "$1" && ln -s "$2" "$1"`, [dst, entry.sig.slice("link:".length)])
+              : await this.dexec(ctr, ident, `mkdir -p "$(dirname "$1")" && rm -f "$1" && cat > "$1" && chmod "$2" "$1"`, [dst, ((entry.mode ?? 0o644) & 0o7777).toString(8)], scanned.bytes.get(rel) ?? (await fsp.readFile(join(this.cwd, rel))));
+            if (r.code !== 0) throw new LayerfsError("Failed", `sync of ${rel} failed: ${r.stderr.toString().trim().slice(0, 200)}`);
           }
         });
       }
-
       const pub = await this.lfs.branch.publish(syncBranch);
       this.projectRecord.mainRef = pub.layer ?? this.projectRecord.mainRef;
       this.bindings.updateProjectMain(this.projectRecord.name, this.projectRecord.mainRef);
-      this.bindings.writeHostIndex(this.projectRecord.name, curr);
+      this.bindings.writeHostIndex(this.projectRecord.name, curr); // only after a successful publish
+      this.bindings.setMainStale(this.projectRecord.name, false);
       return { synced: [...changed, ...removed] };
+    });
+  }
+
+  /** Signatures of every file in main (content + exec bit / link target), read via one short mount. */
+  private async mainIndex(): Promise<HostIndex> {
+    const tmp = `r-${this.shortId}-${(++this.seq)}`;
+    await this.lfs.branch.fork(tmp, "main");
+    return this.withMountedBranch(tmp, false, "main index", async (ctr, ident, wsPath) => {
+      // The bash script travels as "$2" (argv), so its quotes need no escaping inside sh -c.
+      const script = [
+        `cd "$1" || exit 1`,
+        `find . \\( -name .git -prune \\) -o \\( -type f -o -type l \\) -print0 | while IFS= read -r -d '' f; do`,
+        `  f="\${f#./}"; [ "$f" = .lww ] && continue`,
+        `  if [ -L "$f" ]; then printf 'L\\t%s\\t%s\\0' "$f" "$(readlink -- "$f")"`,
+        `  else printf 'F\\t%s\\t%s\\t%s\\0' "$f" "$(sha256sum -- "$f" | cut -d' ' -f1)" "$(stat -c %a -- "$f")"; fi`,
+        `done`,
+      ].join("\n");
+      const r = await this.dexec(ctr, ident, `exec bash -c "$2" _ "$1"`, [wsPath, script]);
+      if (r.code !== 0) throw new LayerfsError("Failed", `cannot index main: ${r.stderr.toString().slice(0, 200)}`);
+      const index: HostIndex = {};
+      for (const rec of r.stdout.toString().split("\0")) {
+        if (!rec) continue;
+        const [t, rel, a, b] = rec.split("\t");
+        if (isExcludedPath(rel, this.config.excludes)) continue;
+        index[rel] = t === "L" ? linkSig(a) : { kind: "file", sig: a, mode: parseInt(b || "644", 8) };
+      }
+      return index;
     });
   }
 
@@ -446,7 +478,12 @@ export class LayerfsSession {
 
   async readFile(hostPath: string): Promise<Buffer> {
     const sp = this.toStorePath(hostPath);
-    if (!sp) return fsp.readFile(resolve(this.cwd, hostPath));
+    if (!sp) {
+      // Outside the project: read-only host access, but never secret files (impl review item 17)
+      const abs = resolve(this.cwd, hostPath);
+      if (isExcludedPath(abs, this.config.excludes) || isExcludedPath(abs, OUTSIDE_SECRET_PATTERNS)) throw enoent(hostPath, "secret file outside the project is not readable");
+      return fsp.readFile(abs);
+    }
     return this.readBytesAtRef(this.workBranch, sp, hostPath);
   }
 
@@ -628,10 +665,11 @@ export class LayerfsSession {
         ...(globPatterns ? globPatterns.map((g) => `--include=${g}`) : []),
       ].filter(Boolean);
       const isDir = await this.isDirectory(targetHost);
+      // Flags, pattern and target travel as argv ("$@"), never interpolated into the script (impl review P1-15)
       const script = isDir
-        ? `cd "$1" && grep ${flags.map((f) => `'${f}'`).join(" ")} -e "$2" -- .`
-        : `cd "$(dirname "$1")" && grep ${flags.map((f) => `'${f}'`).join(" ")} -e "$2" -- "$(basename "$1")"`;
-      const r = await this.dexec(ctr, ident, script, [targetWs, params.pattern]);
+        ? `t="$1"; shift; cd "$t" && exec grep "$@" -- .`
+        : `t="$1"; shift; cd "$(dirname "$t")" && exec grep "$@" -- "$(basename "$t")"`;
+      const r = await this.dexec(ctr, ident, script, [targetWs, ...flags, "-e", params.pattern]);
       if (r.code === 1) return { lines: [], matches: 0, limitReached: false };
       if (r.code !== 0) throw new Error(r.stderr.trim() || "grep failed");
       const lines: string[] = [];
@@ -739,11 +777,13 @@ export class LayerfsSession {
     if (options.signal?.aborted) throw new Error("aborted");
     const ws = await this.lfs.workspace.mount(this.workBranch);
     const { container, ident } = await this.containerAndIdent(ws);
-    const wsCwd = this.toWsPath(ws.path, hostCwd) ?? ws.path;
-    const rewrittenCmd = command.replaceAll(this.cwd, ws.path);
+    const [uid, gid] = ident.split(":");
+    // The command sees the Workspace at the host's own cwd path (per-exec private mount namespace),
+    // so no string rewriting of the command is needed (impl review P1-11).
+    const runCwd = this.toRel(hostCwd) === null ? this.cwd : resolve(this.cwd, hostCwd);
 
     const tag = `${this.shortId}-${randomBytes(4).toString("hex")}`;
-    const sidFile = `/tmp/pi-lfs-${tag}.sid`;
+    const sidFile = `/run/pi-lfs/${tag}.sid`; // root-owned: commands (uid ${uid}) cannot tamper with it
     const envArgs: string[] = [];
     for (const [k, v] of Object.entries(options.env ?? {})) {
       if (typeof v === "string" && (k.startsWith("PI_") || this.config.envAllow.includes(k))) {
@@ -751,26 +791,26 @@ export class LayerfsSession {
       }
     }
 
-    const script = `echo $$ > ${sidFile}; ${gitHidePrelude(this.config.excludes)} cd "$1" || exit 1; exec bash -c "$0"`;
+    await this.ensureRunner(container);
     const child = spawn(
       this.config.docker,
-      ["exec", "-u", ident, "-e", "HOME=/tmp", ...envArgs, "-w", ws.path, container, "setsid", "-w", "bash", "-c", script, rewrittenCmd, wsCwd, ws.path],
+      [
+        "exec", "-u", "0", "-e", "HOME=/tmp", "-e", `PI_LFS_EXCLUDES=${this.config.excludes.join(",")}`, ...envArgs, container,
+        "setsid", "-w", RUNNER_IN_CONTAINER, sidFile, ws.path, this.cwd, runCwd, uid, gid, command,
+      ],
       { stdio: ["ignore", "pipe", "pipe"], env: dockerEnv() },
     );
-    let errText = "";
     child.stdout.on("data", options.onData);
-    child.stderr.on("data", (d) => {
-      errText = (errText + d).slice(-2000);
-      options.onData(d);
-    });
+    child.stderr.on("data", options.onData);
 
     let stopping: Promise<void> | null = null;
-    const kill = () => (stopping ??= this.killSession(container, sidFile));
+    const kill = () => (stopping ??= this.killSession(container, sidFile, child));
     this.activeSids.set(tag, kill);
     let timedOut = false;
     const timer = options.timeout && options.timeout > 0 ? setTimeout(() => { timedOut = true; void kill(); }, options.timeout * 1000) : undefined;
     const onAbort = () => void kill();
     options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) void kill(); // aborted while mounting (impl review P1-12)
 
     let keepMounted = false;
     try {
@@ -779,16 +819,19 @@ export class LayerfsSession {
         child.on("close", (c) => resolveCode(c));
       });
       if (stopping) await stopping;
-      if (code === 1 || code === 125 || code === 126) this.checkSandbox(container, errText);
 
       await this.reapHolders(container, ident, ws.path).catch(() => {});
       await this.dexec(container, ident, `if [ ! -f "$1/.lww" ]; then printf '%%include .gitignore\\n' > "$1/.lww"; fi`, [ws.path]).catch(() => {});
 
+      // Always try to commit what the command changed, even after failures (impl review P1-13)
       const msg = `pi bash (exit ${code ?? "sig"}) [${this.pendingOrigins.join(",") || "bash"}]`.slice(0, 4000);
       try {
         const res = await this.lfs.workspace.commit(ws, msg);
         this.lastStoreCommit = { kind: res.kind, head: res.commit?.id ?? res.head ?? null };
       } catch (ce: any) {
+        if (!(await this.containerRunning(container))) {
+          throw new LayerfsError("SandboxGone", `the LayerFS Sandbox ${container} is gone; committed work is safe in volume ${this.volume}.`);
+        }
         keepMounted = true;
         this.blocked = { reason: `${ce?.code ?? "Error"}: ${String(ce?.message ?? ce).slice(0, 200)}`, heldWs: ws };
       }
@@ -808,16 +851,46 @@ export class LayerfsSession {
     }
   }
 
-  private async killSession(container: string, sidFile: string): Promise<void> {
-    const g = Math.max(0.1, this.config.killGraceMs / 1000);
-    const script = `sid=$(cat ${sidFile} 2>/dev/null) || exit 0; [ -n "$sid" ] || exit 0; pkill -TERM -s "$sid"; i=0; while pgrep -s "$sid" >/dev/null && [ $i -lt $(awk "BEGIN{print int(${g}*10)}") ]; do sleep 0.1; i=$((i+1)); done; pkill -KILL -s "$sid"; true`;
-    await run(this.config.docker, ["exec", "-u", "0", container, "sh", "-c", script], { timeoutMs: this.config.killGraceMs + 15_000 });
+  private runnerReady = new Set<string>();
+  /** Copies pi-lfs-run.sh into the Sandbox once (root-owned, 0755). */
+  private async ensureRunner(container: string): Promise<void> {
+    if (this.runnerReady.has(container)) return;
+    const script = await fsp.readFile(RUNNER_ON_HOST);
+    const r = await run(this.config.docker, ["exec", "-i", "-u", "0", container, "sh", "-c", `mkdir -p /run/pi-lfs && cat > ${RUNNER_IN_CONTAINER} && chmod 0755 ${RUNNER_IN_CONTAINER}`], { input: script, timeoutMs: 20_000 });
+    if (r.code !== 0) {
+      this.checkSandbox(container, r.stderr);
+      throw new LayerfsError("Failed", `cannot install the command runner in ${container}: ${r.stderr.trim().slice(0, 200)}`);
+    }
+    this.runnerReady.add(container);
   }
 
+  private async containerRunning(container: string): Promise<boolean> {
+    const r = await run(this.config.docker, ["inspect", "-f", "{{.State.Running}}", container], { timeoutMs: 10_000 }).catch(() => null);
+    return r?.code === 0 && r.stdout.toString().trim() === "true";
+  }
+
+  /** TERM the command's session, wait, KILL; retries while the SID is not recorded yet. */
+  private async killSession(container: string, sidFile: string, child?: ReturnType<typeof spawn>): Promise<void> {
+    const g = Math.max(0.1, this.config.killGraceMs / 1000);
+    const script = [
+      `i=0; while [ ! -s ${sidFile} ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done;`,
+      `sid=$(cat ${sidFile} 2>/dev/null); [ -n "$sid" ] || exit 3;`,
+      `pkill -TERM -s "$sid"; i=0; while pgrep -s "$sid" >/dev/null && [ $i -lt $(awk "BEGIN{print int(${g}*10)}") ]; do sleep 0.1; i=$((i+1)); done;`,
+      `pkill -KILL -s "$sid"; true`,
+    ].join(" ");
+    const r = await run(this.config.docker, ["exec", "-u", "0", container, "sh", "-c", script], { timeoutMs: this.config.killGraceMs + 20_000 }).catch(() => null);
+    if (!r || r.code !== 0) {
+      // the session was never recorded or docker failed: at least stop the local client
+      try { child?.kill("SIGKILL"); } catch {}
+    }
+  }
+
+  /** Kills only processes of this Workspace: cwd inside it (path compared literally, no glob). */
   private async reapHolders(container: string, ident: string, wsPath: string): Promise<void> {
     await run(this.config.docker, [
       "exec", "-u", ident, container, "sh", "-c",
-      `for p in /proc/[0-9]*; do c=$(readlink $p/cwd 2>/dev/null); case "$c" in ${wsPath}|${wsPath}/*) kill -KILL "\${p#/proc/}" 2>/dev/null;; esac; done; true`,
+      `for p in /proc/[0-9]*; do c=$(readlink "$p/cwd" 2>/dev/null) || continue; if [ "$c" = "$1" ] || [ "\${c#"$1"/}" != "$c" ]; then kill -KILL "\${p#/proc/}" 2>/dev/null; fi; done; true`,
+      "_", wsPath,
     ]);
   }
 
@@ -913,55 +986,86 @@ export class LayerfsSession {
     return items;
   }
 
+  /** Signature (content + exec bit, or link target) of `rel` at `branch`. One short mount reads both. */
   private async readSigAtBranch(branch: string, rel: string): Promise<HostEntry | null> {
     const sp = `/${rel}`;
     const st = await this.lfs.fs.stat(branch, sp).catch(() => null);
-    if (!st) return null;
-    if (st.type === "symlink") {
-      return this.withMountedBranch(branch, false, "read link", async (ctr, ident, wsPath) => {
-        const r = await this.dexec(ctr, ident, `readlink -- "$1"`, [posix.join(wsPath, rel)]);
-        if (r.code !== 0) return null;
-        return { kind: "symlink", sig: `link:${r.stdout.toString().replace(/\n$/, "")}` };
-      });
-    }
-    const data = await this.readBytesAtRef(branch, sp);
-    return { kind: "file", sig: sha(data) };
+    if (!st || st.type === "dir") return null;
+    return this.withMountedBranch(branch, false, "read base", async (ctr, ident, wsPath) => {
+      const p = posix.join(wsPath, rel);
+      if (st.type === "symlink") {
+        const r = await this.dexec(ctr, ident, `readlink -- "$1"`, [p]);
+        return r.code === 0 ? linkSig(r.stdout.toString().replace(/\n$/, "")) : null;
+      }
+      const cat = await this.dexec(ctr, ident, `cat -- "$1"`, [p]);
+      if (cat.code !== 0) return null;
+      const m = await this.dexec(ctr, ident, `stat -c %a -- "$1"`, [p]);
+      return fileSig(cat.stdout, parseInt(m.stdout.toString().trim() || "644", 8));
+    });
   }
 
   /**
-   * P0-1 & P0-4 safe apply:
-   * 1. Diffs `this.baseBranch` -> `this.workBranch` (only files changed by THIS session).
-   * 2. Skips `.git/**`, `.lww`, and `this.config.excludes` (`.env`, etc. are never overwritten).
-   * 3. Reads `baseSig` from `this.baseBranch` in the Store (immutable, never clobbered by another session).
-   * 4. Refuses the entire apply if any file was modified on the host (`hostSig !== baseSig && hostSig !== wantSig`),
-   *    including `Added` files that already exist on the host (`baseSig === null && hostSig !== null`).
-   * 5. Atomically writes changes to the host, merges with `"main"` if another session advanced `"main"`,
-   *    publishes the new `"main"`, and advances `this.baseBranch` to `this.workBranch`.
+   * Safe apply (design P0-1/P0-4 + implementation review P0-1, P1-1..P1-4, item 9):
+   * - Runs inside the session mutex on a pinned snapshot: diff, reads and the base advance all use
+   *   the same Commit, so changes made while apply runs are never skipped (they stay unapplied).
+   * - Diffs this session's base -> pinned head only; skips .git, .lww and excludes.
+   * - Three-way check per file (base from the base Branch, host on disk, want from the snapshot):
+   *   host == want -> unchanged; host != base -> conflict; directories / special files on the
+   *   host where a file goes -> conflict. Signatures include the executable bit.
+   * - Refuses to move the host backwards: if the snapshot is older than the base (after /tree),
+   *   the apply is refused unless `allowRevert`.
+   * - Re-checks each host file right before writing it (TOCTOU), deletes deepest-first then
+   *   writes shallowest-first, records each written file in the host index immediately, and on a
+   *   mid-way failure reports what was written and removes leftover temp files.
+   * - Advances main in the Store (merge first if it moved); a failure there is reported, and the
+   *   project is marked mainStale so the next session start resyncs main from the host.
    */
-  async apply(): Promise<ApplyResult> {
+  async apply(options: { allowRevert?: boolean } = {}): Promise<ApplyResult> {
+    const job = this.mutex.then(() => this.applyLocked(options));
+    this.mutex = job.catch(() => {});
+    return job;
+  }
+
+  private async applyLocked(options: { allowRevert?: boolean }): Promise<ApplyResult> {
     if (this.blocked) {
       throw new Error(`cannot apply while a checkpoint is pending (${this.blocked.reason}); run /layerfs retry`);
     }
-    await this.mutex;
     return this.bindings.withProjectLock(this.projectRecord.name, async () => {
-      const items = (await this.diff()).filter((i) => i.type !== "dir");
-      const result: ApplyResult = { applied: [], skipped: [], conflicts: [], unchanged: [] };
+      const result: ApplyResult = { applied: [], skipped: [], conflicts: [], unchanged: [], warnings: [] };
+      const snapRef = this.headCommit ?? this.baseRef;
+      // A Branch pinned at the snapshot: reads and the diff never see later commits.
+      this.seq++;
+      const snapBranch = `a-${this.shortId}-${this.seq}`;
+      await this.lfs.branch.fork(snapBranch, snapRef);
+
+      if (!options.allowRevert && this.headCommit && (await this.isAncestorOfBase(this.headCommit))) {
+        throw new LayerfsError("WouldRevert", "this branch is behind what was already applied (you went back with /tree); applying would revert files on disk. Use /layerfs apply --revert to do that on purpose.");
+      }
+
+      const items: Array<{ path: string; kind: string; type: string }> = [];
+      for (let pos = 0; ; ) {
+        const page = await this.lfs.branch.diff_branches(this.baseBranch, snapBranch, 1000, pos, { hunks: false });
+        for (const it of page.items ?? []) if (it.type !== "dir") items.push({ path: it.path, kind: it.kind, type: it.type });
+        if (!page.hasMore || !(page.items ?? []).length) break;
+        pos = page.nextPagePos ?? (pos + page.items.length);
+      }
       if (!items.length) {
         this.unapplied = false;
         this.persistSessionBinding();
         return result;
       }
 
-      const plan: Array<{ rel: string; next: { kind: "file"; data: Buffer; mode: number } | { kind: "symlink"; target: string } | null }> = [];
+      type Next = { kind: "file"; data: Buffer; mode: number } | { kind: "symlink"; target: string } | null;
+      const plan: Array<{ rel: string; next: Next; host: HostEntry | null }> = [];
 
-      await this.withMountedBranch(this.workBranch, false, "apply read", async (ctr, ident, wsPath) => {
+      await this.withMountedBranch(snapBranch, false, "apply read", async (ctr, ident, wsPath) => {
         for (const it of items) {
           const rel = it.path.replace(/^\/+/, "");
           if (rel === ".lww" || rel === ".git" || rel.startsWith(".git/") || isExcludedPath(rel, this.config.excludes)) {
             result.skipped.push(rel);
             continue;
           }
-          let next: (typeof plan)[number]["next"] = null;
+          let next: Next = null;
           if (it.kind !== "Removed") {
             const p = posix.join(wsPath, rel);
             if (it.type === "symlink") {
@@ -975,82 +1079,112 @@ export class LayerfsSession {
               next = { kind: "file", data: cat.stdout, mode: parseInt(st.stdout.toString().trim() || "644", 8) };
             }
           }
-
-          const host = await signatureOfHost(join(this.cwd, rel));
+          const host = await hostState(join(this.cwd, rel));
+          if (host === "other") { result.conflicts.push(rel); continue; } // a directory or special file is in the way
           const base = it.kind === "Added" ? null : await this.readSigAtBranch(this.baseBranch, rel);
-          const want = next
-            ? next.kind === "file"
-              ? ({ kind: "file", sig: sha(next.data) } as const)
-              : ({ kind: "symlink", sig: `link:${next.target}` } as const)
-            : null;
-
-          if (sameSig(host, want)) {
-            result.unchanged.push(rel);
-            continue;
-          }
-          if (!sameSig(host, base)) {
-            result.conflicts.push(rel);
-            continue;
-          }
-          plan.push({ rel, next });
+          const want = next ? (next.kind === "file" ? fileSig(next.data, next.mode) : linkSig(next.target)) : null;
+          if (sameSig(host, want)) { result.unchanged.push(rel); continue; }
+          if (!sameSig(host, base)) { result.conflicts.push(rel); continue; }
+          plan.push({ rel, next, host });
         }
       });
 
       if (result.conflicts.length) return result;
 
+      // Removals deepest-first, then writes shallowest-first (file <-> directory changes stay valid).
+      const depth = (r: string) => r.split("/").length;
+      const ordered = [
+        ...plan.filter((p) => !p.next).sort((a, b) => depth(b.rel) - depth(a.rel)),
+        ...plan.filter((p) => p.next).sort((a, b) => depth(a.rel) - depth(b.rel)),
+      ];
       const hostIndex = this.bindings.readHostIndex(this.projectRecord.name);
-      for (const { rel, next } of plan) {
-        const target = join(this.cwd, rel);
-        if (!next) {
-          await fsp.rm(target, { force: true });
-          delete hostIndex[rel];
-        } else if (next.kind === "symlink") {
-          await fsp.mkdir(dirname(target), { recursive: true });
-          await fsp.rm(target, { force: true });
-          await fsp.symlink(next.target, target);
-          const st = await fsp.lstat(target);
-          hostIndex[rel] = { kind: "symlink", sig: `link:${next.target}`, mtimeMs: st.mtimeMs, size: st.size };
-        } else {
-          await fsp.mkdir(dirname(target), { recursive: true });
-          const tmp = `${target}.pi-layerfs-${randomBytes(4).toString("hex")}`;
-          await fsp.writeFile(tmp, next.data, { mode: next.mode & 0o7777 });
-          await fsp.chmod(tmp, next.mode & 0o7777);
-          await fsp.rename(tmp, target);
-          const st = await fsp.lstat(target);
-          hostIndex[rel] = { kind: "file", sig: sha(next.data), mode: next.mode & 0o7777, mtimeMs: st.mtimeMs, size: st.size };
+      const tmps: string[] = [];
+      try {
+        for (const { rel, next, host } of ordered) {
+          const target = join(this.cwd, rel);
+          // Re-check right before writing: the user may have saved the file meanwhile (TOCTOU).
+          const now = await hostState(target);
+          if (now === "other" || !sameSig(now, host)) {
+            result.conflicts.push(rel);
+            throw new LayerfsError("ChangedDuringApply", `${rel} changed on disk while applying`);
+          }
+          if (!next) {
+            await fsp.rm(target, { force: true });
+            delete hostIndex[rel];
+            await removeEmptyParents(this.cwd, rel);
+          } else if (next.kind === "symlink") {
+            await fsp.mkdir(dirname(target), { recursive: true });
+            await fsp.rm(target, { force: true });
+            await fsp.symlink(next.target, target);
+            const st = await fsp.lstat(target);
+            hostIndex[rel] = { ...linkSig(next.target), mtimeMs: st.mtimeMs, size: st.size };
+          } else {
+            await fsp.mkdir(dirname(target), { recursive: true });
+            const tmp = join(dirname(target), `.${posix.basename(rel)}.pi-layerfs-${randomBytes(4).toString("hex")}`);
+            tmps.push(tmp);
+            await fsp.writeFile(tmp, next.data, { mode: next.mode & 0o7777 });
+            await fsp.chmod(tmp, next.mode & 0o7777);
+            await fsp.rename(tmp, target);
+            tmps.pop();
+            const st = await fsp.lstat(target);
+            hostIndex[rel] = { ...fileSig(next.data, next.mode), mode: next.mode & 0o7777, mtimeMs: st.mtimeMs, size: st.size };
+          }
+          result.applied.push(rel);
+          this.bindings.writeHostIndex(this.projectRecord.name, hostIndex); // progress survives a later failure
         }
-        result.applied.push(rel);
+      } catch (e: any) {
+        for (const t of tmps) await fsp.rm(t, { force: true }).catch(() => {});
+        this.bindings.writeHostIndex(this.projectRecord.name, hostIndex);
+        const err = new LayerfsError(e?.code ?? "PartialApply", `apply stopped after ${result.applied.length} file(s): ${e?.message ?? e}`);
+        (err as any).result = result;
+        throw err;
       }
-      this.bindings.writeHostIndex(this.projectRecord.name, hostIndex);
 
-      // Advance "main" in the Store: merge first if another session published since our baseBranch
+      // Advance main in the Store; never swallow a failure (impl review P0-2).
       try {
         const mainVsBase = await this.lfs.branch.diff_branches("main", this.baseBranch, 1, 0, { hunks: false });
-        const mainUnchanged = mainVsBase.from?.root && mainVsBase.from?.root === mainVsBase.to?.root;
-        let toPublish = this.workBranch;
+        const mainUnchanged = Boolean(mainVsBase.from?.root) && mainVsBase.from?.root === mainVsBase.to?.root;
+        let toPublish = snapBranch;
         if (!mainUnchanged) {
           const merged = `m-${this.shortId}-${(++this.seq)}`;
-          await this.lfs.branch.merge("main", this.workBranch, merged, "merge applied session");
+          const m = await this.lfs.branch.merge("main", snapBranch, merged, "merge applied session");
+          if (m?.kind && m.kind !== "Merged" && m.kind !== "FastForward" && m.kind !== "UpToDate") throw new Error(`merge answered ${m.kind}`);
           toPublish = merged;
         }
-        if (this.headCommit !== null || toPublish !== this.workBranch) {
-          const pub = await this.lfs.branch.publish(toPublish);
-          if (pub?.layer) this.bindings.updateProjectMain(this.projectRecord.name, pub.layer);
-        }
-      } catch {
-        // Host files are already updated and hostIndex is saved; a publish/merge error on main does not undo host writes
+        const pub = await this.lfs.branch.publish(toPublish);
+        if (pub?.layer) this.bindings.updateProjectMain(this.projectRecord.name, pub.layer);
+        this.bindings.setMainStale(this.projectRecord.name, false);
+      } catch (e: any) {
+        this.bindings.setMainStale(this.projectRecord.name, true);
+        result.warnings.push(`your folder is updated, but LayerFS main could not be updated (${e?.code ?? "Error"}: ${String(e?.message ?? e).slice(0, 160)}); the next session will resync main from your folder`);
       }
 
-      // Advance this session's baseBranch anchor to workBranch's current state
+      // Advance the base anchor to the applied snapshot (not to whatever head is now).
       this.seq++;
       const nextBase = `b-${this.shortId}-${this.seq}`;
-      const fb = await this.lfs.branch.fork(nextBase, this.headCommit ?? this.baseRef);
+      const fb = await this.lfs.branch.fork(nextBase, snapRef);
       this.baseBranch = nextBase;
       this.baseRef = fb.head ?? fb.base;
-      this.unapplied = false;
+      this.unapplied = this.headCommit !== snapRef;
       this.persistSessionBinding();
       return result;
     });
+  }
+
+  /** True when `commit` is already contained in the base anchor (i.e. applying it would go backwards). */
+  private async isAncestorOfBase(commit: string): Promise<boolean> {
+    if (commit === this.baseRef) return false;
+    try {
+      for (let pos = 0; pos < 2000; ) {
+        const page = await this.lfs.branch.list_commits(this.baseBranch, 200, pos);
+        for (const c of page.items ?? []) if (c.id === commit) return true;
+        if (!page.hasMore || !(page.items ?? []).length) break;
+        pos = page.nextPagePos ?? (pos + page.items.length);
+      }
+    } catch {
+      // base Branch with no Commits: nothing applied after the session start
+    }
+    return false;
   }
 
   // ---------------------------------------------------------------- shutdown
@@ -1078,34 +1212,78 @@ function enoent(path: string, why: string) {
   return Object.assign(new Error(`ENOENT: ${path}: ${why.trim() || "not found"}`), { code: "ENOENT" });
 }
 
-function sameSig(a: { kind: string; sig: string } | null, b: { kind: string; sig: string } | null) {
+function sameSig(a: { kind: string; sig: string; mode?: number } | null, b: { kind: string; sig: string; mode?: number } | null) {
   if (!a || !b) return a === b;
-  return a.kind === b.kind && a.sig === b.sig;
+  if (a.kind !== b.kind || a.sig !== b.sig) return false;
+  // the executable bit counts (impl review P1-4); unknown modes are not compared
+  if (a.kind === "file" && a.mode !== undefined && b.mode !== undefined) return (a.mode & 0o111) === (b.mode & 0o111);
+  return true;
+}
+
+const fileSig = (data: Buffer, mode?: number): HostEntry => ({ kind: "file", sig: sha(data), ...(mode !== undefined ? { mode: mode & 0o7777 } : {}) });
+const linkSig = (target: string): HostEntry => ({ kind: "symlink", sig: `link:${target}` });
+
+/** The host entry at `abs`: null when absent, "other" for a directory / socket / device. */
+async function hostState(abs: string): Promise<HostEntry | null | "other"> {
+  const st = await fsp.lstat(abs).catch((e: any) => (e?.code === "ENOENT" || e?.code === "ENOTDIR" ? null : Promise.reject(e)));
+  if (!st) return null;
+  if (st.isSymbolicLink()) return linkSig(await fsp.readlink(abs));
+  if (st.isFile()) return fileSig(await fsp.readFile(abs), st.mode);
+  return "other";
+}
+
+async function removeEmptyParents(root: string, rel: string): Promise<void> {
+  let dir = posix.dirname(rel);
+  while (dir && dir !== "." && dir !== "/") {
+    try { await fsp.rmdir(join(root, dir)); } catch { return; }
+    dir = posix.dirname(dir);
+  }
 }
 
 /**
- * Shell prelude run before each bash command (workspace root is "$2"):
- * - excluded secret files (e.g. .env) that git tracks but are absent from the Branch are marked
- *   skip-worktree, so `git status` does not report them as deleted and the agent does not "restore" them;
- * - `.lww` (LayerFS merge rules) is listed in `.git/info/exclude`, so it never shows as untracked.
- * Only `.git/` changes, which apply never writes back to the host.
+ * The one exclude matcher (impl review P1-16), used for import, host scans, sync, apply and tool access.
+ * Semantics (gitignore-like, case-insensitive because APFS is):
+ * - a pattern without "/" matches any path component at any depth (".env" hides "a/b/.env" and ".env/x");
+ * - a pattern ending in "/" matches directories (and so everything under them);
+ * - a pattern with "/" elsewhere is anchored at the project root ("config/*.key" or "/secrets").
  */
-export function gitHidePrelude(excludes: string[]): string {
-  const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
-  const specs = excludes.flatMap((e) => [q(`:(glob)${e}`), q(`:(glob)**/${e}`)]).join(" ");
-  return [
-    `if [ -d "$2/.git" ] && command -v git >/dev/null 2>&1; then`,
-    `mkdir -p "$2/.git/info" && (grep -qxF '/.lww' "$2/.git/info/exclude" 2>/dev/null || echo '/.lww' >> "$2/.git/info/exclude");`,
-    // `ls-files -v` prints "S " for entries already marked skip-worktree: leave those (and .git/index) untouched
-    `git -C "$2" ls-files -v -- ${specs} 2>/dev/null | while IFS= read -r line; do t="\${line%% *}"; f="\${line#* }"; [ "$t" = S ] && continue; [ -e "$2/$f" ] || git -C "$2" update-index --skip-worktree -- "$f" 2>/dev/null; done;`,
-    `fi;`,
-  ].join(" ");
+export function isExcludedPath(relPath: string, patterns: string[]): boolean {
+  const rel = relPath.replace(/^\/+/, "").toLowerCase();
+  if (!rel) return false;
+  const parts = rel.split("/");
+  for (const raw of patterns) {
+    let pat = raw.trim().toLowerCase();
+    if (!pat) continue;
+    const dirOnly = pat.endsWith("/");
+    if (dirOnly) pat = pat.slice(0, -1);
+    const anchored = pat.startsWith("/") || pat.includes("/");
+    pat = pat.replace(/^\/+/, "");
+    if (!anchored) {
+      // any component (for dirOnly: any non-final component, or the final one when it is a dir prefix)
+      const comps = dirOnly ? parts.slice(0, -1) : parts;
+      if (comps.some((c) => posix.matchesGlob(c, pat))) return true;
+      continue;
+    }
+    // anchored: the pattern matches the path itself or one of its ancestor directories
+    for (let i = 1; i <= parts.length; i++) {
+      const prefix = parts.slice(0, i).join("/");
+      if (dirOnly && i === parts.length) break;
+      if (posix.matchesGlob(prefix, pat)) return true;
+    }
+  }
+  return false;
 }
 
-export function isExcludedPath(relPath: string, patterns: string[]): boolean {
-  const rel = relPath.replace(/^\/+/, "");
-  const base = posix.basename(rel);
-  return patterns.some((p) => posix.matchesGlob(base, p) || posix.matchesGlob(rel, p));
+/** The same rules as rsync filter arguments (case-insensitive via character classes). */
+export function rsyncExcludeArgs(patterns: string[]): string[] {
+  const ci = (p: string) => p.replace(/[a-z]/gi, (ch) => `[${ch.toLowerCase()}${ch.toUpperCase()}]`);
+  return patterns.map((p) => p.trim()).filter(Boolean).map((p) => {
+    const dirOnly = p.endsWith("/");
+    const body = dirOnly ? p.slice(0, -1) : p;
+    const anchored = body.startsWith("/") || body.includes("/");
+    const rule = `${anchored ? `/${body.replace(/^\/+/, "")}` : body}${dirOnly ? "/" : ""}`;
+    return `--exclude=${ci(rule)}`;
+  });
 }
 
 export function expandBraces(pattern: string): string[] {
@@ -1129,34 +1307,47 @@ async function signatureOfHost(abs: string): Promise<HostEntry | null> {
   return null;
 }
 
-async function scanHostDirectory(root: string, excludes: string[], cache: HostIndex = {}): Promise<HostIndex> {
-  const out: HostIndex = {};
+/**
+ * Scans the host project. `strict`: any error other than ENOENT aborts (an unreadable directory
+ * must never look like a deletion). With `keepBytes`, files whose content was read are returned
+ * so the caller stores exactly the bytes it hashed.
+ */
+async function scanHostDirectory(root: string, excludes: string[], cache: HostIndex = {}, strict = false): Promise<{ index: HostIndex; bytes: Map<string, Buffer> }> {
+  const index: HostIndex = {};
+  const bytes = new Map<string, Buffer>();
   const walk = async (dir: string) => {
-    const entries = await fsp.readdir(dir, { withFileTypes: true }).catch(() => []);
+    let entries;
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch (e: any) {
+      if (e?.code === "ENOENT" || !strict) return;
+      throw new LayerfsError("ScanFailed", `cannot read ${relative(root, dir) || "."}: ${e?.code ?? e}`);
+    }
     for (const ent of entries) {
-      if (ent.name === ".git" || ent.name === ".lww") continue;
+      if (ent.name === ".git" || ent.name === ".lww" || ent.name.includes(".pi-layerfs-")) continue;
       const abs = join(dir, ent.name);
       const rel = relative(root, abs).split("\\").join("/");
       if (isExcludedPath(rel, excludes)) continue;
-      if (ent.isDirectory()) {
-        await walk(abs);
-      } else {
-        const st = await fsp.lstat(abs).catch(() => null);
-        if (!st) continue;
-        const prev = cache[rel];
-        if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size) {
-          out[rel] = prev;
-        } else {
-          const s = await signatureOfHost(abs);
-          if (s) out[rel] = s;
-        }
+      if (ent.isDirectory()) { await walk(abs); continue; }
+      const st = await fsp.lstat(abs).catch((e: any) => (e?.code === "ENOENT" ? null : Promise.reject(e)));
+      if (!st) continue;
+      const prev = cache[rel];
+      if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size && (prev.mode === undefined || prev.mode === (st.mode & 0o7777))) {
+        index[rel] = prev;
+        continue;
+      }
+      if (st.isSymbolicLink()) {
+        index[rel] = { ...linkSig(await fsp.readlink(abs)), mtimeMs: st.mtimeMs, size: st.size };
+      } else if (st.isFile()) {
+        const data = await fsp.readFile(abs);
+        bytes.set(rel, data);
+        index[rel] = { ...fileSig(data, st.mode), mtimeMs: st.mtimeMs, size: st.size };
       }
     }
   };
   await walk(root);
-  return out;
+  return { index, bytes };
 }
-
 function runLocal(cmd: string, args: string[]): Promise<{ code: number | null; stderr: string }> {
   return new Promise((resolveRun) => {
     const child = spawn(cmd, args, { stdio: ["ignore", "ignore", "pipe"] });

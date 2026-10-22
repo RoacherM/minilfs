@@ -295,8 +295,8 @@ export default function layerfsExtension(pi: ExtensionAPI) {
     ["status", "当前分支、checkpoint 数、是否有未写回的改动"],
     ["diff", "列出本会话改了哪些文件"],
     ["history", "本会话的保存历史：每次改动、来自哪个工具、改了哪些文件（可加条数，如 history 50）"],
-    ["apply", "把改动写回你的项目目录（有冲突则一个都不写）"],
-    ["sync", "把你在 Pi 外的改动同步进 LayerFS main"],
+    ["apply", "把改动写回你的项目目录（有冲突则一个都不写；--revert 允许回退已写回的内容）"],
+    ["sync", "把你在 Pi 外的改动同步进 LayerFS main（--full 全量重新校验）"],
     ["branches", "列出项目里所有 LayerFS 分支"],
     ["retry", "checkpoint 失败被锁住后重试"],
   ];
@@ -340,7 +340,7 @@ export default function layerfsExtension(pi: ExtensionAPI) {
         return say(d.length ? d.map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`).join("\n") : "No changes in the LayerFS workspace.");
       }
       if (sub === "sync") {
-        const res = await s.syncHostDriftIntoMain();
+        const res = await s.syncHostDriftIntoMain({ full: argv.includes("--full") });
         return say(res.synced.length ? `Synced ${res.synced.length} host file(s) into main: ${res.synced.join(", ")}` : "Host folder is already in sync with main.");
       }
       if (sub === "retry") {
@@ -349,13 +349,31 @@ export default function layerfsExtension(pi: ExtensionAPI) {
         return say(r.error ? `Retry failed: ${r.error.message}` : "Checkpoint saved; changes are unblocked.", r.error ? "error" : "info");
       }
       if (sub === "apply") {
+        const allowRevert = argv.includes("--revert");
         const d = (await s.diff()).filter((i) => i.type !== "dir" && !hiddenPath(i.path));
         if (!d.length) return say("Nothing to apply.");
         if (ctx.hasUI && !(await ctx.ui.confirm("Apply LayerFS changes to your folder?", d.map((i) => `${i.kind} ${i.path}`).slice(0, 40).join("\n")))) return say("Apply cancelled.");
-        const r = await s.apply();
-        if (r.conflicts.length) return say(`Nothing applied: you changed these files since the session started:\n${r.conflicts.join("\n")}`, "error");
+        let r;
+        try {
+          r = await s.apply({ allowRevert });
+        } catch (e: any) {
+          status(ctx, describe(s));
+          const partial = e?.result as { applied: string[]; conflicts: string[] } | undefined;
+          if (e?.code === "WouldRevert") return say(e.message, "warning");
+          return say([
+            `Apply stopped: ${e?.message ?? e}`,
+            partial?.applied.length ? `Already written to your folder: ${partial.applied.join(", ")}` : "Nothing was written to your folder.",
+            partial?.conflicts.length ? `Changed on disk during apply: ${partial.conflicts.join(", ")}` : "",
+          ].filter(Boolean).join("\n"), "error");
+        }
+        if (r.conflicts.length) return say(`Nothing applied: these files changed on disk since the session started (or are directories now):\n${r.conflicts.join("\n")}`, "error");
         status(ctx, describe(s));
-        return say([`Applied ${r.applied.length} change(s) to ${s.cwd}.`, r.skipped.length ? `Skipped (never applied): ${r.skipped.join(", ")}` : ""].filter(Boolean).join("\n"));
+        return say([
+          `Applied ${r.applied.length} change(s) to ${s.cwd}.`,
+          r.skipped.length ? `Skipped (never applied): ${r.skipped.filter((p) => !hiddenPath(p)).join(", ") || "git metadata"}` : "",
+          ...r.warnings.map((w) => `Warning: ${w}`),
+          s.unapplied ? "Changes made while applying are still pending: run /layerfs apply again." : "",
+        ].filter(Boolean).join("\n"), r.warnings.length ? "warning" : "info");
       }
       return say([`未知子命令 "${sub}"。可用：`, ...SUBCOMMANDS.map(([n, d]) => `  /layerfs ${n.padEnd(9)} ${d}`)].join("\n"), "warning");
     },

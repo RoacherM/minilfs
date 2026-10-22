@@ -165,7 +165,7 @@ try {
     const routed = await session.extensionRunner.emitUserBash({ type: "user_bash", command: "echo user > user.txt && pwd", cwd, excludeFromContext: false });
     assert.ok(routed?.operations, "user_bash must be routed");
     const out = await session.executeBash("echo user > user.txt && pwd", undefined, { operations: routed.operations });
-    assert.match(out.output, /\/workspaces\/\d+/);
+    assert.equal(out.output.trim().split("\n").at(-1), cwd, "commands see the Branch at the host path");
     assert.equal(existsSync(join(cwd, "user.txt")), false);
     assert.ok(main.checkpoints().some((c) => c.data.origins.includes("user_bash")));
   });
