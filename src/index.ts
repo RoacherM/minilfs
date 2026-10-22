@@ -1,12 +1,11 @@
 /**
- * pi-layerfs: every Pi session works in an isolated LayerFS Branch/Workspace
- * by default. The host project folder is only written by `/layerfs apply`.
- *
- *   pi -e /path/to/pi-layerfs            # on by default
- *   PI_LAYERFS=0 pi -e ...  |  pi -e ... --no-layerfs   # explicit opt-out
- *
- * Fail-closed: if LayerFS cannot start, file tools and bash fail with the
- * reason; they never fall back to the host folder.
+ * pi-layerfs v0.2: every Pi session works on an isolated LayerFS Branch in a
+ * shared Project Store by default.
+ * - File tools (`read`, `write`, `edit`, `ls`, `find`, `grep`) go directly to the Store
+ *   with automatic byte-exact Workspace fallback for binary, symlinks and >48KB lines.
+ * - `bash` and `!cmd` mount a Workspace on demand, stream output, and unmount immediately.
+ * - `/resume`, `/tree` and `/fork` restore or branch the file state alongside the conversation.
+ * - The host folder is written only by `/layerfs apply` (with three-way conflict detection).
  */
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -18,6 +17,7 @@ import { resolveConfig } from "./config.ts";
 import { LayerfsSession, type Checkpoint } from "./workspace.ts";
 
 export const CHECKPOINT_ENTRY = "layerfs-checkpoint";
+export const SESSION_ENTRY = "layerfs-session";
 const IMAGE_TYPES: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" };
 
 export default function layerfsExtension(pi: ExtensionAPI) {
@@ -27,7 +27,8 @@ export default function layerfsExtension(pi: ExtensionAPI) {
   let ready: Promise<LayerfsSession> | null = null;
   let disabled = false;
   let startError: Error | null = null;
-  // prototypes for names/schemas/renderers; host tools are rebuilt with the session cwd when opted out
+  let pendingForkRef: string | null = null;
+
   const proto = process.cwd();
   let hostCwd = proto;
   const local = {
@@ -40,7 +41,8 @@ export default function layerfsExtension(pi: ExtensionAPI) {
   const onHost = (name: string, id: string, params: any, signal: any, onUpdate: any) => host[name](hostCwd).execute(id, params, signal, onUpdate);
 
   const status = (ctx: ExtensionContext | undefined, text: string | undefined) => { try { ctx?.ui.setStatus("layerfs", text); } catch {} };
-  const describe = (s: LayerfsSession) => `LayerFS ${s.blocked ? "BLOCKED" : "on"} · ${s.checkpoints.length} checkpoints${s.unapplied ? " · unapplied" : ""}`;
+  const describe = (s: LayerfsSession) =>
+    `LayerFS ${s.blocked ? "BLOCKED" : `on (${s.workBranch})`} · ${s.checkpoints.length} checkpoints${s.unapplied ? " · unapplied" : ""}`;
 
   async function need(): Promise<LayerfsSession> {
     if (disabled) throw new Error("LayerFS is disabled for this run");
@@ -50,7 +52,7 @@ export default function layerfsExtension(pi: ExtensionAPI) {
   }
 
   function report(ctx: ExtensionContext | undefined, s: LayerfsSession, r: { checkpoint: Checkpoint | null; error: Error | null }) {
-    if (r.checkpoint) pi.appendEntry(CHECKPOINT_ENTRY, { ...r.checkpoint, project: s.project, branch: "work" });
+    if (r.checkpoint) pi.appendEntry(CHECKPOINT_ENTRY, { ...r.checkpoint, project: s.project, branch: s.workBranch });
     status(ctx, describe(s));
     return r.error
       ? `\n\n[LayerFS] The change is in the workspace but its checkpoint failed (${(r.error as any).code ?? "Error"}: ${r.error.message}). Further changes are blocked until /layerfs retry succeeds.`
@@ -78,13 +80,13 @@ export default function layerfsExtension(pi: ExtensionAPI) {
     },
     find: {
       exists: (p: string) => s.exists(p),
-      glob: (pattern: string, cwd: string, o: { ignore: string[]; limit: number }) => findInWorkspace(s, pattern, cwd, o),
+      glob: (pattern: string, cwd: string, o: { ignore: string[]; limit: number }) => s.findFiles(pattern, cwd, o),
     },
   });
 
   pi.registerTool({
     ...local.read,
-    async execute(id, params, signal, onUpdate, ctx) {
+    async execute(id, params, signal, onUpdate) {
       if (disabled) return onHost("read", id, params, signal, onUpdate);
       const s = await need();
       return createReadTool(s.cwd, { operations: ops(s).read }).execute(id, params, signal, onUpdate);
@@ -130,7 +132,12 @@ export default function layerfsExtension(pi: ExtensionAPI) {
     async execute(id, params: any, signal, onUpdate) {
       if (disabled) return onHost("grep", id, params, signal, onUpdate);
       const s = await need();
-      return grepInWorkspace(s, params);
+      const g = await s.grepWorkspace(params);
+      if (g.matches === 0) return { content: [{ type: "text" as const, text: "No matches found" }], details: undefined };
+      const limit = Math.max(1, params.limit ?? 100);
+      const t = truncateHead(g.lines.join("\n"), { maxLines: Number.MAX_SAFE_INTEGER });
+      const notes = [g.limitReached ? `${limit} matches limit reached` : "", t.truncated ? `${formatSize(DEFAULT_MAX_BYTES)} limit reached` : ""].filter(Boolean);
+      return { content: [{ type: "text" as const, text: t.content + (notes.length ? `\n\n[${notes.join(". ")}]` : "") }], details: undefined };
     },
   });
 
@@ -149,9 +156,54 @@ export default function layerfsExtension(pi: ExtensionAPI) {
     };
   });
 
-  // ------------------------------------------------------------- lifecycle
+  // ------------------------------------------------------------- lifecycle & tree / fork / resume
 
-  pi.on("session_start", async (_event, ctx) => {
+  /** Extracts the snapshot ref and session binding along a session entry chain (up to optional `stopAtEntryId`). */
+  function inspectBranchEntries(entries: any[], stopAtEntryId?: string, inclusive = true) {
+    let baseRef: string | undefined;
+    let baseBranch: string | undefined;
+    let workBranch: string | undefined;
+    let project: string | undefined;
+    let headCommit: string | null = null;
+    for (const e of entries) {
+      if (stopAtEntryId && e.id === stopAtEntryId && !inclusive) break;
+      if (e.type === "custom" && e.customType === SESSION_ENTRY && e.data) {
+        project = e.data.project ?? project;
+        baseBranch = e.data.baseBranch ?? baseBranch;
+        workBranch = e.data.workBranch ?? workBranch;
+        baseRef = e.data.baseRef ?? baseRef;
+      }
+      if (e.type === "custom" && e.customType === CHECKPOINT_ENTRY && e.data?.commit) {
+        headCommit = e.data.commit;
+        workBranch = e.data.branch ?? workBranch;
+      }
+      if (stopAtEntryId && e.id === stopAtEntryId && inclusive) break;
+    }
+    return { project, baseBranch, workBranch, baseRef, headCommit };
+  }
+
+  pi.on("session_before_fork", async (event, ctx) => {
+    if (disabled || !session) return;
+    const branchEntries = ctx.sessionManager.getBranch();
+    const info = inspectBranchEntries(branchEntries, event.entryId, event.position === "at");
+    pendingForkRef = info.headCommit ?? info.baseRef ?? session.effectiveRef;
+  });
+
+  pi.on("session_tree", async (_event, ctx) => {
+    if (disabled) return;
+    const s = await need().catch(() => null);
+    if (!s) return;
+    const info = inspectBranchEntries(ctx.sessionManager.getBranch());
+    const targetRef = info.headCommit ?? info.baseRef ?? s.baseRef;
+    const switched = await s.switchToRef(targetRef);
+    pi.appendEntry(SESSION_ENTRY, {
+      project: s.project, volume: s.volume, cwd: s.cwd,
+      baseBranch: s.baseBranch, workBranch: switched.branch, baseRef: s.baseRef, headCommit: s.headCommit,
+    });
+    status(ctx, describe(s));
+  });
+
+  pi.on("session_start", async (event, ctx) => {
     const config = resolveConfig();
     hostCwd = ctx.cwd;
     disabled = !config.enabled || pi.getFlag("no-layerfs") === true;
@@ -160,12 +212,30 @@ export default function layerfsExtension(pi: ExtensionAPI) {
       if (ctx.hasUI) ctx.ui.notify("LayerFS isolation is OFF for this run: tools act directly on the host folder.", "warning");
       return;
     }
-    if (session) return;
+    if (session && event.reason === "reload") {
+      status(ctx, describe(session));
+      return;
+    }
+    const branchInfo = inspectBranchEntries(ctx.sessionManager.getBranch());
+    const forkRef = event.reason === "fork" ? (pendingForkRef ?? branchInfo.headCommit ?? branchInfo.baseRef ?? null) : null;
+    pendingForkRef = null;
+
     const s = new LayerfsSession(ctx.cwd, ctx.sessionManager.getSessionId(), config);
     session = s;
     startError = null;
     status(ctx, "LayerFS starting…");
-    ready = s.open().then(() => { status(ctx, describe(s)); return s; }, (e) => {
+    ready = s.open({
+      reason: event.reason,
+      resumeBinding: branchInfo.project ? branchInfo : undefined,
+      forkFromRef: forkRef,
+    }).then(() => {
+      pi.appendEntry(SESSION_ENTRY, {
+        project: s.project, volume: s.volume, cwd: s.cwd,
+        baseBranch: s.baseBranch, workBranch: s.workBranch, baseRef: s.baseRef, headCommit: s.headCommit,
+      });
+      status(ctx, describe(s));
+      return s;
+    }, (e) => {
       startError = e;
       status(ctx, "LayerFS FAILED");
       if (ctx.hasUI) ctx.ui.notify(`LayerFS failed to start: ${e.message}\nFile tools are disabled; nothing is written to the host folder.`, "error");
@@ -174,7 +244,8 @@ export default function layerfsExtension(pi: ExtensionAPI) {
     ready.catch(() => {});
   });
 
-  pi.on("session_shutdown", async (_event, ctx) => {
+  pi.on("session_shutdown", async (event, ctx) => {
+    if (event.reason === "reload") return;
     const s = session;
     session = null;
     const r = ready;
@@ -190,8 +261,8 @@ export default function layerfsExtension(pi: ExtensionAPI) {
     if (disabled) return undefined;
     const note = [
       "",
-      "File tools and bash run in an isolated LayerFS workspace of this project (Linux).",
-      `Paths under ${session?.cwd ?? "the working directory"} refer to that workspace; edits there do NOT reach the user's folder until the user runs /layerfs apply.`,
+      "File tools and bash run on an isolated LayerFS Branch of this project.",
+      `Paths under ${session?.cwd ?? "the working directory"} refer to that Branch; edits there do NOT reach the user's folder until the user runs /layerfs apply.`,
       "Files outside the working directory are read-only. Secret files such as .env are not imported.",
     ].join("\n");
     return { systemPrompt: `${event.systemPrompt}\n${note}` };
@@ -200,7 +271,7 @@ export default function layerfsExtension(pi: ExtensionAPI) {
   // ------------------------------------------------------------- command
 
   pi.registerCommand("layerfs", {
-    description: "LayerFS workspace: status | diff | apply | retry",
+    description: "LayerFS workspace: status | diff | apply | retry | sync | branches",
     handler: async (args, ctx) => {
       const sub = (args ?? "").trim().split(/\s+/)[0] || "status";
       const say = (t: string, level: "info" | "warning" | "error" = "info") => (ctx.hasUI ? ctx.ui.notify(t, level) : console.log(t));
@@ -209,13 +280,23 @@ export default function layerfsExtension(pi: ExtensionAPI) {
       try { s = await need(); } catch (e: any) { return say(e.message, "error"); }
       if (sub === "status") {
         return say([
-          describe(s), `project ${s.project} · volume ${s.volume}`, `workspace ${s.container}:${s.wsDir}`,
-          s.blocked ? `blocked: ${s.blocked.reason}` : "", s.leakedWorkspaces.length ? `leaked: ${s.leakedWorkspaces.join(", ")}` : "",
+          describe(s),
+          `project ${s.project} · volume ${s.volume}`,
+          `branch ${s.workBranch} (base ${s.baseBranch} @ ${s.baseRef.slice(0, 12)}) · head ${(s.headCommit ?? "none").slice(0, 12)}`,
+          s.blocked ? `blocked: ${s.blocked.reason}` : "",
         ].filter(Boolean).join("\n"));
+      }
+      if (sub === "branches") {
+        const list = await s.listAllBranches();
+        return say(list.map((b) => `${b.name.padEnd(20)} head ${(b.head ?? "-").slice(0, 12)} base ${(b.base ?? "-").slice(0, 12)}`).join("\n"));
       }
       if (sub === "diff") {
         const d = (await s.diff()).filter((i) => i.type !== "dir");
         return say(d.length ? d.map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`).join("\n") : "No changes in the LayerFS workspace.");
+      }
+      if (sub === "sync") {
+        const res = await s.syncHostDriftIntoMain();
+        return say(res.synced.length ? `Synced ${res.synced.length} host file(s) into main: ${res.synced.join(", ")}` : "Host folder is already in sync with main.");
       }
       if (sub === "retry") {
         const r = await s.retry();
@@ -231,55 +312,7 @@ export default function layerfsExtension(pi: ExtensionAPI) {
         status(ctx, describe(s));
         return say([`Applied ${r.applied.length} change(s) to ${s.cwd}.`, r.skipped.length ? `Skipped (never applied): ${r.skipped.join(", ")}` : ""].filter(Boolean).join("\n"));
       }
-      return say(`Unknown subcommand ${sub}. Use: status | diff | apply | retry`, "warning");
+      return say(`Unknown subcommand ${sub}. Use: status | diff | apply | retry | sync | branches`, "warning");
     },
   });
-}
-
-// ------------------------------------------------------------- grep / find in the workspace
-
-function matchesToolGlob(rel: string, pattern: string): boolean {
-  if (pattern.includes("/")) return path.posix.matchesGlob(rel, pattern) || path.posix.matchesGlob(rel, `**/${pattern}`);
-  return path.posix.matchesGlob(path.posix.basename(rel), pattern);
-}
-
-async function findInWorkspace(s: LayerfsSession, pattern: string, cwd: string, o: { ignore: string[]; limit: number }): Promise<string[]> {
-  const root = s.toWs(cwd);
-  if (!root) throw new Error(`${cwd} is outside the LayerFS workspace`);
-  const r = await s.sh(`cd "$1" && find . \\( -name .git -o -name node_modules \\) -prune -o \\( -type f -o -type l \\) -print0`, [root]);
-  if (r.code !== 0) throw new Error(r.stderr.trim() || `find failed in ${cwd}`);
-  const out: string[] = [];
-  for (const raw of r.stdout.split("\0")) {
-    if (!raw) continue;
-    const rel = raw.replace(/^\.\//, "");
-    if (o.ignore.some((g) => path.posix.matchesGlob(rel, g))) continue;
-    if (!matchesToolGlob(rel, pattern)) continue;
-    out.push(path.join(cwd, rel));
-    if (out.length >= o.limit) break;
-  }
-  return out;
-}
-
-async function grepInWorkspace(s: LayerfsSession, p: { pattern: string; path?: string; glob?: string; ignoreCase?: boolean; literal?: boolean; context?: number; limit?: number }) {
-  const target = path.resolve(s.cwd, p.path ?? ".");
-  const ws = s.toWs(target);
-  if (!ws) throw new Error(`${p.path} is outside the LayerFS workspace`);
-  const limit = Math.max(1, p.limit ?? 100);
-  const flags = ["-rnIH", "--exclude-dir=.git", "--exclude-dir=node_modules", p.ignoreCase ? "-i" : "", p.literal ? "-F" : "-P", p.context ? `-C${Math.floor(p.context)}` : "", p.glob ? `--include=${p.glob}` : ""].filter(Boolean);
-  const isDir = await s.isDirectory(target);
-  const script = isDir ? `cd "$1" && grep ${flags.map((f) => `'${f}'`).join(" ")} -e "$2" -- .` : `cd "$(dirname "$1")" && grep ${flags.map((f) => `'${f}'`).join(" ")} -e "$2" -- "$(basename "$1")"`;
-  const r = await s.sh(script, [ws, p.pattern]);
-  if (r.code === 1) return { content: [{ type: "text" as const, text: "No matches found" }], details: undefined };
-  if (r.code !== 0) throw new Error(r.stderr.trim() || "grep failed");
-  const lines: string[] = [];
-  let matches = 0;
-  for (const line of r.stdout.split("\n")) {
-    if (!line) continue;
-    const clean = line.replace(/^\.\//, "");
-    if (/^.+?:\d+:/.test(clean)) { if (matches >= limit) break; matches++; }
-    lines.push(clean.replace(/^(.+?):(\d+):/, "$1:$2: ").replace(/^(.+?)-(\d+)-/, "$1-$2- "));
-  }
-  const t = truncateHead(lines.join("\n"), { maxLines: Number.MAX_SAFE_INTEGER });
-  const notes = [matches >= limit ? `${limit} matches limit reached` : "", t.truncated ? `${formatSize(DEFAULT_MAX_BYTES)} limit reached` : ""].filter(Boolean);
-  return { content: [{ type: "text" as const, text: t.content + (notes.length ? `\n\n[${notes.join(". ")}]` : "") }], details: undefined };
 }

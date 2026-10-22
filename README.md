@@ -5,7 +5,7 @@ Pi extension: **every Pi session works in an isolated [LayerFS](https://github.c
 Linux LayerFS Branch/Workspace imported from the project folder. Your folder changes only
 when you run `/layerfs apply`.
 
-Status: v0.1, tested with stock Pi 1.2.0 and LayerFS `5fb68dd` on macOS arm64 + Docker Desktop.
+Status: v0.2 (see docs/DESIGN-v0.2.md, docs/REVIEW-v0.2-opus-5.5.md), tested with stock Pi 1.2.0 and LayerFS `5fb68dd` on macOS arm64 + Docker Desktop.
 Not wired into Epi yet.
 
 ## How it works
@@ -68,14 +68,23 @@ npm run test:scale     # APFS clone of a real repo (default ~/Projects/sides/epi
 npm run probe:real     # low-level LayerFS probes (see probes/real/FINDINGS.md)
 ```
 
+## v0.2 architecture (summary)
+
+- One long-lived Store container `<prefix>store` (`--network host`, Mac talks to it over `docker exec` + Unix socket); `project.init` runs in a throwaway container.
+- One Project Store per host folder, shared by all sessions; each session gets `b-<id>` (base anchor) + `s-<id>` (work) branches.
+- `read/write/edit/ls/find/grep` go to the Store directly (0 Sandboxes); binary, symlink, or >48 KiB-line files fall back to a short Workspace mount.
+- `bash`/`!cmd`: mount → `docker exec setsid` → commit → unmount per call.
+- `/layerfs apply` diffs base→work only, skips excludes/.git, three-way checks against the base branch, merges with main if it moved, then publishes.
+- `/tree`, `/fork`, `/resume` restore file state from checkpoint commits.
+
 ## Known limits
 
-- **Startup**: ~8 s for a small project, ~20 s for a 23k-file repo with node_modules (copy + hashing ≈9 s, init + prewarm + mount ≈11 s). Tools wait for it.
-- **Upstream bug**: the first Workspace of a fresh Sandbox fails to unmount (deterministic here); a 2 s throwaway prewarm Workspace absorbs it and is leaked per session.
+- **Startup**: first session in a folder ~0.7 s (small) / ~12.6 s (23k files); later sessions in the same folder ~0.2–0.6 s.
+- **Upstream bug**: the first Workspace of a fresh Sandbox can hit a 5 s unmount timeout; v0.2 has no prewarm, so the first fallback/bash on a new Sandbox may take ~5 s once.
 - On the default Docker bridge network the binding cannot reach a new Sandbox; the worker uses `--network host`.
 - Commands run in Linux: host (darwin) `node_modules` native addons are copied as-is and will not load there.
 - Only the 7 built-in tools and `!` commands are isolated; other extensions/MCP tools still act on the host.
-- No resume: a resumed/forked Pi session starts a fresh workspace from the current folder; unapplied work of an ended session stays in its Docker volume (`~/.cache/pi-layerfs/sessions/<project>/session.json`) without a restore command yet.
+- Branches are never garbage-collected yet (Store grows; no `/layerfs gc`).
 - **No orphan GC yet**: if Pi is killed hard (SIGKILL/crash) its worker/Sandbox containers and volume stay behind (`docker ps -a --filter name=pi-lfs-`). Needs a startup sweeper or `/layerfs gc`.
 - `grep` uses GNU `grep -P` in the Sandbox (not ripgrep); `find` globs use Node `path.matchesGlob`.
 - Interactive TUI rendering was not driven directly; its dialogs/status were tested through RPC mode.

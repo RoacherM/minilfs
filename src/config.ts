@@ -6,17 +6,15 @@ export interface LayerfsConfig {
   enabled: boolean;
   /** folder with layerfs-daemon, layerfs.node and sdk/js (built from source) */
   bundle: string;
-  /** runtime image tag or id for the worker and Sandboxes */
+  /** runtime image tag or id for the Store container and Sandboxes */
   image: string;
   docker: string;
-  /** private state: LayerFS home, staging copies, manifests */
+  /** private state: LayerFS home, bindings, manifests, staging */
   root: string;
-  /** container / volume name prefix */
+  /** container / volume name prefix (Store container is <prefix>store) */
   prefix: string;
-  /** host paths never imported into a session (rsync --exclude patterns) */
+  /** host paths never imported into a session or overwritten by apply */
   excludes: string[];
-  /** throwaway Workspace lifetime on a fresh Sandbox (upstream first-unmount race) */
-  prewarmMs: number;
   /** TERM -> KILL grace when cancelling a command */
   killGraceMs: number;
   /** env vars forwarded into commands (besides PI_*) */
@@ -38,7 +36,6 @@ export function resolveConfig(env: NodeJS.ProcessEnv = process.env): LayerfsConf
     root: env.PI_LAYERFS_ROOT ?? join(homedir(), ".cache/pi-layerfs"),
     prefix: env.PI_LAYERFS_PREFIX ?? "pi-lfs-",
     excludes: list(env.PI_LAYERFS_EXCLUDES, DEFAULT_EXCLUDES),
-    prewarmMs: Number(env.PI_LAYERFS_PREWARM_MS ?? 2000),
     killGraceMs: Number(env.PI_LAYERFS_KILL_GRACE_MS ?? 2000),
     envAllow: list(env.PI_LAYERFS_ENV_ALLOW, ["TERM", "LANG", "LC_ALL", "CI", "NO_COLOR", "FORCE_COLOR"]),
   };
