@@ -285,6 +285,7 @@ export default function layerfsExtension(pi: ExtensionAPI) {
       "File tools and bash run on an isolated LayerFS Branch of this project.",
       `Paths under ${session?.cwd ?? "the working directory"} refer to that Branch; edits there do NOT reach the user's folder until the user runs /layerfs apply.`,
       "Files outside the working directory are read-only. Secret files such as .env are not imported.",
+      "Each bash call runs in its own sandbox: background processes (`cmd &`, dev servers) end when that call ends. Start and use a server within one bash call.",
     ].join("\n");
     return { systemPrompt: `${event.systemPrompt}\n${note}` };
   });

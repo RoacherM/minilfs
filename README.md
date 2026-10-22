@@ -77,6 +77,13 @@ npm run probe:real     # low-level LayerFS probes (see probes/real/FINDINGS.md)
 - `/layerfs apply` diffs base→work only, skips excludes/.git, three-way checks against the base branch, merges with main if it moved, then publishes.
 - `/tree`, `/fork`, `/resume` restore file state from checkpoint commits.
 
+## Command sandbox
+
+Each `bash` / `!cmd` runs in its own PID + mount namespace inside the Sandbox: the Workspace is
+bind-mounted at your project's real path (so absolute paths work and nothing is rewritten), and
+every process the command started, including `cmd &` and `nohup`, is killed when it ends or is
+cancelled. Background servers therefore do not survive across bash calls.
+
 ## Known limits
 
 - **Startup**: first session in a folder ~0.7 s (small) / ~12.6 s (23k files); later sessions in the same folder ~0.2–0.6 s.
@@ -86,5 +93,6 @@ npm run probe:real     # low-level LayerFS probes (see probes/real/FINDINGS.md)
 - Only the 7 built-in tools and `!` commands are isolated; other extensions/MCP tools still act on the host.
 - Branches are never garbage-collected yet (Store grows; no `/layerfs gc`).
 - **No orphan GC yet**: if Pi is killed hard (SIGKILL/crash) its worker/Sandbox containers and volume stay behind (`docker ps -a --filter name=pi-lfs-`). Needs a startup sweeper or `/layerfs gc`.
+- `/layerfs apply` refuses to go backwards after `/tree` (use `/layerfs apply --revert` to do it on purpose); if updating LayerFS main fails after files were written, you get a warning and the next session resyncs main from your folder.
 - `grep` uses GNU `grep -P` in the Sandbox (not ripgrep); `find` globs use Node `path.matchesGlob`.
 - Interactive TUI rendering was not driven directly; its dialogs/status were tested through RPC mode.

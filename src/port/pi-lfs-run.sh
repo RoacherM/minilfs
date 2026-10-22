@@ -52,7 +52,12 @@ export PI_LFS_NS
 PI_LFS_A1=$ws PI_LFS_A2=$root PI_LFS_A3=$run_cwd PI_LFS_A4=$uid PI_LFS_A5=$gid PI_LFS_A6=$cmd \
   unshare -m -p -f --kill-child --mount-proc --propagation slave /bin/sh -c 'ns=$PI_LFS_NS; set -- "$PI_LFS_A1" "$PI_LFS_A2" "$PI_LFS_A3" "$PI_LFS_A4" "$PI_LFS_A5" "$PI_LFS_A6"; unset PI_LFS_NS PI_LFS_A1 PI_LFS_A2 PI_LFS_A3 PI_LFS_A4 PI_LFS_A5 PI_LFS_A6; eval "$ns"' pi-lfs-ns &
 ns=$!
-echo $ns > "$sid_file"
+# The namespace init (sh) is unshare's child; it forwards TERM to the command. Record both pids:
+# "<unshare-pid> <init-pid>" (TERM goes to init, KILL to unshare, which kills the whole namespace).
+init=""
+i=0
+while [ -z "$init" ] && [ $i -lt 50 ]; do init=$(pgrep -P "$ns" 2>/dev/null | head -1); [ -n "$init" ] || sleep 0.02; i=$((i+1)); done
+echo "$ns $init" > "$sid_file"
 trap "kill -TERM $ns 2>/dev/null" TERM
 wait $ns; code=$?
 while kill -0 $ns 2>/dev/null; do wait $ns; code=$?; done

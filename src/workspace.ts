@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { constants as fsc, promises as fsp } from "node:fs";
+import { constants as fsc, promises as fsp, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { BindingStore, type HostEntry, type HostIndex, type ProjectRecord, type SessionBinding } from "./bindings.ts";
@@ -30,6 +30,7 @@ export class LayerfsError extends Error {
 type Log = (msg: string) => void;
 const RUNNER_ON_HOST = new URL("./port/pi-lfs-run.sh", import.meta.url);
 const LWW_DEFAULT = "%include .gitignore\n.git/\n";
+const HOMES = [...new Set([homedir(), (() => { try { return realpathSync(homedir()); } catch { return homedir(); } })()])];
 /** Extra secrets never readable outside the project, on top of config.excludes. */
 const OUTSIDE_SECRET_PATTERNS = [
   ".ssh", ".aws", ".gnupg", ".kube", ".docker/config.json", ".config/gh", ".config/gcloud", ".azure",
@@ -75,6 +76,7 @@ export class LayerfsSession {
   private lastStoreCommit: { kind: string; head: string | null } | null = null;
   private identByContainer = new Map<string, string>();
   private activeSids = new Map<string, () => Promise<void>>();
+  private pendingUnmounts = new Set<Promise<unknown>>();
   private mutex: Promise<unknown> = Promise.resolve();
   private closed = false;
 
@@ -866,7 +868,13 @@ export class LayerfsSession {
       options.signal?.removeEventListener("abort", onAbort);
       this.activeSids.delete(tag);
       void run(this.config.docker, ["exec", "-u", "0", container, "rm", "-f", sidFile]).catch(() => {});
-      if (!keepMounted) await this.lfs.workspace.unmount(ws).catch(() => {});
+      if (!keepMounted) {
+        // The commit is done; unmounting a Workspace whose command was killed can hit the
+        // upstream 5 s teardown stall. Do not make the tool result wait for it.
+        const u = this.lfs.workspace.unmount(ws).catch(() => {});
+        if (options.signal?.aborted || timedOut) this.pendingUnmounts.add(u.finally(() => this.pendingUnmounts.delete(u)));
+        else await u;
+      }
     }
   }
 
@@ -906,8 +914,11 @@ export class LayerfsSession {
     const g = Math.max(0.1, this.config.killGraceMs / 1000);
     const script = [
       `i=0; while [ ! -s ${sidFile} ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done;`,
-      `ns=$(cat ${sidFile} 2>/dev/null); [ -n "$ns" ] || exit 3;`,
-      `kill -TERM "$ns" 2>/dev/null; i=0; while kill -0 "$ns" 2>/dev/null && [ $i -lt $(awk "BEGIN{print int(${g}*10)}") ]; do sleep 0.1; i=$((i+1)); done;`,
+      `read ns init < ${sidFile} 2>/dev/null; [ -n "$ns" ] || exit 3;`,
+      // wait on the namespace (unshare) pid; a zombie counts as gone (state Z in /proc/<pid>/stat)
+      `t=\${init:-$ns}; kill -TERM "$t" 2>/dev/null; n=$(awk "BEGIN{print int(${g}*10)}"); i=0;`,
+      `alive() { [ -r /proc/$1/stat ] && ! awk '{exit ($3=="Z")?0:1}' /proc/$1/stat; };`,
+      `while alive "$ns" && [ $i -lt $n ]; do sleep 0.1; i=$((i+1)); done;`,
       `kill -KILL "$ns" 2>/dev/null; true`,
     ].join(" ");
     const r = await run(this.config.docker, ["exec", "-u", "0", container, "sh", "-c", script], { timeoutMs: this.config.killGraceMs + 20_000 }).catch(() => null);
@@ -1239,7 +1250,7 @@ export class LayerfsSession {
   private async baseIsCommit(): Promise<boolean> {
     const known = this.baseCommitKnown.get(this.baseRef);
     if (known !== undefined) return known;
-    const page = await this.lfs.branch.list_commits(this.baseBranch, 1, 0).catch(() => null);
+    const page = await this.lfs.branch.list_commits(this.baseBranch, 1, 0); // errors propagate (not cached)
     const isCommit = Boolean(page?.items?.[0]?.id === this.baseRef);
     this.baseCommitKnown.set(this.baseRef, isCommit);
     return isCommit;
@@ -1252,6 +1263,7 @@ export class LayerfsSession {
     if (this.closed) return { kept: true, notes };
     this.closed = true;
     await Promise.allSettled([...this.activeSids.values()].map((k) => k()));
+    await Promise.allSettled([...this.pendingUnmounts]);
     if (this.blocked?.heldWs) {
       await this.lfs?.workspace.unmount(this.blocked.heldWs, true).catch(() => {});
     }
@@ -1308,9 +1320,10 @@ async function removeEmptyParents(root: string, rel: string): Promise<void> {
 /** A secret outside the project: any configured exclude (at any depth) or a known credential path under $HOME. */
 export function isOutsideSecret(abs: string, excludes: string[]): boolean {
   if (isExcludedPath(abs, excludes.filter((p) => !p.replace(/\/$/, "").includes("/")))) return true;
-  const home = homedir();
-  const rel = abs.startsWith(`${home}/`) ? abs.slice(home.length + 1) : null;
-  return rel !== null && isExcludedPath(rel, OUTSIDE_SECRET_PATTERNS);
+  for (const home of HOMES) {
+    if (abs.startsWith(`${home}/`) && isExcludedPath(abs.slice(home.length + 1), OUTSIDE_SECRET_PATTERNS)) return true;
+  }
+  return false;
 }
 
 export function isExcludedPath(relPath: string, patterns: string[]): boolean {
@@ -1352,7 +1365,7 @@ async function listImportable(root: string, excludes: string[]): Promise<string[
     for (const ent of entries) {
       const abs = join(dir, ent.name);
       const rel = relative(root, abs).split("\\").join("/");
-      if (!rel.startsWith(".git/") && rel !== ".git" && isExcludedPath(rel, excludes)) continue;
+      if (!rel.startsWith(".git/") && rel !== ".git" && (isExcludedPath(rel, excludes) || (ent.isDirectory() && isExcludedPath(`${rel}/x`, excludes)))) continue;
       if (ent.isDirectory()) await walk(abs);
       else out.push(rel);
     }
