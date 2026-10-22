@@ -213,14 +213,89 @@ try {
     await assert.rejects(s.lfs.fs.stat("main", "/secrets/new.txt"), (e) => e.code === "NoSuchPath", "not synced either");
   });
 
-  await step("outside-project reads refuse secret files", async () => {
+  await step("outside-project reads: configured excludes and $HOME credentials refused, also via symlink", async () => {
     const cwd = project();
     const s = await open(cwd, "o");
-    mkdirSync(join(base, ".ssh"), { recursive: true });
-    writeFileSync(join(base, ".ssh/id_rsa"), "KEY\n");
+    writeFileSync(join(base, "other.env"), "x\n");
+    mkdirSync(join(base, "elsewhere"), { recursive: true });
+    writeFileSync(join(base, "elsewhere/.env"), "SECRET=1\n");
     writeFileSync(join(base, "notes.md"), "ok\n");
-    await assert.rejects(s.readFile(join(base, ".ssh/id_rsa")), /secret file/);
+    await assert.rejects(s.readFile(join(base, "elsewhere/.env")), /secret file/);
+    // symlink outside the project pointing at a $HOME credential file
+    const real = join(homedir(), ".pi/agent/auth.json");
+    const link = join(base, "innocent.txt");
+    (await import("node:fs")).symlinkSync(real, link);
+    await assert.rejects(s.readFile(link), /secret file|ENOENT/);
     assert.equal((await s.readFile(join(base, "notes.md"))).toString(), "ok\n");
+  });
+
+  await step("N1: background jobs started by bash die with the command (PID namespace)", async () => {
+    const cwd = project();
+    const s = await open(cwd, "n1");
+    const r = await s.exec("nohup sh -c 'sleep 200' >/dev/null 2>&1 & (setsid sleep 201 &) ; echo started", cwd, { onData: () => {} });
+    assert.equal(r.exitCode, 0);
+    const ctr = docker("ps", "--filter", `name=^${config.prefix}${s.project}-`, "--format", "{{.Names}}").stdout.trim().split("\n")[0];
+    const left = ctr ? docker("exec", ctr, "sh", "-c", "pgrep -f 'sleep 20[01]' || true").stdout.trim() : "";
+    assert.equal(left, "", `leftover background processes: ${left}`);
+  });
+
+  await step("N2/N3: partial apply marks mainStale; another session's publish does not clear it", async () => {
+    const cwd = project();
+    const a = await open(cwd, "n2a");
+    const b = await open(cwd, "n2b");
+    await a.mutate("1", "write", () => a.writeFile(join(cwd, "aa1.txt"), "1\n"));
+    await a.mutate("2", "write", () => a.writeFile(join(cwd, "zz2.txt"), "2\n"));
+    const realRename = fsp.rename;
+    let n = 0;
+    fsp.rename = async (...args) => { if (String(args[1]).endsWith("zz2.txt") && n++ === 0) throw Object.assign(new Error("disk full"), { code: "ENOSPC" }); return realRename.apply(fsp, args); };
+    try { await assert.rejects(a.apply(), (e) => e.result?.applied?.includes("aa1.txt")); } finally { fsp.rename = realRename; }
+    assert.equal(a.bindings.byName(a.project).mainStale, true, "partial apply marks stale");
+    await b.mutate("3", "write", () => b.writeFile(join(cwd, "bb.txt"), "b\n"));
+    const rb = await b.apply();
+    assert.deepEqual(rb.applied, ["bb.txt"]);
+    assert.equal(b.bindings.byName(b.project).mainStale, true, "another session's publish must not clear stale");
+    const c = await open(cwd, "n2c");
+    assert.equal((await c.readFile(join(cwd, "aa1.txt"))).toString(), "1\n", "full resync brings the partially applied file into main");
+    assert.equal(c.bindings.byName(c.project).mainStale, false);
+  });
+
+  await step("N6: /tree back then edit -> apply still refuses to revert applied content", async () => {
+    const cwd = project();
+    const s = await open(cwd, "n6");
+    const c1 = await s.mutate("1", "write", () => s.writeFile(join(cwd, "a.txt"), "v1\n"));
+    await s.mutate("2", "write", () => s.writeFile(join(cwd, "a.txt"), "v2\n"));
+    await s.apply();
+    await s.switchToRef(c1.checkpoint.commit);
+    await s.mutate("3", "write", () => s.writeFile(join(cwd, "new.txt"), "n\n")); // edit after going back
+    await assert.rejects(s.apply(), (e) => e.code === "WouldRevert");
+    assert.equal(readFileSync(join(cwd, "a.txt"), "utf8"), "v2\n");
+  });
+
+  await step("two sessions that both ran git: apply + merge on .git metadata does not conflict (.lww .git/)", async () => {
+    const cwd = project();
+    spawnSync("git", ["-C", cwd, "init", "-q"]); spawnSync("git", ["-C", cwd, "add", "-A"]); spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "i"]);
+    const a = await open(cwd, "ga");
+    const b = await open(cwd, "gb");
+    await a.mutate("1", "bash", () => a.exec("git status >/dev/null; git add -A; echo A > a.txt", cwd, { onData: () => {} }));
+    await b.mutate("2", "bash", () => b.exec("git status >/dev/null; git log -1 >/dev/null; echo B > src/app.js", cwd, { onData: () => {} }));
+    const ra = await a.apply();
+    const rb = await b.apply();
+    assert.deepEqual(ra.warnings, []);
+    assert.deepEqual(rb.warnings, [], `merge/publish warnings: ${rb.warnings}`);
+    assert.equal((await a.lfs.fs.read("main", "/a.txt")).text, "A\n");
+    assert.equal((await a.lfs.fs.read("main", "/src/app.js")).text, "B\n");
+  });
+
+  await step("brace excludes are honored at import (*.{pem,crt})", async () => {
+    const cwd = project();
+    writeFileSync(join(cwd, "server.pem"), "P\n");
+    writeFileSync(join(cwd, "server.crt"), "C\n");
+    const s = new LayerfsSession(cwd, `br-${id}`, { ...config, excludes: [...config.excludes, "*.{pem,crt}"] });
+    sessions.push(s);
+    await s.open();
+    assert.equal(await s.exists(join(cwd, "server.pem")), false);
+    assert.equal(await s.exists(join(cwd, "server.crt")), false);
+    await assert.rejects(s.lfs.fs.stat("main", "/server.pem"), (e) => e.code === "NoSuchPath");
   });
 } finally {
   for (const s of sessions) await s.close().catch(() => {});

@@ -108,11 +108,15 @@ export class BindingStore {
   }
 
   /** Serializes project-level mutations (init, host-drift sync, apply + publish) across processes. */
-  async withProjectLock<T>(projectName: string, fn: () => Promise<T>, timeoutMs = 60_000): Promise<T> {
+  async withProjectLock<T>(projectName: string, fn: (guard: () => void) => Promise<T>, timeoutMs = 60_000): Promise<T> {
     const lockDir = join(this.stateDir, "locks", `${projectName}.lock`);
     const lock = await acquireLock(lockDir, timeoutMs);
+    // call guard() before an irreversible step: it throws if another process took the lock over
+    const guard = () => {
+      if (lock.lost) throw Object.assign(new Error(`lost the project lock for ${projectName} (process was frozen?); aborting`), { code: "LockLost" });
+    };
     try {
-      return await fn();
+      return await fn(guard);
     } finally {
       lock.release();
     }

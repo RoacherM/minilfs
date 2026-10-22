@@ -16,8 +16,9 @@
     "@earendil-works/pi-coding-agent": ">=1.2.0"
   },
   "scripts": {
-    "test": "node tests/backend.test.mjs && node tests/pi.test.mjs && node tests/cli.test.mjs && node tests/rpc.test.mjs && node tests/scale.test.mjs",
+    "test": "node tests/backend.test.mjs && node tests/review-fixes.test.mjs && node tests/pi.test.mjs && node tests/cli.test.mjs && node tests/rpc.test.mjs && node tests/scale.test.mjs",
     "test:backend": "node tests/backend.test.mjs",
+    "test:fixes": "node tests/review-fixes.test.mjs",
     "test:pi": "node tests/pi.test.mjs",
     "test:cli": "node tests/cli.test.mjs",
     "test:rpc": "node tests/rpc.test.mjs",

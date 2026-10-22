@@ -2,25 +2,32 @@
 # Runs one Pi bash command in a LayerFS Workspace (copied into each Sandbox, run as root).
 # Usage: pi-lfs-run.sh <sid-file> <workspace-path> <host-project-root> <run-cwd> <uid> <gid> <command>
 #
-# - Records this process's session id in <sid-file> (root-owned dir) so the host can
-#   TERM/KILL the whole command tree.
-# - Creates a private mount namespace and bind-mounts the Workspace at the host's own
-#   project path, so absolute host paths in commands just work and nothing is rewritten.
-#   The bind is invisible to every other process (other sessions sharing the Sandbox).
+# - Private PID + mount namespace per command (`unshare -m -p -f --kill-child`): when the command
+#   ends or is cancelled, every process it started (background jobs, nohup, daemons) is killed by
+#   the kernel, so nothing keeps writing to the Workspace after its commit / unmount.
+# - Records the unshare process id in <sid-file> (root-owned dir): killing it with SIGKILL makes
+#   the kernel kill the whole namespace. SIGTERM is forwarded first for a graceful stop.
+# - Bind-mounts the Workspace at the host's own project path, visible only inside this namespace,
+#   so absolute host paths in commands work and nothing is rewritten.
 # - Hides excluded secrets from `git status` (skip-worktree) and .lww (info/exclude).
-# - Drops to the command identity and execs bash.
+# - Drops to the command identity and runs bash.
 set -u
 sid_file=$1 ws=$2 root=$3 run_cwd=$4 uid=$5 gid=$6 cmd=$7
-mkdir -p "$(dirname "$sid_file")" && echo $$ > "$sid_file" || exit 125
-exec unshare -m --propagation private /bin/sh -c '
+case "$root" in
+  /|/bin|/bin/*|/sbin|/sbin/*|/usr|/usr/*|/lib|/lib/*|/etc|/etc/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run|/run/*|/workspaces|/workspaces/*|/layerfs-store|/layerfs-store/*)
+    echo "pi-layerfs: refusing project root $root (it would shadow a system path in the Sandbox)" >&2; exit 125 ;;
+esac
+mkdir -p "$(dirname "$sid_file")" || exit 125
+# The namespace's PID 1 is `sh -c`, which forwards TERM to the command's process group.
+PI_LFS_NS='
   ws=$1 root=$2 run_cwd=$3 uid=$4 gid=$5 cmd=$6
-  mkdir -p "$root" && mount --bind "$ws" "$root" || exit 125
+  mkdir -p "$root" && mount --rbind "$ws" "$root" || { echo "pi-layerfs: cannot bind the workspace (needs CAP_SYS_ADMIN)" >&2; exit 125; }
   cd "$run_cwd" 2>/dev/null || cd "$root" || exit 125
-  exec setpriv --reuid="$uid" --regid="$gid" --clear-groups /bin/sh -c "
+  setpriv --reuid="$uid" --regid="$gid" --clear-groups /bin/sh -c "
     if [ -d \"\$1/.git\" ] && command -v git >/dev/null 2>&1; then
       mkdir -p \"\$1/.git/info\" && { grep -qxF /.lww \"\$1/.git/info/exclude\" 2>/dev/null || echo /.lww >> \"\$1/.git/info/exclude\"; }
       if [ -n \"\${PI_LFS_EXCLUDES:-}\" ]; then
-        printf %s \"\$PI_LFS_EXCLUDES\" | tr \",\" \"\\n\" | while IFS= read -r pat; do
+        printf %s \"\$PI_LFS_EXCLUDES\" | tr \"\\n\" \"\\n\" | while IFS= read -r pat; do
           [ -n \"\$pat\" ] || continue
           git -C \"\$1\" -c core.quotePath=false ls-files -v -- \":(glob,icase)\$pat\" \":(glob,icase)**/\$pat\" 2>/dev/null
         done | while IFS= read -r line; do
@@ -29,7 +36,24 @@ exec unshare -m --propagation private /bin/sh -c '
           [ -e \"\$1/\$f\" ] || git -C \"\$1\" update-index --skip-worktree -- \"\$f\" 2>/dev/null
         done
       fi
+      unset PI_LFS_EXCLUDES
     fi
     exec bash -c \"\$0\"
-  " "$cmd" "$root"
-' _ "$ws" "$root" "$run_cwd" "$uid" "$gid" "$cmd"
+  " "$cmd" "$root" &
+  child=$!
+  trap "kill -TERM $child 2>/dev/null" TERM
+  wait $child; code=$?
+  # a TERM interrupts the first wait: wait again for the real exit status
+  while kill -0 $child 2>/dev/null; do wait $child; code=$?; done
+  exit $code
+'
+export PI_LFS_NS
+# Arguments travel in the environment, so the namespace's PID 1 shows only "pi-lfs-ns" in ps.
+PI_LFS_A1=$ws PI_LFS_A2=$root PI_LFS_A3=$run_cwd PI_LFS_A4=$uid PI_LFS_A5=$gid PI_LFS_A6=$cmd \
+  unshare -m -p -f --kill-child --mount-proc --propagation slave /bin/sh -c 'ns=$PI_LFS_NS; set -- "$PI_LFS_A1" "$PI_LFS_A2" "$PI_LFS_A3" "$PI_LFS_A4" "$PI_LFS_A5" "$PI_LFS_A6"; unset PI_LFS_NS PI_LFS_A1 PI_LFS_A2 PI_LFS_A3 PI_LFS_A4 PI_LFS_A5 PI_LFS_A6; eval "$ns"' pi-lfs-ns &
+ns=$!
+echo $ns > "$sid_file"
+trap "kill -TERM $ns 2>/dev/null" TERM
+wait $ns; code=$?
+while kill -0 $ns 2>/dev/null; do wait $ns; code=$?; done
+exit $code
