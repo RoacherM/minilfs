@@ -60,7 +60,7 @@ const settledAfter = (n) => (m) => m.type === "agent_settled" && events.indexOf(
 try {
   await step("status line: starting -> on", async () => {
     await waitFor(ui("setStatus", (m) => /LayerFS starting/.test(m.statusText ?? "")), "starting status", 30_000);
-    await waitFor(ui("setStatus", (m) => /LayerFS on/.test(m.statusText ?? "")), "ready status", 90_000);
+    await waitFor(ui("setStatus", (m) => /LayerFS s-/.test(m.statusText ?? "")), "ready status", 90_000);
   });
 
   await step("agent writes stay in LayerFS (0 Sandboxes); status shows checkpoints/unapplied", async () => {
@@ -71,7 +71,7 @@ try {
     assert.equal(existsSync(join(cwd, "new.txt")), false);
     const sb = docker("ps", "-q", "--filter", `name=^${PREFIX}`, "--filter", "label=layerfs.role=sandbox").stdout.trim();
     assert.equal(sb, "", "Store-direct writes in RPC mode must start 0 Sandboxes");
-    const st = await waitFor(ui("setStatus", (m) => /2 checkpoints · unapplied/.test(m.statusText ?? "")), "checkpoint status");
+    const st = await waitFor(ui("setStatus", (m) => /2 unapplied/.test(m.statusText ?? "")), "checkpoint status");
     return st.statusText;
   });
 

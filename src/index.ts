@@ -40,9 +40,29 @@ export default function layerfsExtension(pi: ExtensionAPI) {
   };
   const onHost = (name: string, id: string, params: any, signal: any, onUpdate: any) => host[name](hostCwd).execute(id, params, signal, onUpdate);
 
-  const status = (ctx: ExtensionContext | undefined, text: string | undefined) => { try { ctx?.ui.setStatus("layerfs", text); } catch {} };
-  const describe = (s: LayerfsSession) =>
-    `LayerFS ${s.blocked ? "BLOCKED" : `on (${s.workBranch})`} · ${s.checkpoints.length} checkpoints${s.unapplied ? " · unapplied" : ""}`;
+  // Default footer (setStatus) + chip for statusline extensions that listen to `notify:status`
+  // on pi.events (e.g. @savagelands-net/pi-statusline).
+  const status = (ctx: ExtensionContext | undefined, text: string | undefined) => {
+    try { ctx?.ui.setStatus("layerfs", text); } catch {}
+    try {
+      if (text === undefined) {
+        pi.events.emit("notify:status", { source: "layerfs", state: "cleared" });
+      } else {
+        const isError = /FAILED|BLOCKED/.test(text);
+        pi.events.emit("notify:status", {
+          source: "layerfs",
+          state: isError ? "error" : "active",
+          label: text.replace(/^LayerFS\s*/, "") || text,
+          icon: "LFS",
+        });
+      }
+    } catch {}
+  };
+  const describe = (s: LayerfsSession) => {
+    if (s.blocked) return "LayerFS BLOCKED · /layerfs retry";
+    const pending = s.unapplied ? ` · ${s.checkpoints.length} unapplied` : "";
+    return `LayerFS ${s.workBranch}${pending}`;
+  };
 
   async function need(): Promise<LayerfsSession> {
     if (disabled) throw new Error("LayerFS is disabled for this run");
