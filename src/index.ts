@@ -270,8 +270,20 @@ export default function layerfsExtension(pi: ExtensionAPI) {
 
   // ------------------------------------------------------------- command
 
+  const SUBCOMMANDS: Array<[string, string]> = [
+    ["status", "当前分支、checkpoint 数、是否有未写回的改动"],
+    ["diff", "列出本会话改了哪些文件"],
+    ["apply", "把改动写回你的项目目录（有冲突则一个都不写）"],
+    ["sync", "把你在 Pi 外的改动同步进 LayerFS main"],
+    ["branches", "列出项目里所有 LayerFS 分支"],
+    ["retry", "checkpoint 失败被锁住后重试"],
+  ];
   pi.registerCommand("layerfs", {
     description: "LayerFS workspace: status | diff | apply | retry | sync | branches",
+    getArgumentCompletions: (prefix: string) => {
+      const items = SUBCOMMANDS.filter(([n]) => n.startsWith(prefix.trim())).map(([value, description]) => ({ value, label: value, description }));
+      return items.length ? items : null;
+    },
     handler: async (args, ctx) => {
       const sub = (args ?? "").trim().split(/\s+/)[0] || "status";
       const say = (t: string, level: "info" | "warning" | "error" = "info") => (ctx.hasUI ? ctx.ui.notify(t, level) : console.log(t));
@@ -312,7 +324,7 @@ export default function layerfsExtension(pi: ExtensionAPI) {
         status(ctx, describe(s));
         return say([`Applied ${r.applied.length} change(s) to ${s.cwd}.`, r.skipped.length ? `Skipped (never applied): ${r.skipped.join(", ")}` : ""].filter(Boolean).join("\n"));
       }
-      return say(`Unknown subcommand ${sub}. Use: status | diff | apply | retry | sync | branches`, "warning");
+      return say([`未知子命令 "${sub}"。可用：`, ...SUBCOMMANDS.map(([n, d]) => `  /layerfs ${n.padEnd(9)} ${d}`)].join("\n"), "warning");
     },
   });
 }
