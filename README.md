@@ -76,5 +76,6 @@ npm run probe:real     # low-level LayerFS probes (see probes/real/FINDINGS.md)
 - Commands run in Linux: host (darwin) `node_modules` native addons are copied as-is and will not load there.
 - Only the 7 built-in tools and `!` commands are isolated; other extensions/MCP tools still act on the host.
 - No resume: a resumed/forked Pi session starts a fresh workspace from the current folder; unapplied work of an ended session stays in its Docker volume (`~/.cache/pi-layerfs/sessions/<project>/session.json`) without a restore command yet.
+- **No orphan GC yet**: if Pi is killed hard (SIGKILL/crash) its worker/Sandbox containers and volume stay behind (`docker ps -a --filter name=pi-lfs-`). Needs a startup sweeper or `/layerfs gc`.
 - `grep` uses GNU `grep -P` in the Sandbox (not ripgrep); `find` globs use Node `path.matchesGlob`.
 - Interactive TUI rendering was not driven directly; its dialogs/status were tested through RPC mode.
