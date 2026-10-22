@@ -44,7 +44,7 @@ flags consume a following non-flag argument).
 
 ## Commands
 
-`/layerfs status` · `/layerfs diff` · `/layerfs apply` (confirm dialog when a UI exists) · `/layerfs retry`
+`/layerfs status` · `/layerfs diff` · `/layerfs history [n]` (this session's checkpoints: tool, time, changed files, HEAD/applied; Store reads only) · `/layerfs apply` (confirm dialog when a UI exists) · `/layerfs retry`
 
 ## Guarantees (each covered by tests)
 

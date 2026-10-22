@@ -15,6 +15,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { resolveConfig } from "./config.ts";
 import { LayerfsSession, type Checkpoint } from "./workspace.ts";
+import { formatHistory, hiddenPath, loadHistory } from "./history.ts";
 
 export const CHECKPOINT_ENTRY = "layerfs-checkpoint";
 export const SESSION_ENTRY = "layerfs-session";
@@ -293,24 +294,26 @@ export default function layerfsExtension(pi: ExtensionAPI) {
   const SUBCOMMANDS: Array<[string, string]> = [
     ["status", "当前分支、checkpoint 数、是否有未写回的改动"],
     ["diff", "列出本会话改了哪些文件"],
+    ["history", "本会话的保存历史：每次改动、来自哪个工具、改了哪些文件（可加条数，如 history 50）"],
     ["apply", "把改动写回你的项目目录（有冲突则一个都不写）"],
     ["sync", "把你在 Pi 外的改动同步进 LayerFS main"],
     ["branches", "列出项目里所有 LayerFS 分支"],
     ["retry", "checkpoint 失败被锁住后重试"],
   ];
   pi.registerCommand("layerfs", {
-    description: "LayerFS workspace: status | diff | apply | retry | sync | branches",
+    description: "LayerFS workspace: status | diff | history | apply | retry | sync | branches",
     // Pi's editor treats Enter on an open argument menu as "apply completion" (not submit),
     // because the argument prefix does not start with "/". So once the typed argument is
     // already a complete subcommand, show no menu and let Enter submit directly.
     getArgumentCompletions: (prefix: string) => {
       const typed = prefix.trim();
-      if (SUBCOMMANDS.some(([n]) => n === typed)) return null;
+      if (SUBCOMMANDS.some(([n]) => n === typed || typed.startsWith(`${n} `))) return null;
       const items = SUBCOMMANDS.filter(([n]) => n.startsWith(typed)).map(([value, description]) => ({ value, label: value, description }));
       return items.length ? items : null;
     },
     handler: async (args, ctx) => {
-      const sub = (args ?? "").trim().split(/\s+/)[0] || "status";
+      const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      const sub = argv[0] || "status";
       const say = (t: string, level: "info" | "warning" | "error" = "info") => (ctx.hasUI ? ctx.ui.notify(t, level) : console.log(t));
       if (disabled) return say("LayerFS is off for this run.", "warning");
       let s: LayerfsSession;
@@ -323,12 +326,17 @@ export default function layerfsExtension(pi: ExtensionAPI) {
           s.blocked ? `blocked: ${s.blocked.reason}` : "",
         ].filter(Boolean).join("\n"));
       }
+      if (sub === "history") {
+        const n = Number(argv[1] ?? 20);
+        const limit = Number.isFinite(n) && n > 0 ? Math.floor(n) : 20;
+        return say(formatHistory(await loadHistory(s, limit)));
+      }
       if (sub === "branches") {
         const list = await s.listAllBranches();
         return say(list.map((b) => `${b.name.padEnd(20)} head ${(b.head ?? "-").slice(0, 12)} base ${(b.base ?? "-").slice(0, 12)}`).join("\n"));
       }
       if (sub === "diff") {
-        const d = (await s.diff()).filter((i) => i.type !== "dir");
+        const d = (await s.diff()).filter((i) => i.type !== "dir" && !hiddenPath(i.path));
         return say(d.length ? d.map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`).join("\n") : "No changes in the LayerFS workspace.");
       }
       if (sub === "sync") {
@@ -341,7 +349,7 @@ export default function layerfsExtension(pi: ExtensionAPI) {
         return say(r.error ? `Retry failed: ${r.error.message}` : "Checkpoint saved; changes are unblocked.", r.error ? "error" : "info");
       }
       if (sub === "apply") {
-        const d = (await s.diff()).filter((i) => i.type !== "dir");
+        const d = (await s.diff()).filter((i) => i.type !== "dir" && !hiddenPath(i.path));
         if (!d.length) return say("Nothing to apply.");
         if (ctx.hasUI && !(await ctx.ui.confirm("Apply LayerFS changes to your folder?", d.map((i) => `${i.kind} ${i.path}`).slice(0, 40).join("\n")))) return say("Apply cancelled.");
         const r = await s.apply();

@@ -8,6 +8,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { resolveConfig } from "../src/config.ts";
 import { LayerfsSession } from "../src/workspace.ts";
+import { formatHistory, loadHistory, parseMessage } from "../src/history.ts";
 
 const id = Date.now().toString(36);
 const base = join(homedir(), ".cache/pi-layerfs-test", `v2-${id}`);
@@ -156,6 +157,9 @@ try {
     const text = out.join("");
     assert.doesNotMatch(text, /\.env/, `git status mentions .env: ${text}`);
     assert.doesNotMatch(text, /\.lww/, `git status mentions .lww: ${text}`);
+    // a read-only command must not create a Commit (the prelude must not rewrite .git/index again)
+    const ro = await sA.mutate("ro", "bash", () => sA.exec("node -e 1 && git status --porcelain >/dev/null", cwd, { onData: () => {} }));
+    assert.equal(ro.checkpoint, null, `read-only bash created a Commit ${ro.checkpoint?.commit}`);
     return text.trim().split("\n").slice(0, 6).join(" | ") || "(clean)";
   });
 
@@ -235,6 +239,52 @@ try {
     await sA.switchToRef(sA.baseRef);
     assert.equal(await sA.exists(join(cwd, "time.txt")), false);
     return `switched snapshots in ${ms} ms`;
+  });
+
+  await step("/layerfs history: newest first, tool origins, changed files, HEAD after /tree, applied marks, 0 Sandboxes", async () => {
+    assert.deepEqual(parseMessage("pi bash (exit 3) [call_1,call_2]"), { label: "bash (exit 3)", origins: ["call_1", "call_2"] });
+    const sH = new LayerfsSession(cwd, `sessH-${id}`, config);
+    await sH.open();
+    try {
+      await sH.mutate("h1", "write", () => sH.writeFile(join(cwd, "hist/one.txt"), "1\n"));
+      await sH.mutate("h2", "bash", () => sH.exec("echo 2 > hist/two.txt && rm hist/one.txt", cwd, { onData: () => {} }));
+      const h3 = await sH.mutate("h3", "write", () => sH.writeFile(join(cwd, "hist/three.txt"), "3\n"));
+      const sandboxesBefore = docker("ps", "-q", "--filter", `name=^${config.prefix}`, "--filter", "label=layerfs.role=sandbox").stdout.trim().split("\n").filter(Boolean).length;
+
+      const v = await loadHistory(sH);
+      assert.equal(v.rows.length, 3);
+      assert.deepEqual(v.rows.map((r) => r.origins[0]), ["h3", "h2", "h1"], "newest first with tool-call origins");
+      assert.deepEqual(v.rows[0].files, [{ kind: "Added", path: "hist/three.txt" }]);
+      assert.deepEqual(v.rows[1].files.map((f) => `${f.kind}:${f.path}`).sort(), ["Added:hist/two.txt", "Removed:hist/one.txt"]);
+      assert.deepEqual(v.rows[2].files, [{ kind: "Added", path: "hist/one.txt" }], "first Commit's files from the base Branch");
+      assert.equal(v.rows[0].isHead, true);
+      assert.equal(v.unapplied.length > 0, true);
+      const text = formatHistory(v);
+      assert.match(text, /● [0-9a-f]{12}  write .*\(HEAD\)/);
+      assert.match(text, /\+hist\/three\.txt/);
+      assert.match(text, /Not yet applied: \d+ file/);
+
+      const sandboxesAfter = docker("ps", "-q", "--filter", `name=^${config.prefix}`, "--filter", "label=layerfs.role=sandbox").stdout.trim().split("\n").filter(Boolean).length;
+      assert.equal(sandboxesAfter, sandboxesBefore, "history must not start a Sandbox");
+
+      // /tree back to h2: history shows h2 as HEAD and no h3
+      await sH.switchToRef(v.rows[1].id);
+      const v2 = await loadHistory(sH);
+      assert.deepEqual(v2.rows.map((r) => r.origins[0]), ["h2", "h1"]);
+      assert.equal(v2.rows[0].isHead, true);
+
+      // apply marks Commits as applied
+      await sH.switchToRef(h3.checkpoint.commit);
+      const res = await sH.apply();
+      assert.deepEqual(res.conflicts, []);
+      const v3 = await loadHistory(sH);
+      assert.ok(v3.rows.every((r) => r.applied), "all Commits applied after /layerfs apply");
+      assert.equal(v3.unapplied.length, 0);
+      assert.match(formatHistory(v3), /Everything on this branch is applied/);
+      return text.split("\n").slice(0, 4).join(" / ");
+    } finally {
+      await sH.close();
+    }
   });
 
   await step("P0-6: external host edits (e.g. git pull) are synced into main when a new session C starts", async () => {

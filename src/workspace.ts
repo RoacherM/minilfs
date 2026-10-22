@@ -1096,7 +1096,8 @@ export function gitHidePrelude(excludes: string[]): string {
   return [
     `if [ -d "$2/.git" ] && command -v git >/dev/null 2>&1; then`,
     `mkdir -p "$2/.git/info" && (grep -qxF '/.lww' "$2/.git/info/exclude" 2>/dev/null || echo '/.lww' >> "$2/.git/info/exclude");`,
-    `git -C "$2" ls-files -z -- ${specs} 2>/dev/null | while IFS= read -r -d '' f; do [ -e "$2/$f" ] || git -C "$2" update-index --skip-worktree -- "$f" 2>/dev/null; done;`,
+    // `ls-files -v` prints "S " for entries already marked skip-worktree: leave those (and .git/index) untouched
+    `git -C "$2" ls-files -v -- ${specs} 2>/dev/null | while IFS= read -r line; do t="\${line%% *}"; f="\${line#* }"; [ "$t" = S ] && continue; [ -e "$2/$f" ] || git -C "$2" update-index --skip-worktree -- "$f" 2>/dev/null; done;`,
     `fi;`,
   ].join(" ");
 }
