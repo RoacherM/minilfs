@@ -300,8 +300,13 @@ export default function layerfsExtension(pi: ExtensionAPI) {
   ];
   pi.registerCommand("layerfs", {
     description: "LayerFS workspace: status | diff | apply | retry | sync | branches",
+    // Pi's editor treats Enter on an open argument menu as "apply completion" (not submit),
+    // because the argument prefix does not start with "/". So once the typed argument is
+    // already a complete subcommand, show no menu and let Enter submit directly.
     getArgumentCompletions: (prefix: string) => {
-      const items = SUBCOMMANDS.filter(([n]) => n.startsWith(prefix.trim())).map(([value, description]) => ({ value, label: value, description }));
+      const typed = prefix.trim();
+      if (SUBCOMMANDS.some(([n]) => n === typed)) return null;
+      const items = SUBCOMMANDS.filter(([n]) => n.startsWith(typed)).map(([value, description]) => ({ value, label: value, description }));
       return items.length ? items : null;
     },
     handler: async (args, ctx) => {

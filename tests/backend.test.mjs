@@ -31,8 +31,7 @@ function fixture(dir) {
   mkdirSync(join(dir, "src/sub"), { recursive: true });
   mkdirSync(join(dir, "scripts"), { recursive: true });
   mkdirSync(join(dir, "node_modules/pkg"), { recursive: true });
-  mkdirSync(join(dir, ".git"), { recursive: true });
-  writeFileSync(join(dir, ".git/HEAD"), "ref: refs/heads/main\n");
+
   writeFileSync(join(dir, "README.md"), "hello v1\n");
   writeFileSync(join(dir, "src/app.js"), "export const a = 1;\n");
   writeFileSync(join(dir, "src/sub/util.ts"), "export const util = 42;\n");
@@ -45,6 +44,11 @@ function fixture(dir) {
   writeFileSync(join(dir, ".env"), "SECRET=production-secret\n");
   writeFileSync(join(dir, "img.bin"), Buffer.from([0, 1, 2, 255, 0, 10, 13]));
   symlinkSync("src/app.js", join(dir, "link"));
+  writeFileSync(join(dir, ".gitignore"), "node_modules/\n");
+  const git = (...a) => spawnSync("git", ["-C", dir, ...a], { encoding: "utf8" });
+  git("init", "-q");
+  git("add", "-A");
+  git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init");
 }
 
 const cwd = join(base, "project");
@@ -143,6 +147,16 @@ try {
     assert.match(all, /PI_X=yes SECRET=unset/);
     assert.match(all, /build-v2/);
     assert.ok(chunks[0].t < 600 && chunks.at(-1).t > 650, `expected streaming chunks: ${JSON.stringify(chunks.map((c) => c.t))}`);
+  });
+
+  await step("git in workspace: excluded .env is not shown as deleted, .lww not shown as untracked", async () => {
+    const out = [];
+    const r = await sA.exec("git status --porcelain", cwd, { onData: (d) => out.push(d.toString()) });
+    assert.equal(r.exitCode, 0);
+    const text = out.join("");
+    assert.doesNotMatch(text, /\.env/, `git status mentions .env: ${text}`);
+    assert.doesNotMatch(text, /\.lww/, `git status mentions .lww: ${text}`);
+    return text.trim().split("\n").slice(0, 6).join(" | ") || "(clean)";
   });
 
   await step("bash abort & timeout reap process groups cleanly", async () => {

@@ -751,10 +751,10 @@ export class LayerfsSession {
       }
     }
 
-    const script = `echo $$ > ${sidFile}; cd "$1" || exit 1; rm -f .lww; exec bash -c "$0"`;
+    const script = `echo $$ > ${sidFile}; ${gitHidePrelude(this.config.excludes)} cd "$1" || exit 1; exec bash -c "$0"`;
     const child = spawn(
       this.config.docker,
-      ["exec", "-u", ident, "-e", "HOME=/tmp", ...envArgs, "-w", ws.path, container, "setsid", "-w", "bash", "-c", script, rewrittenCmd, wsCwd],
+      ["exec", "-u", ident, "-e", "HOME=/tmp", ...envArgs, "-w", ws.path, container, "setsid", "-w", "bash", "-c", script, rewrittenCmd, wsCwd, ws.path],
       { stdio: ["ignore", "pipe", "pipe"], env: dockerEnv() },
     );
     let errText = "";
@@ -1081,6 +1081,24 @@ function enoent(path: string, why: string) {
 function sameSig(a: { kind: string; sig: string } | null, b: { kind: string; sig: string } | null) {
   if (!a || !b) return a === b;
   return a.kind === b.kind && a.sig === b.sig;
+}
+
+/**
+ * Shell prelude run before each bash command (workspace root is "$2"):
+ * - excluded secret files (e.g. .env) that git tracks but are absent from the Branch are marked
+ *   skip-worktree, so `git status` does not report them as deleted and the agent does not "restore" them;
+ * - `.lww` (LayerFS merge rules) is listed in `.git/info/exclude`, so it never shows as untracked.
+ * Only `.git/` changes, which apply never writes back to the host.
+ */
+export function gitHidePrelude(excludes: string[]): string {
+  const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+  const specs = excludes.flatMap((e) => [q(`:(glob)${e}`), q(`:(glob)**/${e}`)]).join(" ");
+  return [
+    `if [ -d "$2/.git" ] && command -v git >/dev/null 2>&1; then`,
+    `mkdir -p "$2/.git/info" && (grep -qxF '/.lww' "$2/.git/info/exclude" 2>/dev/null || echo '/.lww' >> "$2/.git/info/exclude");`,
+    `git -C "$2" ls-files -z -- ${specs} 2>/dev/null | while IFS= read -r -d '' f; do [ -e "$2/$f" ] || git -C "$2" update-index --skip-worktree -- "$f" 2>/dev/null; done;`,
+    `fi;`,
+  ].join(" ");
 }
 
 export function isExcludedPath(relPath: string, patterns: string[]): boolean {
