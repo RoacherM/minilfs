@@ -6,7 +6,7 @@ Linux LayerFS Branch/Workspace imported from the project folder. Your folder cha
 when you run `/layerfs apply`.
 
 Status: v0.2 (see docs/DESIGN-v0.2.md, docs/REVIEW-v0.2-opus-5.5.md), tested with stock Pi 1.2.0 and LayerFS `5fb68dd` on macOS arm64 + Docker Desktop.
-Not wired into Epi yet.
+Optional in Epi: enable it explicitly via the Manifest (`epi install <path>`); machines without Docker are unaffected unless they declare it. See docs/EPI-INTEGRATION.md.
 
 ## How it works
 
