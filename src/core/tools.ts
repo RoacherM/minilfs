@@ -23,12 +23,13 @@ export const LAYERFS_TOOL_DESCRIPTION = [
   "action=show branch=<name> path=<file> [offset=1] [limit=N]: print a file (or list directory) from another branch (supports pagination).",
   "action=ls [branch=<name>] [path=/]: list directory entries on a branch.",
   "action=checkout branch=<name> (path=<file>|paths=[...]): copy files or directories from another branch into your branch.",
+  "action=clean: remove temporary scratch build caches for this project.",
 ].join(" ");
 
 export const LAYERFS_TOOL_SCHEMA = {
   type: "object",
   properties: {
-    action: { type: "string", enum: ["status", "diff", "branches", "sync", "merge", "show", "ls", "checkout"] },
+    action: { type: "string", enum: ["status", "diff", "branches", "sync", "merge", "show", "ls", "checkout", "clean"] },
     branch: { type: "string", description: "branch to merge (action=merge), read from (action=show/ls/checkout), or diff (action=diff/sync)" },
     base: { type: "string", description: "base branch to diff against (action=diff)" },
     path: { type: "string", description: "file or directory path (action=show, action=ls, action=checkout)" },
@@ -51,7 +52,7 @@ export const LAYERFS_APPLY_TOOL_SCHEMA = {
 } as const;
 
 export interface LayerfsActionParams {
-  action: "status" | "diff" | "branches" | "sync" | "merge" | "show" | "ls" | "checkout";
+  action: "status" | "diff" | "branches" | "sync" | "merge" | "show" | "ls" | "checkout" | "clean";
   branch?: string;
   base?: string;
   path?: string;
@@ -344,6 +345,10 @@ export async function executeLayerfsAction(
       : "";
     const fallbackInfo = r.fallback ? " (via path-wise merge)" : "";
     return `Merged ${other}${fallbackInfo}. You are now on ${r.branch}${lwwInfo}.`;
+  }
+  if (action === "clean") {
+    const res = await s.cleanScratch();
+    return `Cleaned scratch build caches at ${res.removedPath}.`;
   }
   throw new Error(`unknown action ${action}`);
 }

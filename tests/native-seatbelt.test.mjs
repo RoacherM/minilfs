@@ -17,6 +17,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { resolveConfig } from "../src/config.ts";
+import { registerExecutionDriver } from "../src/core/index.ts";
 import { formatHistory, loadHistory } from "../src/history.ts";
 import { LayerfsSession, stopNativeDaemons } from "../src/workspace.ts";
 
@@ -543,6 +544,75 @@ try {
     const applyRes = await sLead.apply();
     assert.ok(applyRes.conflicts.includes("feature.txt"), "must detect conflict on feature.txt");
     assert.equal(readFileSync(join(cwd, "feature.txt"), "utf8"), "host external conflict\n");
+  });
+
+  await step("7.1 shell prelude: cd <hostCwd> redirects into workspace & built-in timeout exits 124", async () => {
+    const chunks = [];
+    const r = await sA.mutate("pre1", "bash", () =>
+      sA.exec(
+        `cd "${cwd}" && echo "redirected-ok" > cd-test.txt && cd "${cwd}/src" && pwd -P`,
+        cwd,
+        { onData: (d) => chunks.push(d.toString()) },
+      ),
+    );
+    assert.equal(r.value.exitCode, 0, chunks.join(""));
+    assert.equal((await sA.readFile(join(cwd, "cd-test.txt"))).toString().trim(), "redirected-ok");
+    assert.equal(existsSync(join(cwd, "cd-test.txt")), false, "host folder untouched");
+
+    // Built-in timeout function on macOS
+    const t0 = Date.now();
+    const rTimeout = await sA.exec("timeout 1 sleep 10", cwd, { onData: () => {} });
+    const elapsed = Date.now() - t0;
+    assert.equal(rTimeout.exitCode, 124, "timeout must return 124");
+    assert.ok(elapsed < 4000, `timeout 1 sleep 10 took ${elapsed} ms`);
+  });
+
+  await step("7.2 persistent mergedFileMtimes across multiple bash calls & cleanScratch", async () => {
+    await sWorker.mutate("m-w1", "write", () => sWorker.writeFile(join(cwd, "persisted-mtime.rs"), "fn a() {}\n"));
+    await new Promise((r) => setTimeout(r, 1100));
+    const beforeMergeSec = Math.floor(Date.now() / 1000);
+    await sLead.mergeBranch(sWorker.workBranch);
+
+    // 1st bash call after merge is a read-only grep (which previously cleared touchPathsOnNextExec!)
+    await sLead.exec("grep -q 'fn a' persisted-mtime.rs", cwd, { onData: () => {} });
+
+    // 2nd bash call checks the mtime of persisted-mtime.rs on a freshly mounted workspace
+    const out = [];
+    await sLead.exec("stat -f %m persisted-mtime.rs", cwd, { onData: (d) => out.push(d.toString()) });
+    const fileMtimeSec = Number(out.join("").trim());
+    assert.ok(fileMtimeSec >= beforeMergeSec, `mtime (${fileMtimeSec}) must stay >= merge time (${beforeMergeSec}) on 2nd bash call`);
+
+    // cleanScratch removes the project scratch dir
+    const cleaned = await sLead.cleanScratch();
+    assert.equal(existsSync(cleaned.removedPath), false);
+  });
+
+  await step("7.3 pluggable ExecutionDriver seam for remote/distributed sandbox execution", async () => {
+    const calls = [];
+    registerExecutionDriver("mock-distributed", {
+      name: "mock-distributed",
+      async preflight() { return "mock-distributed"; },
+      async execInWorkspace(ctx) {
+        calls.push({ project: ctx.projectName, branch: ctx.logicalBranch, cmd: ctx.command });
+        writeFileSync(join(ctx.wsReal, "from-remote-driver.txt"), "distributed-ok\n");
+        ctx.options.onData(Buffer.from("REMOTE_DRIVER_STDOUT\n"));
+        return { exitCode: 0 };
+      },
+      async reapWorkspaceHolders() {},
+    });
+
+    const sRemote = new LayerfsSession(cwd, `sessRem-${id}`, { ...config, driver: "mock-distributed", branchName: "dist-worker-1" });
+    await sRemote.open();
+    const out = [];
+    const r = await sRemote.mutate("rem1", "bash", () =>
+      sRemote.exec("cargo test --distributed", cwd, { onData: (d) => out.push(d.toString()) }),
+    );
+    assert.equal(r.value.exitCode, 0);
+    assert.equal(out.join("").trim(), "REMOTE_DRIVER_STDOUT");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].branch, "dist-worker-1");
+    assert.equal((await sRemote.readFile(join(cwd, "from-remote-driver.txt"))).toString(), "distributed-ok\n");
+    await sRemote.close();
   });
 
 } finally {

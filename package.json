@@ -1,17 +1,18 @@
 {
-  "name": "@roacherm/pi-layerfs",
-  "version": "0.3.0",
-  "description": "100% Native LayerFS workspace isolation + Claude Code srt-style macOS Seatbelt sandbox for Pi, Epi, Claude Code, Codex, and MCP.",
+  "name": "@roacherm/minilfs",
+  "version": "0.4.0",
+  "description": "minilfs: 100% Native LayerFS workspace runtime + Claude Code srt-style macOS Seatbelt sandbox + pluggable distributed ExecutionDriver for Pi, Epi, Claude Code, Codex, and MCP.",
   "type": "module",
   "license": "MIT",
   "author": "RoacherM",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/RoacherM/pi-layerfs.git"
+    "url": "git+https://github.com/RoacherM/minilfs.git"
   },
-  "homepage": "https://github.com/RoacherM/pi-layerfs#readme",
-  "bugs": "https://github.com/RoacherM/pi-layerfs/issues",
+  "homepage": "https://github.com/RoacherM/minilfs#readme",
+  "bugs": "https://github.com/RoacherM/minilfs/issues",
   "keywords": [
+    "minilfs",
     "pi-package",
     "pi-extension",
     "epi",
@@ -25,11 +26,13 @@
     "node": ">=22.19"
   },
   "bin": {
+    "minilfs": "./src/cli.ts",
     "pi-layerfs": "./src/cli.ts"
   },
   "exports": {
     ".": "./src/index.ts",
     "./core": "./src/core/index.ts",
+    "./driver": "./src/core/driver.ts",
     "./cli": "./src/cli.ts"
   },
   "files": [

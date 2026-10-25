@@ -1,36 +1,39 @@
-# pi-layerfs (`RoacherM/pi-layerfs`)
+# minilfs (`RoacherM/minilfs`)
 
-A **100% Native, Zero-Docker** [LayerFS](https://github.com/Ephemeral-AI-Lab/layerfs) runtime, [Pi](https://pi.dev) / [Epi](https://github.com/RoacherM/epi) extension, and universal CLI / MCP server that isolates agent file operations and shell commands on copy-on-write LayerFS branches, guarded at the OS kernel level by a Claude Code (`@anthropic-ai/sandbox-runtime` / `srt`)-inspired macOS Seatbelt (`sandbox-exec`) sandbox.
+**minilfs** (`@roacherm/minilfs`) is a **100% Native, Zero-Docker** [LayerFS](https://github.com/Ephemeral-AI-Lab/layerfs) workspace runtime, [Pi](https://pi.dev) / [Epi](https://github.com/RoacherM/epi) extension, universal CLI / MCP server, and pluggable distributed execution engine.
 
-Your real project folder changes **only** when you run `/layerfs apply` (or `layerfs_apply` / `pi-layerfs apply`).
+It isolates coding agents' file operations and shell commands on copy-on-write LayerFS branches, guarded at the OS kernel level by a Claude Code (`@anthropic-ai/sandbox-runtime` / `srt`)-inspired macOS Seatbelt (`sandbox-exec`) sandbox — while providing a clean `ExecutionDriver` seam to route workloads to remote or distributed Sandboxes without changing a single upper-layer call.
 
 ---
 
-## Architecture: Harness-Agnostic Core + Universal Adapters
+## Architecture: Three-Tier Pluggable Design
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ Upper Layer: Universal Harness Surfaces                                 │
+│ Tier 1: Universal Agent Harness Adapters                                │
 │  ├─ Pi & Epi Extension (`src/index.ts`)                                 │
-│  │    `epi install git:github.com/RoacherM/pi-layerfs`                  │
-│  │    `pi install git:github.com/RoacherM/pi-layerfs`                   │
+│  │    `epi install git:github.com/RoacherM/minilfs`                     │
+│  │    `pi install git:github.com/RoacherM/minilfs`                      │
 │  ├─ CLI & MCP Server (`src/cli.ts`)                                     │
-│  │    `pi-layerfs mcp` -> Claude Code / Codex / Cursor MCP Server       │
-│  │    `pi-layerfs exec -- <cmd>` -> Sandboxed branch command runner     │
-│  └─ Programmatic SDK (`@roacherm/pi-layerfs/core`, `src/core/index.ts`) │
+│  │    `minilfs mcp` -> Claude Code / Codex / Cursor MCP Server          │
+│  │    `minilfs exec -- <cmd>` -> Sandboxed branch command runner        │
+│  └─ Programmatic SDK (`@roacherm/minilfs/core`, `src/core/index.ts`)    │
 ├─────────────────────────────────────────────────────────────────────────┤
-│ Lower Layer: Harness-Agnostic Native Workspace Engine (`src/core/`)     │
-│  Zero Pi/Epi dependencies! Pure Node.js + Native LayerFS + OS Seatbelt. │
-│  ├─ In-process APFS SQLite Store (`layerfs.node`)                       │
-│  │    read / write / edit / ls / find / grep / diff / history in ~1–8ms │
-│  ├─ Local NFSv3 Loopback Daemon (`layerfs-daemon` on 127.0.0.1)         │
-│  │    Unprivileged `/sbin/mount_nfs` per-branch Workspace mounts        │
-│  ├─ Claude Code (`srt`)-Style macOS Seatbelt Sandbox (`src/seatbelt.ts`)│
-│  │    • Deny-by-default writes: only mounted branch & scratch writable  │
-│  │    • Kernel write-lock on real host project folder & `.git/config`   │
-│  │    • Kernel read-deny & move-blocking on `.env*`, `*.key`, `~/.ssh`  │
-│  │    • Kernel `file-mount`/`file-unmount` & optional network lockdown  │
-│  └─ Multi-Agent Team DAG (`merge`, 3-way fallback, `checkout`, `sync`)  │
+│ Tier 2: Harness-Agnostic Workspace & DAG Engine (`src/workspace.ts`)    │
+│  • In-process APFS SQLite Store (`layerfs.node`) — 1–8ms file ops       │
+│  • Multi-Agent Team DAG: `merge` (with automatic 3-way path fallback),  │
+│    `sync`, `diff`, `ls`, `show` (paginated), `checkout`, `apply`        │
+│  • Persistent post-merge `mtime` refresh across remounts                │
+├─────────────────────────────────────────────────────────────────────────┤
+│ Tier 3: Pluggable ExecutionDriver Seam (`src/core/driver.ts`)           │
+│  ├─ `LocalNativeDriver` (Default):                                      │
+│  │    • Local `layerfs-daemon` NFSv3 loopback + `/sbin/mount_nfs`       │
+│  │    • Claude Code (`srt`)-style macOS Seatbelt (`sandbox-exec`)       │
+│  │    • Built-in `cd <hostCwd>` redirect, macOS `timeout` shim,         │
+│  │      and per-branch APFS scratch (`$MINILFS_SCRATCH_DIR`)            │
+│  └─ `registerExecutionDriver(name, driver)` (Distributed Seam):         │
+│       Route `execInWorkspace` to remote/distributed Sandboxes           │
+│       (Cloudflare Sandbox, E2B, Modal, SSH/RPC compute nodes)           │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -38,40 +41,33 @@ Your real project folder changes **only** when you run `/layerfs apply` (or `lay
 
 ## 1. Prerequisites (Once per Mac — Zero Docker, Zero Root, Zero macFUSE)
 
-| Need | Why |
-|---|---|
-| macOS (Apple Silicon / Intel) | Uses macOS built-in `/sbin/mount_nfs` and `/usr/bin/sandbox-exec` |
-| Rust (`cargo`) & `git` | Builds the native `layerfs-daemon` and `layerfs.node` once |
-
-Build the native bundle (`~/.cache/epi-layerfs/bundle-native`, ~1 min):
-
 ```bash
-git clone https://github.com/RoacherM/pi-layerfs.git
-./pi-layerfs/scripts/setup-layerfs.sh
+git clone https://github.com/RoacherM/minilfs.git
+./minilfs/scripts/setup-layerfs.sh
 ```
 
 ---
 
-## 2. Install in Epi or Pi (Direct from GitHub!)
+## 2. Install in Epi or Pi
 
 ### Epi
 
 ```bash
 # Global install (~/.epi/epi.json)
-epi install git:github.com/RoacherM/pi-layerfs
+epi install git:github.com/RoacherM/minilfs
 
 # Or project-only (.epi/epi.json)
-epi install -l --approve git:github.com/RoacherM/pi-layerfs
+epi install -l --approve git:github.com/RoacherM/minilfs
 ```
 
 ### Pi
 
 ```bash
 # Global install (~/.pi/agent/settings.json)
-pi install git:github.com/RoacherM/pi-layerfs
+pi install git:github.com/RoacherM/minilfs
 
 # Or project-only (.pi/settings.json)
-pi install -l git:github.com/RoacherM/pi-layerfs
+pi install -l git:github.com/RoacherM/minilfs
 ```
 
 ---
@@ -83,55 +79,60 @@ pi install -l git:github.com/RoacherM/pi-layerfs
 ```json
 {
   "mcpServers": {
-    "layerfs": {
+    "minilfs": {
       "command": "node",
-      "args": ["/path/to/pi-layerfs/src/cli.ts", "mcp"],
+      "args": ["/path/to/minilfs/src/cli.ts", "mcp"],
       "env": {
-        "PI_LAYERFS_TEAM": "1"
+        "MINILFS_TEAM": "1"
       }
     }
   }
 }
 ```
 
-### As a Standalone CLI
+### As a Standalone CLI (`minilfs`)
 
 ```bash
 # Run any command inside an isolated LayerFS branch + macOS Seatbelt sandbox
-node ./src/cli.ts --branch worker-1 exec -- cargo test
+node ./src/cli.ts --branch worker-1 exec -- timeout 110 cargo test
 
-# Inspect, diff, merge, and apply branches
+# Inspect, diff, merge, apply, and clean scratch caches
 node ./src/cli.ts status
 node ./src/cli.ts branches
 node ./src/cli.ts diff worker-1
 node ./src/cli.ts merge worker-1
 node ./src/cli.ts apply
+node ./src/cli.ts clean
 ```
 
 ---
 
-## 4. Programmatic SDK (`@roacherm/pi-layerfs/core`)
+## 4. Pluggable Distributed / Remote Sandbox Driver (`@roacherm/minilfs/driver`)
 
-`src/core/index.ts` has **zero** `@earendil-works/pi-coding-agent` dependencies. Any Node.js harness can embed it directly:
+To dispatch workspace command execution to remote or distributed sandbox nodes while keeping all upper-layer tool calls unchanged:
 
 ```ts
 import {
+  registerExecutionDriver,
   LayerfsSession,
   resolveConfig,
-  createHarnessOperations,
-  executeLayerfsAction,
-  executeLayerfsApply,
-} from "@roacherm/pi-layerfs/core";
+} from "@roacherm/minilfs/core";
 
-const session = new LayerfsSession(process.cwd(), "worker-1", resolveConfig({ PI_LAYERFS_TEAM: "1" }));
+registerExecutionDriver("remote-cluster", {
+  name: "remote-cluster",
+  async preflight() { return "remote-cluster"; },
+  async execInWorkspace(ctx) {
+    // Dispatch ctx.command + ctx.wsReal state to remote worker node, stream stdout to ctx.options.onData
+    return { exitCode: 0 };
+  },
+  async reapWorkspaceHolders() {},
+});
+
+const session = new LayerfsSession(process.cwd(), "worker-1", {
+  ...resolveConfig(),
+  driver: "remote-cluster",
+});
 await session.open();
-
-const ops = createHarnessOperations(session);
-await session.mutate("w1", "write", () => ops.write.writeFile("src/feature.ts", "export const ok = true;\n"));
-console.log(await executeLayerfsAction(session, { action: "diff" }));
-console.log(await executeLayerfsApply(session));
-
-await session.close();
 ```
 
 ---
@@ -147,23 +148,24 @@ await session.close();
 | `/layerfs sync [--full]` | sync external host edits into LayerFS `main` |
 | `/layerfs branches` | active user/worker branches with logical aliases |
 | `/layerfs merge <branch> [--ours\|--theirs]` | merge another branch into yours (with automatic path-wise fallback merge) |
+| `/layerfs clean` | remove temporary scratch build caches for this project |
 | `/layerfs retry` | retry after a failed checkpoint |
 
 ---
 
-## 6. Configuration
+## 6. Configuration (`MINILFS_*` or `PI_LAYERFS_*`)
 
 | Env | Default |
 |---|---|
-| `PI_LAYERFS` | on; `0` turns it off (`--no-layerfs` flag also disables for one run) |
-| `PI_LAYERFS_BUNDLE` | `~/.cache/epi-layerfs/bundle-native` |
-| `PI_LAYERFS_ROOT` | `~/.cache/pi-layerfs` (home, APFS Stores, local mounts, bindings) |
-| `PI_LAYERFS_PREFIX` | `pi-lfs-` |
-| `PI_LAYERFS_NETWORK` | `allow` \| `localhost` \| `deny` (`offline`) — Seatbelt outbound network policy inside `bash` |
-| `PI_LAYERFS_EXCLUDES` | `.env,.env.*,*.pem,*.key,id_rsa*,id_ed25519*,.npmrc,.netrc,.pypirc` |
-| `PI_LAYERFS_BRANCH_ONLY` | comma-separated build-output patterns (e.g. `target/,.cargo-home/`) kept only in branches |
-| `PI_LAYERFS_TEAM` | `1` enables multi-agent `layerfs` / `layerfs_apply` tools |
-| `PI_LAYERFS_BRANCH_NAME` | logical branch alias for this session (defaults to `lead` or `s-<shortId>`) |
+| `MINILFS` / `PI_LAYERFS` | on; `0` turns it off (`--no-layerfs` flag also disables for one run) |
+| `MINILFS_DRIVER` / `PI_LAYERFS_DRIVER` | `native` (or custom registered driver name) |
+| `MINILFS_BUNDLE` / `PI_LAYERFS_BUNDLE` | `~/.cache/epi-layerfs/bundle-native` |
+| `MINILFS_ROOT` / `PI_LAYERFS_ROOT` | `~/.cache/pi-layerfs` |
+| `MINILFS_NETWORK` / `PI_LAYERFS_NETWORK` | `allow` \| `localhost` \| `deny` (`offline`) |
+| `MINILFS_EXCLUDES` / `PI_LAYERFS_EXCLUDES` | `.env,.env.*,*.pem,*.key,id_rsa*,id_ed25519*,.npmrc,.netrc,.pypirc` |
+| `MINILFS_BRANCH_ONLY` / `PI_LAYERFS_BRANCH_ONLY` | comma-separated build-output patterns (e.g. `target/,.cargo-home/`) |
+| `MINILFS_TEAM` / `PI_LAYERFS_TEAM` | `1` enables multi-agent `layerfs` / `layerfs_apply` tools |
+| `MINILFS_BRANCH_NAME` / `PI_LAYERFS_BRANCH_NAME` | logical branch alias for this session (defaults to `lead` or `s-<shortId>`) |
 
 ## License
 

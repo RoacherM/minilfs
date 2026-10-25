@@ -6,6 +6,7 @@ import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "n
 import { BindingStore, type HostEntry, type HostIndex, type ProjectRecord, type SessionBinding } from "./bindings.ts";
 import type { LayerfsConfig } from "./config.ts";
 import { createProjectClient, ensureNativeDirs, type NativeSpec } from "./core/client.ts";
+import { resolveExecutionDriver, type ExecutionDriver } from "./core/driver.ts";
 import { run } from "./core/exec-helper.ts";
 import { bothSpellings, buildSeatbeltProfile } from "./seatbelt.ts";
 
@@ -114,7 +115,9 @@ export class LayerfsSession {
   readonly shortId: string;
   readonly logicalBranch: string;
   readonly touchPathsOnNextExec = new Set<string>();
+  readonly mergedFileMtimes = new Map<string, number>();
   readonly config: LayerfsConfig;
+  readonly driver: ExecutionDriver;
   readonly log: Log;
 
   get isNative(): boolean { return true; }
@@ -144,13 +147,14 @@ export class LayerfsSession {
   private mutex: Promise<unknown> = Promise.resolve();
   private closed = false;
 
-  constructor(cwd: string, sessionId: string, config: LayerfsConfig, log: Log = () => {}) {
+  constructor(cwd: string, sessionId: string, config: LayerfsConfig, log: Log = () => {}, driver?: ExecutionDriver) {
     // canonical path: /tmp/x and /private/tmp/x (or a symlinked folder) are one project
     this.cwd = (() => { try { return realpathSync(resolve(cwd)); } catch { return resolve(cwd); } })();
     this.sessionId = sessionId;
     this.shortId = createHash("sha256").update(`${sessionId}:${randomBytes(8).toString("hex")}`).digest("hex").slice(0, 10);
     this.logicalBranch = config.branchName || (config.team && process.env.PI_SUBAGENT_CHILD !== "1" ? "lead" : `s-${this.shortId}`);
     this.config = config;
+    this.driver = driver ?? resolveExecutionDriver(config.driver ?? "native");
     this.log = log;
   }
 
@@ -437,9 +441,12 @@ export class LayerfsSession {
           if (!page?.hasMore || !(page?.items ?? []).length) break;
           pos = page.nextPagePos ?? (pos + page.items.length);
         }
+        const mergedAt = Date.now();
         for (const it of diffItems) {
           if (it.type !== "dir" && this.isApplicable(it.path)) {
-            this.touchPathsOnNextExec.add(it.path.replace(/^\/+/, ""));
+            const rel = it.path.replace(/^\/+/, "");
+            this.touchPathsOnNextExec.add(rel);
+            this.mergedFileMtimes.set(rel, mergedAt);
           }
         }
 
@@ -626,9 +633,12 @@ export class LayerfsSession {
       this.checkpoints.push({ origins: [`merge:${resolvedOther}`], label: "merge", commit: this.headCommit, branch: target, changed: ops.length > 0 || mountJobs.length > 0, at: Date.now() });
     }
 
+    const mergedAt = Date.now();
     for (const it of theirDiff) {
       if (this.isApplicable(it.path) && it.type !== "dir") {
-        this.touchPathsOnNextExec.add(it.path.replace(/^\/+/, ""));
+        const rel = it.path.replace(/^\/+/, "");
+        this.touchPathsOnNextExec.add(rel);
+        this.mergedFileMtimes.set(rel, mergedAt);
       }
     }
 
@@ -1166,8 +1176,9 @@ export class LayerfsSession {
   }
 
   /**
-   * Mounts a Workspace for this command, streams stdout/stderr inside Seatbelt sandbox-exec,
-   * commits any file changes, reaps holders of this Workspace path, and unmounts immediately.
+   * Mounts a Workspace for this command, delegates execution to `this.driver` (macOS Seatbelt +
+   * NFSv3 by default, or a pluggable remote/distributed Sandbox driver), commits any file changes,
+   * reaps holders of this Workspace path, and unmounts immediately.
    */
   async exec(
     command: string,
@@ -1179,16 +1190,20 @@ export class LayerfsSession {
     const ws = await this.lfs.workspace.mount(this.workBranch);
     const wsReal = await fsp.realpath(ws.path).catch(() => ws.path);
 
-    if (this.touchPathsOnNextExec.size > 0) {
-      const paths = [...this.touchPathsOnNextExec];
+    if (this.touchPathsOnNextExec.size > 0 || this.mergedFileMtimes.size > 0) {
+      const nowMs = Date.now();
+      for (const p of this.touchPathsOnNextExec) {
+        if (!this.mergedFileMtimes.has(p)) this.mergedFileMtimes.set(p, nowMs);
+      }
       this.touchPathsOnNextExec.clear();
-      for (const p of paths) {
+      for (const [p, mergedAt] of this.mergedFileMtimes.entries()) {
         const full = join(wsReal, p);
         try {
           await this.assertInsideWs(wsReal, full, true);
-          const now = new Date();
-          if (typeof fsp.lutimes === "function") {
-            await fsp.lutimes(full, now, now).catch(() => {});
+          const st = await fsp.lstat(full).catch(() => null);
+          if (st && st.mtimeMs < mergedAt && typeof fsp.lutimes === "function") {
+            const d = new Date(mergedAt);
+            await fsp.lutimes(full, d, d).catch(() => {});
           }
         } catch {}
       }
@@ -1197,78 +1212,38 @@ export class LayerfsSession {
     await this.prepareNativeGit(wsReal);
 
     const scratchDir = join(this.config.root, "scratch");
-    await fsp.mkdir(join(scratchDir, this.projectRecord.name, this.logicalBranch), { recursive: true });
-
+    const branchScratchDir = join(scratchDir, this.projectRecord.name, "branches", this.logicalBranch);
+    const sharedCacheDir = join(scratchDir, this.projectRecord.name, "shared");
     const relCwd = this.toRel(hostCwd);
     const runCwd = relCwd ? join(wsReal, relCwd) : wsReal;
-
-    const profile = buildSeatbeltProfile({
-      wsPath: wsReal,
-      hostCwd: this.cwd,
-      scratchDir,
-      configRoot: this.config.root,
-      excludes: this.config.excludes,
-      outsideSecrets: OUTSIDE_SECRET_PATTERNS,
-      network: this.config.network,
-    });
-
-    const childEnv: NodeJS.ProcessEnv = {
-      HOME: homedir(),
-      PATH: process.env.PATH || "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-      TMPDIR: "/private/tmp",
-      USER: process.env.USER || "user",
-      LOGNAME: process.env.LOGNAME || "user",
-    };
-    for (const [k, v] of Object.entries(options.env ?? process.env)) {
-      if (typeof v === "string" && (k.startsWith("PI_") || this.config.envAllow.includes(k))) {
-        childEnv[k] = v;
-      }
-    }
-
-    const child = spawn(
-      "/usr/bin/sandbox-exec",
-      ["-p", profile, "/bin/bash", "-c", command],
-      { cwd: runCwd, env: childEnv, stdio: ["ignore", "pipe", "pipe"], detached: true },
-    );
-    child.stdout.on("data", options.onData);
-    child.stderr.on("data", options.onData);
-
-    const tag = `${this.shortId}-${randomBytes(4).toString("hex")}`;
-    let stopping: Promise<void> | null = null;
-    let killFailed: unknown = null;
-    const kill = () => (stopping ??= this.killNativeSession(child, wsReal).catch((e) => { killFailed = e; }));
-    this.activeSids.set(tag, kill);
-
-    let timedOut = false;
-    const timer = options.timeout && options.timeout > 0 ? setTimeout(() => { timedOut = true; void kill(); }, options.timeout * 1000) : undefined;
-    const onAbort = () => void kill();
-    options.signal?.addEventListener("abort", onAbort, { once: true });
-    if (options.signal?.aborted) void kill();
+    const lwwContent = LWW_DEFAULT + this.config.branchOnly.map((p) => `${p}\n`).join("");
 
     let keepMounted = false;
+    let code: number | null = null;
+    let execErr: unknown = null;
     try {
-      const code = await new Promise<number | null>((resolveCode, reject) => {
-        child.on("error", reject);
-        child.on("close", (c) => resolveCode(c));
+      const res = await this.driver.execInWorkspace({
+        ws,
+        wsReal,
+        hostCwd: this.cwd,
+        runCwd,
+        scratchDir,
+        branchScratchDir,
+        sharedCacheDir,
+        config: this.config,
+        projectName: this.projectRecord.name,
+        logicalBranch: this.logicalBranch,
+        outsideSecrets: OUTSIDE_SECRET_PATTERNS,
+        lwwContent,
+        command,
+        options,
       });
-      if (stopping) await stopping;
-      if (killFailed) {
-        keepMounted = true;
-        this.blocked = { reason: "a cancelled command could not be stopped inside the Sandbox", heldWs: ws };
-        throw killFailed;
-      }
+      code = res.exitCode;
+    } catch (e) {
+      execErr = e;
+    }
 
-      if (child.pid) {
-        try { process.kill(-child.pid, "SIGKILL"); } catch {}
-      }
-
-      await this.reapHolders(wsReal).catch(() => {});
-
-      const lwwFile = join(wsReal, ".lww");
-      if (!existsSync(lwwFile)) {
-        writeFileSync(lwwFile, LWW_DEFAULT + this.config.branchOnly.map((p) => `${p}\n`).join(""));
-      }
-
+    try {
       const msg = `pi bash (exit ${code ?? "sig"}) [${this.pendingOrigins.join(",") || "bash"}]`.slice(0, 4000);
       try {
         const res = await this.lfs.workspace.commit(ws, msg);
@@ -1277,26 +1252,25 @@ export class LayerfsSession {
         keepMounted = true;
         this.blocked = { reason: `${ce?.code ?? "Error"}: ${String(ce?.message ?? ce).slice(0, 200)}`, heldWs: ws };
       }
-
-      if (options.signal?.aborted) throw new Error("aborted");
-      if (timedOut) throw new Error(`timeout:${options.timeout}`);
+      if (execErr) throw execErr;
       return { exitCode: code };
     } finally {
-      if (timer) clearTimeout(timer);
-      options.signal?.removeEventListener("abort", onAbort);
-      this.activeSids.delete(tag);
       if (!keepMounted) {
         const u = (async () => {
-          if (child.pid) {
-            try { process.kill(-child.pid, "SIGKILL"); } catch {}
-          }
           await this.reapHolders(wsReal).catch(() => {});
           await this.lfs.workspace.unmount(ws).catch(() => {});
         })();
-        if (options.signal?.aborted || timedOut) this.pendingUnmounts.add(u.finally(() => this.pendingUnmounts.delete(u)));
+        if (options.signal?.aborted || Boolean(execErr)) this.pendingUnmounts.add(u.finally(() => this.pendingUnmounts.delete(u)));
         else await u;
       }
     }
+  }
+
+  /** Removes the per-project scratch build cache directory (`<root>/scratch/<project>`). */
+  async cleanScratch(): Promise<{ removedPath: string }> {
+    const target = join(this.config.root, "scratch", this.projectRecord?.name || "");
+    await fsp.rm(target, { recursive: true, force: true }).catch(() => {});
+    return { removedPath: target };
   }
 
   private async reapHolders(wsPath: string): Promise<void> {

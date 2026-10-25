@@ -180,7 +180,7 @@ async function main() {
   const sub = rest[0] || "status";
   if (sub === "-h" || sub === "--help" || sub === "help") {
     console.log([
-      "Usage: pi-layerfs [--branch <alias>] [--cwd <dir>] <command> [args...]",
+      "Usage: minilfs [--branch <alias>] [--cwd <dir>] <command> [args...]",
       "",
       "Commands:",
       "  mcp                            Start stdio MCP server (for Claude Code / Codex / Cursor)",
@@ -195,6 +195,7 @@ async function main() {
       "  merge <branch> [--ours|--theirs] Merge <branch> into your branch",
       "  apply                          3-way checked write back to host folder",
       "  history [limit]                Show branch commit history",
+      "  clean                          Remove project scratch build caches",
     ].join("\n"));
     return;
   }
@@ -228,7 +229,7 @@ async function main() {
     }
     const strategy = rest.includes("--theirs") ? "theirs" : rest.includes("--ours") ? "ours" : undefined;
     const positional = rest.slice(1).filter((a) => a !== "--theirs" && a !== "--ours");
-    if (sub === "status" || sub === "branches") {
+    if (sub === "status" || sub === "branches" || sub === "clean") {
       console.log(await executeLayerfsAction(s, { action: sub }));
       return;
     }

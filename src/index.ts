@@ -350,9 +350,10 @@ export default function layerfsExtension(pi: ExtensionAPI) {
     ["branches", "列出项目里所有 LayerFS 分支"],
     ["merge", "把另一个分支（如子 agent 的分支）合并进本会话：merge <branch>"],
     ["retry", "checkpoint 失败被锁住后重试"],
+    ["clean", "清理本项目的 scratch 构建缓存目录"],
   ];
   pi.registerCommand("layerfs", {
-    description: "LayerFS workspace: status | diff | history | apply | merge | retry | sync | branches",
+    description: "LayerFS workspace: status | diff | history | apply | merge | retry | sync | branches | clean",
     // Pi's editor treats Enter on an open argument menu as "apply completion" (not submit),
     // because the argument prefix does not start with "/". So once the typed argument is
     // already a complete subcommand, show no menu and let Enter submit directly.
@@ -435,6 +436,10 @@ export default function layerfsExtension(pi: ExtensionAPI) {
         const r = await s.retry();
         report(ctx, s, r);
         return say(r.error ? `Retry failed: ${r.error.message}` : "Checkpoint saved; changes are unblocked.", r.error ? "error" : "info");
+      }
+      if (sub === "clean") {
+        const res = await s.cleanScratch();
+        return say(`Cleaned scratch build caches at ${res.removedPath}.`);
       }
       if (sub === "apply") {
         const allowRevert = argv.includes("--revert");

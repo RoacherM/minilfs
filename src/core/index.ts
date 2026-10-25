@@ -65,6 +65,16 @@ export {
 } from "./client.ts";
 
 export {
+  buildNativeShellPrelude,
+  LocalNativeDriver,
+  registerExecutionDriver,
+  resolveExecutionDriver,
+  type DriverExecContext,
+  type DriverExecOptions,
+  type ExecutionDriver,
+} from "./driver.ts";
+
+export {
   run,
   type RunResult,
 } from "./exec-helper.ts";
