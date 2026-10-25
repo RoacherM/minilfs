@@ -354,7 +354,7 @@ export async function executeLayerfsAction(
 }
 
 /**
- * Executes `layerfs_apply` on `s` and returns the plain-text response string.
+ * Executes `minilfs_apply` on `s` and returns the plain-text response string.
  */
 export async function executeLayerfsApply(
   s: LayerfsSession,

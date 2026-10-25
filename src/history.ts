@@ -1,4 +1,4 @@
-// `/layerfs history`: a read-only view of this session's file history on its LayerFS
+// `/minilfs history`: a read-only view of this session's file history on its LayerFS
 // Branch. Store reads only (list_commits, diff_commits, diff_branches): no Sandbox starts.
 import type { LayerfsSession } from "./workspace.ts";
 
@@ -156,11 +156,11 @@ export function formatHistory(v: HistoryView, now = Date.now()): string {
       ? `│   ${r.files.map((f) => `${KIND_MARK[f.kind] ?? "?"}${f.path}`).join("  ")}${r.filesMore ? "  …" : ""}${buildNote}`
       : "│   (only git metadata changed)");
   }
-  if (v.more) lines.push("│   … older changes not shown (/layerfs history <n>)");
+  if (v.more) lines.push("│   … older changes not shown (/minilfs history <n>)");
   lines.push(`└ base ${v.baseRef.slice(0, 12)} (session start / last apply)`);
   lines.push(
     v.unapplied.length
-      ? `Not yet applied: ${v.unapplied.length} file(s) · /layerfs diff · /layerfs apply`
+      ? `Not yet applied: ${v.unapplied.length} file(s) · /minilfs diff · /minilfs apply`
       : "Everything on this branch is applied to your folder.",
   );
   return lines.join("\n");

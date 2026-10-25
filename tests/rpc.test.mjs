@@ -11,11 +11,11 @@ import { stopNativeDaemons } from "../src/workspace.ts";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const id = Date.now().toString(36);
-const base = join(homedir(), ".cache/pi-layerfs-test", `rpc-${id}`);
+const base = join(homedir(), ".cache/minilfs-test", `rpc-${id}`);
 const cwd = join(base, "project");
 mkdirSync(cwd, { recursive: true });
 writeFileSync(join(cwd, "a.txt"), "host a\n");
-const PREFIX = `pi-lfs-rt-${id}-`;
+const PREFIX = `minilfs-rt-${id}-`;
 const pgrep = (pattern) => spawnSync("pgrep", ["-f", pattern], { encoding: "utf8" });
 const results = [];
 const step = async (name, fn) => {
@@ -32,7 +32,7 @@ const step = async (name, fn) => {
 const child = spawn("pi", ["--mode", "rpc", "--no-session", "--offline", "-ne", "-e", join(root, "tests/fixtures/faux-model.ts"), "-e", join(root, "src/index.ts"), "--model", "lfs-faux/m"], {
   cwd, stdio: ["pipe", "pipe", "pipe"],
   env: {
-    ...process.env, PI_CODING_AGENT_DIR: join(base, "agent"), PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", PI_LAYERFS_ROOT: join(base, "lfs"), PI_LAYERFS_PREFIX: PREFIX,
+    ...process.env, PI_CODING_AGENT_DIR: join(base, "agent"), PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", MINILFS_ROOT: join(base, "lfs"), MINILFS_PREFIX: PREFIX,
     PI_LFS_SCRIPT: JSON.stringify([[["write", { path: "a.txt", content: "agent a\n" }], ["write", { path: "new.txt", content: "new\n" }]]]),
   },
 });
@@ -60,8 +60,8 @@ const settledAfter = (n) => (m) => m.type === "agent_settled" && events.indexOf(
 
 try {
   await step("status line: starting -> on", async () => {
-    await waitFor(ui("setStatus", (m) => /LayerFS starting/.test(m.statusText ?? "")), "starting status", 30_000);
-    await waitFor(ui("setStatus", (m) => /LayerFS s-/.test(m.statusText ?? "")), "ready status", 90_000);
+    await waitFor(ui("setStatus", (m) => /minilfs starting/.test(m.statusText ?? "")), "starting status", 30_000);
+    await waitFor(ui("setStatus", (m) => /minilfs s-/.test(m.statusText ?? "")), "ready status", 90_000);
   });
 
   await step("agent writes stay in LayerFS (0 Sandboxes); status shows checkpoints/unapplied", async () => {
@@ -76,16 +76,16 @@ try {
     return st.statusText;
   });
 
-  await step("/layerfs status notifies", async () => {
+  await step("/minilfs status notifies", async () => {
     const n = events.length;
-    send({ id: "p2", type: "prompt", message: "/layerfs status" });
+    send({ id: "p2", type: "prompt", message: "/minilfs status" });
     const m = await waitFor((e) => events.indexOf(e) >= n && ui("notify")(e), "status notify");
     assert.match(m.message, /project project · volume/);
   });
 
-  await step("/layerfs apply -> confirm declined -> nothing written", async () => {
+  await step("/minilfs apply -> confirm declined -> nothing written", async () => {
     const n = events.length;
-    send({ id: "p3", type: "prompt", message: "/layerfs apply" });
+    send({ id: "p3", type: "prompt", message: "/minilfs apply" });
     const c = await waitFor((e) => events.indexOf(e) >= n && ui("confirm")(e), "confirm dialog");
     assert.match(c.message, /Modified \/a\.txt/);
     assert.match(c.message, /Added \/new\.txt/);
@@ -94,9 +94,9 @@ try {
     assert.equal(readFileSync(join(cwd, "a.txt"), "utf8"), "host a\n");
   });
 
-  await step("/layerfs apply -> confirm accepted -> host updated", async () => {
+  await step("/minilfs apply -> confirm accepted -> host updated", async () => {
     const n = events.length;
-    send({ id: "p4", type: "prompt", message: "/layerfs apply" });
+    send({ id: "p4", type: "prompt", message: "/minilfs apply" });
     const c = await waitFor((e) => events.indexOf(e) >= n && ui("confirm")(e), "confirm dialog");
     send({ type: "extension_ui_response", id: c.id, confirmed: true });
     const m = await waitFor((e) => events.indexOf(e) >= n && ui("notify", (x) => /Applied 2 change/.test(x.message))(e), "applied notify");

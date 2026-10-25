@@ -413,11 +413,11 @@ export class LayerfsSession {
     options?: { strategy?: "ours" | "theirs"; resolve?: Record<string, "ours" | "theirs"> }
   ): Promise<MergeResult> {
     const job = this.mutex.then(async () => {
-      if (this.blocked) throw new Error(`cannot merge while a checkpoint is pending (${this.blocked.reason}); run /layerfs retry`);
+      if (this.blocked) throw new Error(`cannot merge while a checkpoint is pending (${this.blocked.reason}); run /minilfs retry`);
       const resolvedOther = await this.resolveBranchName(other);
       const branches = await this.listAllBranches();
       const known = branches.find((b) => b.name === resolvedOther);
-      if (!known) throw new LayerfsError("NoSuchBranch", `no LayerFS branch named ${other} (see /layerfs branches)`);
+      if (!known) throw new LayerfsError("NoSuchBranch", `no LayerFS branch named ${other} (see /minilfs branches)`);
 
       if (options?.strategy || options?.resolve) {
         return await this.fallbackMergeBranch(resolvedOther, options);
@@ -1371,7 +1371,7 @@ export class LayerfsSession {
   mutate<T>(origin: string, label: string, fn: () => Promise<T>): Promise<{ value: T; checkpoint: Checkpoint | null; error: Error | null }> {
     const job = this.mutex.then(async () => {
       if (this.blocked) {
-        throw new Error(`LayerFS checkpoint failed earlier (${this.blocked.reason}); changes are blocked until /layerfs retry succeeds`);
+        throw new Error(`minilfs checkpoint failed earlier (${this.blocked.reason}); changes are blocked until /minilfs retry succeeds`);
       }
       this.pendingOrigins.push(origin);
       this.lastStoreCommit = null;
@@ -1483,7 +1483,7 @@ export class LayerfsSession {
 
   private async applyLocked(options: { allowRevert?: boolean }): Promise<ApplyResult> {
     if (this.blocked) {
-      throw new Error(`cannot apply while a checkpoint is pending (${this.blocked.reason}); run /layerfs retry`);
+      throw new Error(`cannot apply while a checkpoint is pending (${this.blocked.reason}); run /minilfs retry`);
     }
     return this.bindings.withProjectLock(this.projectRecord.name, async (guard) => {
       const result: ApplyResult = { applied: [], skipped: [], conflicts: [], unchanged: [], warnings: [] };
@@ -1493,7 +1493,7 @@ export class LayerfsSession {
       await this.lfs.branch.fork(snapBranch, snapRef);
 
       if (!options.allowRevert && !(await this.snapshotContainsBase(snapBranch))) {
-        throw new LayerfsError("WouldRevert", "this branch no longer contains what was already applied to your folder (you went back with /tree, maybe edited since); applying would revert files on disk. Use /layerfs apply --revert to do that on purpose.");
+        throw new LayerfsError("WouldRevert", "this branch no longer contains what was already applied to your folder (you went back with /tree, maybe edited since); applying would revert files on disk. Use /minilfs apply --revert to do that on purpose.");
       }
 
       const items: Array<{ path: string; kind: string; type: string }> = [];
@@ -1867,7 +1867,7 @@ async function scanHostDirectory(root: string, excludes: string[], cache: HostIn
       throw new LayerfsError("ScanFailed", `cannot read ${relative(root, dir) || "."}: ${e?.code ?? e}`);
     }
     for (const ent of entries) {
-      if (ent.name === ".git" || ent.name === ".lww" || ent.name.includes(".minilfs-") || ent.name.includes(".pi-layerfs-")) continue;
+      if (ent.name === ".git" || ent.name === ".lww" || ent.name.includes(".minilfs-")) continue;
       const abs = join(dir, ent.name);
       const rel = relative(root, abs).split("\\").join("/");
       if (isExcludedPath(rel, excludes)) continue;

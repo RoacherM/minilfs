@@ -10,11 +10,11 @@ import { stopNativeDaemons } from "../src/workspace.ts";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const id = Date.now().toString(36);
-const base = join(homedir(), ".cache/pi-layerfs-test", `cli-${id}`);
+const base = join(homedir(), ".cache/minilfs-test", `cli-${id}`);
 const cwd = join(base, "project");
 mkdirSync(cwd, { recursive: true });
 writeFileSync(join(cwd, "a.txt"), "host a\n");
-const PREFIX = `pi-lfs-ct-${id}-`;
+const PREFIX = `minilfs-ct-${id}-`;
 const results = [];
 const step = (name, fn) => {
   try {
@@ -31,7 +31,7 @@ function piArgs(extra) {
   return ["-p", "--no-session", "--offline", "-ne", "-e", join(root, "tests/fixtures/faux-model.ts"), "-e", join(root, "src/index.ts"), ...extra, "--model", "lfs-faux/m", "run the script"];
 }
 function piEnv(script, env = {}) {
-  return { ...process.env, PI_CODING_AGENT_DIR: join(base, "agent"), PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", PI_LFS_SCRIPT: JSON.stringify(script), PI_LAYERFS_ROOT: join(base, "lfs"), PI_LAYERFS_PREFIX: PREFIX, ...env };
+  return { ...process.env, PI_CODING_AGENT_DIR: join(base, "agent"), PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", PI_LFS_SCRIPT: JSON.stringify(script), MINILFS_ROOT: join(base, "lfs"), MINILFS_PREFIX: PREFIX, ...env };
 }
 function piAsync(script) {
   return new Promise((resolve) => {
@@ -87,7 +87,7 @@ try {
   });
 
   step("missing bundle: run reports the error; nothing written to host", () => {
-    const r = pi([[["write", { path: "d.txt", content: "x" }]]], [], { PI_LAYERFS_BUNDLE: "/tmp/nonexistent-bundle" });
+    const r = pi([[["write", { path: "d.txt", content: "x" }]]], [], { MINILFS_BUNDLE: "/tmp/nonexistent-bundle" });
     assert.equal(existsSync(join(cwd, "d.txt")), false);
     assert.match(r.stdout + r.stderr, /SCRIPT_DONE/);
     return `exit ${r.status}`;

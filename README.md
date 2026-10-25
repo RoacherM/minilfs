@@ -137,7 +137,7 @@ await session.open();
 
 ---
 
-## 5. Interactive Commands (`/layerfs`)
+## 5. Interactive Commands (`/minilfs`)
 
 | Command | Does |
 |---|---|
@@ -165,7 +165,7 @@ await session.open();
 | `MINILFS_NETWORK` | `allow` \| `localhost` \| `deny` (`offline`) — Seatbelt outbound network policy inside `bash` |
 | `MINILFS_EXCLUDES` | `.env,.env.*,*.pem,*.key,id_rsa*,id_ed25519*,.npmrc,.netrc,.pypirc` |
 | `MINILFS_BRANCH_ONLY` | comma-separated build-output patterns (e.g. `target/,.cargo-home/`) |
-| `MINILFS_TEAM` | `1` enables multi-agent `layerfs` / `layerfs_apply` tools |
+| `MINILFS_TEAM` | `1` enables multi-agent `minilfs` / `minilfs_apply` tools |
 | `MINILFS_BRANCH_NAME` | logical branch alias for this session (defaults to `lead` or `s-<shortId>`) |
 
 ## License

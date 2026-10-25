@@ -11,7 +11,7 @@ import { LayerfsSession, stopNativeDaemons } from "../src/workspace.ts";
 import { formatHistory, loadHistory, parseMessage } from "../src/history.ts";
 
 const id = Date.now().toString(36);
-const base = join(homedir(), ".cache/pi-layerfs-test", `v2-${id}`);
+const base = join(homedir(), ".cache/minilfs-test", `v2-${id}`);
 const results = [];
 const step = async (name, fn) => {
   const t0 = Date.now();
@@ -26,7 +26,7 @@ const step = async (name, fn) => {
 };
 const pgrep = (pattern) => spawnSync("pgrep", ["-f", pattern], { encoding: "utf8" });
 const sha = (b) => createHash("sha256").update(b).digest("hex");
-const config = { ...resolveConfig({}), root: join(base, "root"), prefix: `pi-lfs-v2-${id}-`, killGraceMs: 1000 };
+const config = { ...resolveConfig({}), root: join(base, "root"), prefix: `minilfs-v2-${id}-`, killGraceMs: 1000 };
 
 function fixture(dir) {
   mkdirSync(join(dir, "src/sub"), { recursive: true });
@@ -242,7 +242,7 @@ try {
     return `switched snapshots in ${ms} ms`;
   });
 
-  await step("/layerfs history: newest first, tool origins, changed files, HEAD after /tree, applied marks, 0 Sandboxes", async () => {
+  await step("/minilfs history: newest first, tool origins, changed files, HEAD after /tree, applied marks, 0 Sandboxes", async () => {
     assert.deepEqual(parseMessage("pi bash (exit 3) [call_1,call_2]"), { label: "bash (exit 3)", origins: ["call_1", "call_2"] });
     const sH = new LayerfsSession(cwd, `sessH-${id}`, config);
     await sH.open();
@@ -279,7 +279,7 @@ try {
       const res = await sH.apply();
       assert.deepEqual(res.conflicts, []);
       const v3 = await loadHistory(sH);
-      assert.ok(v3.rows.every((r) => r.applied), "all Commits applied after /layerfs apply");
+      assert.ok(v3.rows.every((r) => r.applied), "all Commits applied after /minilfs apply");
       assert.equal(v3.unapplied.length, 0);
       assert.match(formatHistory(v3), /Everything on this branch is applied/);
       return text.split("\n").slice(0, 4).join(" / ");

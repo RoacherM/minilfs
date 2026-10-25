@@ -1,5 +1,5 @@
 // v0.2 Real Pi 1.2.0 AgentSession + scripted faux model + real LayerFS backend.
-// Covers: Store-direct tools, on-demand bash mount/abort, /layerfs diff+apply,
+// Covers: Store-direct tools, on-demand bash mount/abort, /minilfs diff+apply,
 // multi-session apply without reverting, /tree + /fork + /resume time-travel,
 // Store container self-healing, fail-closed startup, and explicit opt-out.
 // Run: node tests/pi.test.mjs
@@ -11,7 +11,7 @@ import { join } from "node:path";
 
 const REAL_HOME = homedir();
 const id = Date.now().toString(36);
-const base = join(REAL_HOME, ".cache/pi-layerfs-test", `pi-${id}`);
+const base = join(REAL_HOME, ".cache/minilfs-test", `pi-${id}`);
 const cwd = join(base, "project");
 mkdirSync(join(cwd, "src"), { recursive: true });
 writeFileSync(join(cwd, "README.md"), "original readme\n");
@@ -23,11 +23,11 @@ process.env.PI_CODING_AGENT_DIR = join(base, "agent");
 process.env.PI_OFFLINE = "1";
 process.env.PI_SKIP_VERSION_CHECK = "1";
 process.env.PI_TELEMETRY = "0";
-const PREFIX = `pi-lfs-pt-${id}-`;
-process.env.PI_LAYERFS_ROOT = join(base, "lfs");
-process.env.PI_LAYERFS_PREFIX = PREFIX;
-process.env.PI_LAYERFS_KILL_GRACE_MS = "1000";
-process.env.PI_LAYERFS_BUNDLE ??= join(REAL_HOME, ".cache/epi-layerfs/bundle-native");
+const PREFIX = `minilfs-pt-${id}-`;
+process.env.MINILFS_ROOT = join(base, "lfs");
+process.env.MINILFS_PREFIX = PREFIX;
+process.env.MINILFS_KILL_GRACE_MS = "1000";
+process.env.MINILFS_BUNDLE ??= join(REAL_HOME, ".cache/minilfs/bundle-native");
 
 const { fauxAssistantMessage, fauxText, fauxToolCall, createFauxCore } = await import("@earendil-works/pi-ai");
 const { createAgentSessionServices, createAgentSessionFromServices, resolveCliModel, SessionManager, SettingsManager } = await import("@earendil-works/pi-coding-agent");
@@ -101,11 +101,11 @@ try {
   main = await makeSession();
   const { session, run } = main;
 
-  await step("registration: one tool per name, /layerfs command", async () => {
+  await step("registration: one tool per name, /minilfs command", async () => {
     for (const n of ["read", "write", "edit", "bash", "grep", "find", "ls"]) {
       assert.equal(session.getAllTools().filter((t) => t.name === n).length, 1, n);
     }
-    assert.ok(session.extensionRunner.getCommand("layerfs"));
+    assert.ok(session.extensionRunner.getCommand("minilfs"));
   });
 
   await step("read sees the imported snapshot, not later host edits (0 Sandboxes)", async () => {
@@ -115,7 +115,7 @@ try {
     const [r] = await run([["read", { path: "README.md" }]]);
     assert.match(text(r), /original readme/);
     writeFileSync(join(cwd, "README.md"), "original readme\n");
-    const daemons = pgrep(`layerfs-daemon --config ${join(process.env.PI_LAYERFS_ROOT, "local")}/`).stdout.trim();
+    const daemons = pgrep(`layerfs-daemon --config ${join(process.env.MINILFS_ROOT, "local")}/`).stdout.trim();
     assert.equal(daemons, "", "Store-direct read must not start a daemon");
   });
 
@@ -207,7 +207,7 @@ try {
     assert.match(text(rGenAfter), /generated/);
   });
 
-  await step("multi-session /layerfs apply: peer session B and main session A both apply without reverting each other", async () => {
+  await step("multi-session /minilfs apply: peer session B and main session A both apply without reverting each other", async () => {
     peer = await makeSession();
     await peer.run([["write", { path: "peer-only.txt", content: "from peer B\n" }]]);
 
@@ -215,9 +215,9 @@ try {
     const log = console.log;
     console.log = (m) => (out += `${m}\n`);
     try {
-      await session.prompt("/layerfs diff");
-      await session.prompt("/layerfs apply");
-      await peer.session.prompt("/layerfs apply");
+      await session.prompt("/minilfs diff");
+      await session.prompt("/minilfs apply");
+      await peer.session.prompt("/minilfs apply");
     } finally { console.log = log; }
 
     assert.match(out, /Added\s+gen\.txt/);
@@ -230,7 +230,7 @@ try {
   });
 
   await step("Sandbox daemon self-heals when stopped mid-session", async () => {
-    const daemonPids = pgrep(`layerfs-daemon --config ${join(process.env.PI_LAYERFS_ROOT, "local")}/`).stdout.trim().split(/\s+/).filter(Boolean);
+    const daemonPids = pgrep(`layerfs-daemon --config ${join(process.env.MINILFS_ROOT, "local")}/`).stdout.trim().split(/\s+/).filter(Boolean);
     for (const pid of daemonPids) {
       try { process.kill(Number(pid), "SIGTERM"); } catch {}
     }
@@ -240,31 +240,31 @@ try {
     assert.match(text(rAfter), /healed/);
   });
 
-  await step("fail-closed: broken LayerFS -> tools error, host never written", async () => {
-    process.env.PI_LAYERFS_BUNDLE = "/tmp/nonexistent-bundle";
+  await step("fail-closed: broken minilfs -> tools error, host never written", async () => {
+    process.env.MINILFS_BUNDLE = "/tmp/nonexistent-bundle";
     const bad = await makeSession();
     try {
       const [r, w] = await bad.run([["read", { path: "README.md" }], ["write", { path: "fallback.txt", content: "x" }]]);
       assert.equal(r.isError, true);
-      assert.match(text(r), /LayerFS failed to start/);
+      assert.match(text(r), /minilfs failed to start/);
       assert.equal(w.isError, true);
       assert.equal(existsSync(join(cwd, "fallback.txt")), false);
       return text(r).slice(0, 120);
-    } finally { delete process.env.PI_LAYERFS_BUNDLE; await bad.shutdown(); }
+    } finally { delete process.env.MINILFS_BUNDLE; await bad.shutdown(); }
   });
 
-  await step("explicit opt-out PI_LAYERFS=0 uses the host folder", async () => {
-    process.env.PI_LAYERFS = "0";
+  await step("explicit opt-out MINILFS=0 uses the host folder", async () => {
+    process.env.MINILFS = "0";
     const off = await makeSession();
     try {
       const [r] = await off.run([["read", { path: ".env" }]]);
       assert.match(text(r), /TOKEN=secret/);
-    } finally { delete process.env.PI_LAYERFS; await off.shutdown(); }
+    } finally { delete process.env.MINILFS; await off.shutdown(); }
   });
 } finally {
   await main?.shutdown().catch(() => {});
   await peer?.shutdown().catch(() => {});
-  await stopNativeDaemons(join(process.env.PI_LAYERFS_ROOT, "local")).catch(() => {});
+  await stopNativeDaemons(join(process.env.MINILFS_ROOT, "local")).catch(() => {});
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} passed (zero Docker)`);
   rmSync(base, { recursive: true, force: true });

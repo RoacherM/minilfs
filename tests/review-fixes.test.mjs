@@ -12,8 +12,8 @@ import { formatHistory, loadHistory } from "../src/history.ts";
 import layerfsExtension from "../src/index.ts";
 
 const id = Date.now().toString(36);
-const base = join(homedir(), ".cache/pi-layerfs-test", `fix-${id}`);
-const config = { ...resolveConfig({}), root: join(base, "root"), prefix: `pi-lfs-fx-${id}-`, killGraceMs: 800, excludes: [...resolveConfig({}).excludes, "secrets/"] };
+const base = join(homedir(), ".cache/minilfs-test", `fix-${id}`);
+const config = { ...resolveConfig({}), root: join(base, "root"), prefix: `minilfs-fx-${id}-`, killGraceMs: 800, excludes: [...resolveConfig({}).excludes, "secrets/"] };
 const pgrep = (pattern) => spawnSync("pgrep", ["-f", pattern], { encoding: "utf8" });
 const results = [];
 const step = async (name, fn) => {
@@ -136,7 +136,7 @@ try {
     } finally { fsp.writeFile = realWrite; }
     assert.equal(readFileSync(join(cwd, "src/app.js"), "utf8"), "export const x = 99; // user\n", "user save is kept");
     assert.equal(readFileSync(join(cwd, "aaa.txt"), "utf8"), "agent\n", "the file written before the stop is reported, not rolled back");
-    assert.equal(readdirSync(cwd).filter((f) => f.includes(".pi-layerfs-")).length, 0, "no temp files left");
+    assert.equal(readdirSync(cwd).filter((f) => f.includes(".minilfs-")).length, 0, "no temp files left");
   });
 
   await step("#5 directory in the way = conflict; exec-bit-only change is applied", async () => {
@@ -468,18 +468,18 @@ try {
     assert.equal((await lead.readFile(join(cwd, "conf.txt"))).toString(), "theirs v1\n");
   });
 
-  await step("layerfs show >60KB without truncation, pagination, ls, checkout, and cross-branch diff", async () => {
+  await step("minilfs show >60KB without truncation, pagination, ls, checkout, and cross-branch diff", async () => {
     const cwd = project();
-    process.env.PI_LAYERFS_TEAM = "1";
-    process.env.PI_LAYERFS_ROOT = config.root;
-    process.env.PI_LAYERFS_PREFIX = config.prefix;
+    process.env.MINILFS_TEAM = "1";
+    process.env.MINILFS_ROOT = config.root;
+    process.env.MINILFS_PREFIX = config.prefix;
 
     let layerfsTool;
     let sessionStartHandler;
     let sessionShutdownHandler;
     const fakePi = {
       registerFlag: () => {},
-      registerTool: (t) => { if (t.name === "layerfs") layerfsTool = t; },
+      registerTool: (t) => { if (t.name === "minilfs") layerfsTool = t; },
       registerCommand: () => {},
       on: (evt, fn) => {
         if (evt === "session_start") sessionStartHandler = fn;
@@ -490,7 +490,7 @@ try {
       getFlag: () => false,
     };
     layerfsExtension(fakePi);
-    assert.ok(layerfsTool, "layerfs tool registered");
+    assert.ok(layerfsTool, "minilfs tool registered");
 
     const fakeCtx = {
       cwd,

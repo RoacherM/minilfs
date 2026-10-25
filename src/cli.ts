@@ -41,21 +41,21 @@ async function runMcpServer(): Promise<void> {
 
   const tools = [
     {
-      name: "layerfs",
+      name: "minilfs",
       description: LAYERFS_TOOL_DESCRIPTION,
       inputSchema: LAYERFS_TOOL_SCHEMA,
     },
     ...(!isChild
       ? [
           {
-            name: "layerfs_apply",
+            name: "minilfs_apply",
             description: LAYERFS_APPLY_TOOL_DESCRIPTION,
             inputSchema: LAYERFS_APPLY_TOOL_SCHEMA,
           },
         ]
       : []),
     {
-      name: "layerfs_bash",
+      name: "minilfs_bash",
       description: "Run a shell command on your isolated LayerFS branch inside the macOS Seatbelt sandbox, automatically committing changes.",
       inputSchema: {
         type: "object",
@@ -106,17 +106,17 @@ async function runMcpServer(): Promise<void> {
         const s = await getSession();
         const name = params?.name;
         const args = params?.arguments ?? {};
-        if (name === "layerfs") {
+        if (name === "minilfs") {
           const out = await executeLayerfsAction(s, args);
           send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: out }] } });
           continue;
         }
-        if (name === "layerfs_apply") {
+        if (name === "minilfs_apply") {
           const out = await executeLayerfsApply(s);
           send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: out }] } });
           continue;
         }
-        if (name === "layerfs_bash") {
+        if (name === "minilfs_bash") {
           const chunks: Buffer[] = [];
           const r = await s.mutate(`mcp-${id}`, "bash", () =>
             s.exec(String(args.command ?? ""), s.cwd, {

@@ -22,7 +22,7 @@ import { formatHistory, loadHistory } from "../src/history.ts";
 import { LayerfsSession, stopNativeDaemons } from "../src/workspace.ts";
 
 const id = Date.now().toString(36);
-const base = join(homedir(), ".cache/pi-layerfs-test", `native-${id}`);
+const base = join(homedir(), ".cache/minilfs-test", `native-${id}`);
 const results = [];
 const step = async (name, fn) => {
   const t0 = Date.now();
@@ -44,7 +44,7 @@ const root = join(base, "root");
 const cwd = join(base, "project");
 const outside = join(base, "outside.txt");
 const config = {
-  ...resolveConfig({ PI_LAYERFS_SANDBOX: "native" }),
+  ...resolveConfig({}),
   root,
   prefix: `pi-nat-${id}-`,
   killGraceMs: 800,

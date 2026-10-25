@@ -5,7 +5,7 @@
  *   with automatic byte-exact Workspace fallback for binary, symlinks and >48KB lines.
  * - `bash` and `!cmd` mount a Workspace on demand, stream output, and unmount immediately.
  * - `/resume`, `/tree` and `/fork` restore or branch the file state alongside the conversation.
- * - The host folder is written only by `/layerfs apply` (with three-way conflict detection).
+ * - The host folder is written only by `/minilfs apply` (with three-way conflict detection).
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -13,7 +13,6 @@ import {
   DEFAULT_MAX_BYTES, formatSize, truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import {
-  cleanRelPath,
   createHarnessOperations,
   executeLayerfsAction,
   executeLayerfsApply,
@@ -29,8 +28,8 @@ import {
   type Checkpoint,
 } from "./core/index.ts";
 
-export const CHECKPOINT_ENTRY = "layerfs-checkpoint";
-export const SESSION_ENTRY = "layerfs-session";
+export const CHECKPOINT_ENTRY = "minilfs-checkpoint";
+export const SESSION_ENTRY = "minilfs-session";
 
 export default function minilfsExtension(pi: ExtensionAPI) {
   pi.registerFlag("no-minilfs", { description: "Disable minilfs isolation for this run (tools act on the host folder)", type: "boolean", default: false });
@@ -52,42 +51,40 @@ export default function minilfsExtension(pi: ExtensionAPI) {
   };
   const onHost = (name: string, id: string, params: any, signal: any, onUpdate: any) => host[name](hostCwd).execute(id, params, signal, onUpdate);
 
-  // Default footer (setStatus) + chip for statusline extensions that listen to `notify:status`
-  // on pi.events (e.g. @savagelands-net/pi-statusline).
   const status = (ctx: ExtensionContext | undefined, text: string | undefined) => {
-    try { ctx?.ui.setStatus("layerfs", text); } catch {}
+    try { ctx?.ui.setStatus("minilfs", text); } catch {}
     try {
       if (text === undefined) {
-        pi.events.emit("notify:status", { source: "layerfs", state: "cleared" });
+        pi.events.emit("notify:status", { source: "minilfs", state: "cleared" });
       } else {
         const isError = /FAILED|BLOCKED/.test(text);
         pi.events.emit("notify:status", {
-          source: "layerfs",
+          source: "minilfs",
           state: isError ? "error" : "active",
-          label: text.replace(/^LayerFS\s*/, "") || text,
+          label: text.replace(/^minilfs\s*/, "") || text,
           icon: "LFS",
         });
       }
     } catch {}
   };
   const describe = (s: LayerfsSession) => {
-    if (s.blocked) return "LayerFS BLOCKED · /layerfs retry";
+    if (s.blocked) return "minilfs BLOCKED · /minilfs retry";
     const pending = s.unapplied ? ` · ${s.checkpoints.length} unapplied` : "";
-    return `LayerFS ${s.workBranch}${pending}`;
+    return `minilfs ${s.workBranch}${pending}`;
   };
 
   async function need(): Promise<LayerfsSession> {
-    if (disabled) throw new Error("LayerFS is disabled for this run");
-    if (startError) throw new Error(`LayerFS failed to start: ${startError.message}. File tools are disabled (no fallback to the host folder).`);
-    if (!ready) throw new Error("LayerFS has not started (no session)");
-    return ready.catch((e) => { throw new Error(`LayerFS failed to start: ${e.message}. File tools are disabled (no fallback to the host folder).`); });
+    if (disabled) throw new Error("minilfs is disabled for this run");
+    if (startError) throw new Error(`minilfs failed to start: ${startError.message}. File tools are disabled (no fallback to the host folder).`);
+    if (!ready) throw new Error("minilfs has not started (no session)");
+    return ready.catch((e) => { throw new Error(`minilfs failed to start: ${e.message}. File tools are disabled (no fallback to the host folder).`); });
   }
 
   function report(ctx: ExtensionContext | undefined, s: LayerfsSession, r: { checkpoint: Checkpoint | null; error: Error | null }) {
     if (r.checkpoint) pi.appendEntry(CHECKPOINT_ENTRY, { ...r.checkpoint, project: s.project, branch: s.workBranch });
     status(ctx, describe(s));
     return r.error
-      ? `\n\n[LayerFS] The change is in the workspace but its checkpoint failed (${(r.error as any).code ?? "Error"}: ${r.error.message}). Further changes are blocked until /layerfs retry succeeds.`
+      ? `\n\n[minilfs] The change is in the workspace but its checkpoint failed (${(r.error as any).code ?? "Error"}: ${r.error.message}). Further changes are blocked until /minilfs retry succeeds.`
       : "";
   }
 
@@ -164,20 +161,17 @@ export default function minilfsExtension(pi: ExtensionAPI) {
   });
 
   // ------------------------------------------------------------- team mode (MINILFS_TEAM=1)
-  // Agent-facing branch tools for multi-agent runs. `layerfs` is for every session (lead and
-  // sub-agents); `layerfs_apply` (writes the user's folder) only for the top-level session:
-  // pi-subagents children (PI_SUBAGENT_CHILD=1) never get it.
   const boot = resolveConfig();
   const isChild = process.env.PI_SUBAGENT_CHILD === "1";
   if (boot.team && boot.enabled) {
     const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: undefined });
     pi.registerTool({
-      name: "layerfs",
-      label: "LayerFS",
+      name: "minilfs",
+      label: "minilfs",
       description: LAYERFS_TOOL_DESCRIPTION,
       parameters: LAYERFS_TOOL_SCHEMA as any,
       async execute(_id: string, params: any, _signal: any, _onUpdate: any, ctx: ExtensionContext) {
-        if (disabled) return text("LayerFS is off for this run: there are no branches; tools act on the user's folder.");
+        if (disabled) return text("minilfs is off for this run: there are no branches; tools act on the user's folder.");
         const s = await need();
         const out = await executeLayerfsAction(s, params, {
           onStatusChange: () => status(ctx, describe(s)),
@@ -189,12 +183,12 @@ export default function minilfsExtension(pi: ExtensionAPI) {
 
     if (!isChild) {
       pi.registerTool({
-        name: "layerfs_apply",
-        label: "LayerFS apply",
+        name: "minilfs_apply",
+        label: "minilfs apply",
         description: LAYERFS_APPLY_TOOL_DESCRIPTION,
         parameters: LAYERFS_APPLY_TOOL_SCHEMA as any,
         async execute(_id: string, _params: any, _signal: any, _onUpdate: any, ctx: ExtensionContext) {
-          if (disabled) return text("LayerFS is off for this run: your edits are already in the user's folder.");
+          if (disabled) return text("minilfs is off for this run: your edits are already in the user's folder.");
           const s = await need();
           const out = await executeLayerfsApply(s, {
             onStatusChange: () => status(ctx, describe(s)),
@@ -223,7 +217,6 @@ export default function minilfsExtension(pi: ExtensionAPI) {
 
   // ------------------------------------------------------------- lifecycle & tree / fork / resume
 
-  /** Extracts the snapshot ref and session binding along a session entry chain (up to optional `stopAtEntryId`). */
   function inspectBranchEntries(entries: any[], stopAtEntryId?: string, inclusive = true) {
     let baseRef: string | undefined;
     let baseBranch: string | undefined;
@@ -273,8 +266,8 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     hostCwd = ctx.cwd;
     disabled = !config.enabled || pi.getFlag("no-minilfs") === true;
     if (disabled) {
-      status(ctx, "LayerFS off");
-      if (ctx.hasUI) ctx.ui.notify("LayerFS isolation is OFF for this run: tools act directly on the host folder.", "warning");
+      status(ctx, "minilfs off");
+      if (ctx.hasUI) ctx.ui.notify("minilfs isolation is OFF for this run: tools act directly on the host folder.", "warning");
       return;
     }
     if (session && event.reason === "reload") {
@@ -288,7 +281,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     const s = new LayerfsSession(ctx.cwd, ctx.sessionManager.getSessionId(), config);
     session = s;
     startError = null;
-    status(ctx, "LayerFS starting…");
+    status(ctx, "minilfs starting…");
     ready = s.open({
       reason: event.reason,
       resumeBinding: branchInfo.project ? branchInfo : undefined,
@@ -302,8 +295,8 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       return s;
     }, (e) => {
       startError = e;
-      status(ctx, "LayerFS FAILED");
-      if (ctx.hasUI) ctx.ui.notify(`LayerFS failed to start: ${e.message}\nFile tools are disabled; nothing is written to the host folder.`, "error");
+      status(ctx, "minilfs FAILED");
+      if (ctx.hasUI) ctx.ui.notify(`minilfs failed to start: ${e.message}\nFile tools are disabled; nothing is written to the host folder.`, "error");
       throw e;
     });
     ready.catch(() => {});
@@ -319,21 +312,21 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     await r?.catch(() => {});
     const out = await s.close().catch((e) => ({ kept: true, notes: [`close failed: ${e.message}`] }));
     status(ctx, undefined);
-    if (out.notes.length && ctx.hasUI) ctx.ui.notify(`LayerFS: ${out.notes.join("; ")}`, out.kept ? "warning" : "info");
+    if (out.notes.length && ctx.hasUI) ctx.ui.notify(`minilfs: ${out.notes.join("; ")}`, out.kept ? "warning" : "info");
   });
 
   pi.on("before_agent_start", async (event) => {
     if (disabled) return undefined;
     const note = [
       "",
-      "File tools and bash run on an isolated LayerFS Branch of this project.",
-      `Paths under ${session?.cwd ?? "the working directory"} refer to that Branch; edits there do NOT reach the user's folder until the user runs /layerfs apply.`,
+      "File tools and bash run on an isolated minilfs Branch of this project.",
+      `Paths under ${session?.cwd ?? "the working directory"} refer to that Branch; edits there do NOT reach the user's folder until the user runs /minilfs apply.`,
       "Files outside the working directory are read-only. Secret files such as .env are not imported.",
       "Each bash call runs in its own sandbox: background processes (`cmd &`, dev servers) end when that call ends. Start and use a server within one bash call.",
       ...(resolveConfig().team ? [
         isChild
-          ? "Team mode: you work on your own branch. Use the `layerfs` tool (status/diff/sync); report your branch name from `layerfs status` when you finish. You cannot write the user's folder."
-          : "Team mode: the `layerfs` tool merges other branches (e.g. sub-agents') into yours; `layerfs_apply` writes your branch into the user's folder and advances main, which new sub-agents start from.",
+          ? "Team mode: you work on your own branch. Use the `minilfs` tool (status/diff/sync); report your branch name from `minilfs status` when you finish. You cannot write the user's folder."
+          : "Team mode: the `minilfs` tool merges other branches (e.g. sub-agents') into yours; `minilfs_apply` writes your branch into the user's folder and advances main, which new sub-agents start from.",
       ] : []),
     ].join("\n");
     return { systemPrompt: `${event.systemPrompt}\n${note}` };
@@ -346,17 +339,26 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     ["diff", "列出本会话改了哪些文件"],
     ["history", "本会话的保存历史：每次改动、来自哪个工具、改了哪些文件（可加条数，如 history 50）"],
     ["apply", "把改动写回你的项目目录（有冲突则一个都不写；--revert 允许回退已写回的内容）"],
-    ["sync", "把你在 Pi 外的改动同步进 LayerFS main（--full 全量重新校验）"],
-    ["branches", "列出项目里所有 LayerFS 分支"],
+    ["sync", "把你在外面的改动同步进 LayerFS main（--full 全量重新校验）"],
+    ["branches", "列出项目里所有分支"],
     ["merge", "把另一个分支（如子 agent 的分支）合并进本会话：merge <branch>"],
     ["retry", "checkpoint 失败被锁住后重试"],
     ["clean", "清理本项目的 scratch 构建缓存目录"],
   ];
-  const commandHandler = async (args: string | undefined, ctx: ExtensionContext) => {
+
+  pi.registerCommand("minilfs", {
+    description: "minilfs workspace: status | diff | history | apply | merge | retry | sync | branches | clean",
+    getArgumentCompletions: (prefix: string) => {
+      const typed = prefix.trim();
+      if (SUBCOMMANDS.some(([n]) => n === typed || typed.startsWith(`${n} `))) return null;
+      const items = SUBCOMMANDS.filter(([n]) => n.startsWith(typed)).map(([value, description]) => ({ value, label: value, description }));
+      return items.length ? items : null;
+    },
+    handler: async (args: string | undefined, ctx: ExtensionContext) => {
       const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
       const sub = argv[0] || "status";
       const say = (t: string, level: "info" | "warning" | "error" = "info") => (ctx.hasUI ? ctx.ui.notify(t, level) : console.log(t));
-      if (disabled) return say("LayerFS is off for this run.", "warning");
+      if (disabled) return say("minilfs is off for this run.", "warning");
       let s: LayerfsSession;
       try { s = await need(); } catch (e: any) { return say(e.message, "error"); }
       if (sub === "status") {
@@ -378,7 +380,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       }
       if (sub === "merge") {
         const otherParam = argv[1];
-        if (!otherParam) return say("用法：/layerfs merge <branch> [--ours|--theirs]（分支名见 /layerfs branches）", "warning");
+        if (!otherParam) return say("用法：/minilfs merge <branch> [--ours|--theirs]（分支名见 /minilfs branches）", "warning");
         const strategy = argv.includes("--theirs") ? "theirs" : argv.includes("--ours") ? "ours" : undefined;
         const other = await s.resolveBranchName(otherParam);
         const r = await s.mergeBranch(other, strategy ? { strategy } : undefined);
@@ -386,7 +388,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
         if (!r.merged) return say([`Conflict merging ${other}; nothing changed. Conflicting files:`, ...r.conflicts.map((c) => `  ${c.path}${c.kind ? ` (${c.kind})` : ""}`)].join("\n"), "error");
         recordMerge(s, other, r);
         const lwwInfo = r.lww ? (r.lwwPaths?.length ? `, ${r.lww} generated file(s) took the newer side: ${r.lwwPaths.slice(0, 5).join(", ")}${r.lwwPaths.length > 5 ? ", …" : ""}` : `, ${r.lww} generated file(s) took the newer side`) : "";
-        return say(`Merged ${other} into this session (now on ${r.branch}${lwwInfo}). /layerfs diff to review, /layerfs apply to write to your folder.`);
+        return say(`Merged ${other} into this session (now on ${r.branch}${lwwInfo}). /minilfs diff to review, /minilfs apply to write to your folder.`);
       }
       if (sub === "diff") {
         if (argv[1]) {
@@ -415,7 +417,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
           return say(d.length ? d.map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`).join("\n") : `No changes between ${baseBranch} and ${targetBranch}.`);
         }
         const d = await applicableDiff(s);
-        return say(d.length ? d.map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`).join("\n") : "No changes in the LayerFS workspace.");
+        return say(d.length ? d.map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`).join("\n") : "No changes in the minilfs workspace.");
       }
       if (sub === "sync") {
         const res = await s.syncHostDriftIntoMain({ full: argv.includes("--full") });
@@ -434,7 +436,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
         const allowRevert = argv.includes("--revert");
         const d = await applicableDiff(s);
         if (!d.length) return say("Nothing to apply.");
-        if (ctx.hasUI && !(await ctx.ui.confirm("Apply LayerFS changes to your folder?", d.map((i) => `${i.kind} ${i.path}`).slice(0, 40).join("\n")))) return say("Apply cancelled.");
+        if (ctx.hasUI && !(await ctx.ui.confirm("Apply minilfs changes to your folder?", d.map((i) => `${i.kind} ${i.path}`).slice(0, 40).join("\n")))) return say("Apply cancelled.");
         let r;
         try {
           r = await s.apply({ allowRevert });
@@ -454,24 +456,10 @@ export default function minilfsExtension(pi: ExtensionAPI) {
           `Applied ${r.applied.length} change(s) to ${s.cwd}.`,
           r.skipped.length ? `Skipped (never applied): ${r.skipped.filter((p) => !hiddenPath(p)).join(", ") || "git metadata"}` : "",
           ...r.warnings.map((w) => `Warning: ${w}`),
-          s.unapplied ? "Changes made while applying are still pending: run /layerfs apply again." : "",
+          s.unapplied ? "Changes made while applying are still pending: run /minilfs apply again." : "",
         ].filter(Boolean).join("\n"), r.warnings.length ? "warning" : "info");
       }
       return say([`未知子命令 "${sub}"。可用：`, ...SUBCOMMANDS.map(([n, d]) => `  /minilfs ${n.padEnd(9)} ${d}`)].join("\n"), "warning");
-  };
-
-  const getArgumentCompletions = (prefix: string) => {
-    const typed = prefix.trim();
-    if (SUBCOMMANDS.some(([n]) => n === typed || typed.startsWith(`${n} `))) return null;
-    const items = SUBCOMMANDS.filter(([n]) => n.startsWith(typed)).map(([value, description]) => ({ value, label: value, description }));
-    return items.length ? items : null;
-  };
-
-  for (const cmdName of ["minilfs", "layerfs"]) {
-    pi.registerCommand(cmdName, {
-      description: "minilfs workspace: status | diff | history | apply | merge | retry | sync | branches | clean",
-      getArgumentCompletions,
-      handler: commandHandler,
-    });
-  }
+    },
+  });
 }

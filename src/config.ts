@@ -1,4 +1,3 @@
-import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -29,13 +28,15 @@ export interface LayerfsConfig {
    * from main), never written by apply. Visible to the agent inside its branch. Empty by default.
    */
   branchOnly: string[];
-  /** team mode: agent-facing `layerfs` tool (+ `layerfs_apply` for the top-level session) */
+  /** team mode: agent-facing `minilfs` tool (+ `minilfs_apply` for the top-level session) */
   team: boolean;
   /** execution driver name: "native" (default local macOS NFSv3 + Seatbelt) or a custom registered remote/distributed sandbox driver */
   driver: string;
   /** logical branch name alias (e.g. lead, or from MINILFS_BRANCH_NAME) */
   branchName?: string;
 }
+
+export type MinilfsConfig = LayerfsConfig;
 
 export const DEFAULT_EXCLUDES = [
   ".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*", ".npmrc", ".netrc", ".pypirc",
@@ -44,30 +45,27 @@ export const DEFAULT_EXCLUDES = [
 export function resolveConfig(env: NodeJS.ProcessEnv = process.env): LayerfsConfig {
   const list = (value: string | undefined, fallback: string[]) =>
     value === undefined ? fallback : value.split(",").map((s) => s.trim()).filter(Boolean);
-  const netEnv = env.MINILFS_NETWORK ?? env.PI_LAYERFS_NETWORK;
+  const netEnv = env.MINILFS_NETWORK;
   const network: "allow" | "localhost" | "deny" =
     netEnv === "deny" || netEnv === "offline"
       ? "deny"
       : netEnv === "localhost"
         ? "localhost"
         : "allow";
-  const defaultBundle = existsSync(join(homedir(), ".cache/minilfs/bundle-native/layerfs.node"))
-    ? join(homedir(), ".cache/minilfs/bundle-native")
-    : join(homedir(), ".cache/epi-layerfs/bundle-native");
   return {
-    enabled: (env.MINILFS ?? env.PI_LAYERFS) !== "0",
+    enabled: env.MINILFS !== "0",
     sandbox: "native",
-    driver: env.MINILFS_DRIVER ?? env.PI_LAYERFS_DRIVER ?? "native",
+    driver: env.MINILFS_DRIVER ?? "native",
     network,
-    nfsMount: env.MINILFS_NFS_MOUNT || env.PI_LAYERFS_NFS_MOUNT || undefined,
-    bundle: env.MINILFS_BUNDLE ?? env.PI_LAYERFS_BUNDLE ?? defaultBundle,
-    root: env.MINILFS_ROOT ?? env.PI_LAYERFS_ROOT ?? join(homedir(), ".cache/minilfs"),
-    prefix: env.MINILFS_PREFIX ?? env.PI_LAYERFS_PREFIX ?? "minilfs-",
-    excludes: list(env.MINILFS_EXCLUDES ?? env.PI_LAYERFS_EXCLUDES, DEFAULT_EXCLUDES),
-    killGraceMs: Number(env.MINILFS_KILL_GRACE_MS ?? env.PI_LAYERFS_KILL_GRACE_MS ?? 2000),
-    envAllow: list(env.MINILFS_ENV_ALLOW ?? env.PI_LAYERFS_ENV_ALLOW, ["TERM", "LANG", "LC_ALL", "CI", "NO_COLOR", "FORCE_COLOR"]),
-    branchOnly: list(env.MINILFS_BRANCH_ONLY ?? env.PI_LAYERFS_BRANCH_ONLY, []),
-    team: (env.MINILFS_TEAM ?? env.PI_LAYERFS_TEAM) === "1",
-    branchName: env.MINILFS_BRANCH_NAME || env.PI_LAYERFS_BRANCH_NAME || undefined,
+    nfsMount: env.MINILFS_NFS_MOUNT || undefined,
+    bundle: env.MINILFS_BUNDLE ?? join(homedir(), ".cache/minilfs/bundle-native"),
+    root: env.MINILFS_ROOT ?? join(homedir(), ".cache/minilfs"),
+    prefix: env.MINILFS_PREFIX ?? "minilfs-",
+    excludes: list(env.MINILFS_EXCLUDES, DEFAULT_EXCLUDES),
+    killGraceMs: Number(env.MINILFS_KILL_GRACE_MS ?? 2000),
+    envAllow: list(env.MINILFS_ENV_ALLOW, ["TERM", "LANG", "LC_ALL", "CI", "NO_COLOR", "FORCE_COLOR"]),
+    branchOnly: list(env.MINILFS_BRANCH_ONLY, []),
+    team: env.MINILFS_TEAM === "1",
+    branchName: env.MINILFS_BRANCH_NAME || undefined,
   };
 }

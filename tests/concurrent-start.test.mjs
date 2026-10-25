@@ -9,8 +9,8 @@ import { join } from "node:path";
 import { stopNativeDaemons } from "../src/workspace.ts";
 
 const id = Date.now().toString(36);
-const base = join(homedir(), ".cache/pi-layerfs-test", `cs-${id}`);
-const prefix = `pi-lfs-cs-${id}-`;
+const base = join(homedir(), ".cache/minilfs-test", `cs-${id}`);
+const prefix = `minilfs-cs-${id}-`;
 const cwd = join(base, "proj");
 mkdirSync(cwd, { recursive: true });
 writeFileSync(join(cwd, "a.txt"), "a\n");

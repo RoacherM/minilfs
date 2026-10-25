@@ -12,12 +12,12 @@ import { LayerfsSession, stopNativeDaemons } from "../src/workspace.ts";
 
 const source = process.argv[2] ?? join(homedir(), "Projects/sides/epi");
 const id = Date.now().toString(36);
-const base = join(homedir(), ".cache/pi-layerfs-test", `scale-${id}`);
+const base = join(homedir(), ".cache/minilfs-test", `scale-${id}`);
 const cwd = join(base, "repo");
 mkdirSync(base, { recursive: true });
 const clone = spawnSync("cp", ["-c", "-R", source, cwd], { encoding: "utf8" });
 assert.equal(clone.status, 0, clone.stderr);
-const prefix = `pi-lfs-sc-${id}-`;
+const prefix = `minilfs-sc-${id}-`;
 const pgrep = (pattern) => spawnSync("pgrep", ["-f", pattern], { encoding: "utf8" });
 const timings = {};
 const time = async (k, fn) => { const t0 = Date.now(); const v = await fn(); timings[k] = Date.now() - t0; return v; };
