@@ -194,7 +194,16 @@ export class LayerfsSession {
       this.lfs = client.lfs;
       this.operator = client.operator;
       this.LayerFSError = client.LayerFSError;
-      if (options.reason !== "reload" && options.reason !== "resume" && !options.forkFromRef) {
+      const hasPriorSession =
+        Boolean(options.resumeBinding?.workBranch) ||
+        Boolean(this.bindings.session(this.sessionId)?.project === this.projectRecord.name) ||
+        Boolean(
+          this.config.branchName &&
+            Object.values(this.bindings.data.sessions).some(
+              (s) => s.project === this.projectRecord.name && (s.logicalBranch === this.config.branchName || s.workBranch === this.config.branchName),
+            ),
+        );
+      if (options.reason !== "reload" && !(options.reason === "resume" && hasPriorSession) && !options.forkFromRef) {
         await this.syncHostDriftIntoMain();
       }
     }
@@ -402,6 +411,15 @@ export class LayerfsSession {
         this.headCommit = f.head ?? null;
         this.unapplied = await this.hasApplicable();
         return;
+      }
+    }
+
+    if (!this.config.branchName && this.logicalBranch === "lead") {
+      const existingLead = Object.entries(this.bindings.data.sessions).find(
+        ([sid, s]) => s.project === this.projectRecord.name && sid !== this.sessionId && s.logicalBranch === "lead",
+      );
+      if (existingLead) {
+        this.logicalBranch = `s-${this.shortId}`;
       }
     }
 
