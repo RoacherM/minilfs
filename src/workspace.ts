@@ -1196,8 +1196,8 @@ export class LayerfsSession {
 
     await this.prepareNativeGit(wsReal);
 
-    const scratchDir = join(this.config.root, "scratch", this.projectRecord.name, this.logicalBranch);
-    await fsp.mkdir(scratchDir, { recursive: true });
+    const scratchDir = join(this.config.root, "scratch");
+    await fsp.mkdir(join(scratchDir, this.projectRecord.name, this.logicalBranch), { recursive: true });
 
     const relCwd = this.toRel(hostCwd);
     const runCwd = relCwd ? join(wsReal, relCwd) : wsReal;
