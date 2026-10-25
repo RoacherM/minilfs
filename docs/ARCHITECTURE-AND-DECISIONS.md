@@ -203,6 +203,8 @@ await s.open({ reason: "resume" });
 const ops = createHarnessOperations(s);
 
 // 2. Wire file tools directly to Store (0 mounts, 0 conflict with DSH sandbox):
+//    - Wrap mutations in s.mutate(callId, label, fn) for serialized execution + labeled checkpoints
+//      (note: direct s.writeFile() / s.exec() also auto-advance headCommit & unapplied if called directly):
 //    - read:  ops.read.readFile(path) / ops.read.access(path)
 //    - write: await s.mutate(callId, "write", () => ops.write.writeFile(path, content))
 //    - edit:  await s.mutate(callId, "edit",  () => /* readFile + replace + writeFile */)
@@ -210,6 +212,7 @@ const ops = createHarnessOperations(s);
 //    - bash:  await s.mutate(callId, "bash",  () => ops.bash.exec(command, projectCwd, { onData, signal, timeout }))
 
 // 3. Register `minilfs` and `minilfs_apply` control tools using executeLayerfsAction(s, params) and executeLayerfsApply(s).
+// 4. On session/test teardown: call await s.close({ stopDaemons: true }) (or stopNativeDaemons) to reap local NFS daemons.
 ```
 
 ---

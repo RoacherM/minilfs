@@ -142,6 +142,7 @@ export class LayerfsSession {
   unapplied = false;
 
   private lastStoreCommit: { kind: string; head: string | null } | null = null;
+  private inMutate = false;
   private activeSids = new Map<string, () => Promise<void>>();
   private pendingUnmounts = new Set<Promise<unknown>>();
   private mutex: Promise<unknown> = Promise.resolve();
@@ -1027,7 +1028,7 @@ export class LayerfsSession {
       const ops: any[] = parent !== "/" ? [{ op: "mkdir", path: parent }, { op: "write", path: sp, bytes }] : [{ op: "write", path: sp, bytes }];
       const msg = `pi write [${this.pendingOrigins.join(",") || "write"}]`.slice(0, 4000);
       const res = await this.lfs.fs.apply(this.workBranch, ops, msg);
-      this.lastStoreCommit = { kind: res.kind, head: res.commit?.id ?? res.head ?? null };
+      this.recordStoreCommit({ kind: res.kind, head: res.commit?.id ?? res.head ?? null }, "write");
       return;
     }
     const rel = sp.replace(/^\/+/, "");
@@ -1167,14 +1168,14 @@ export class LayerfsSession {
       const value = await fn(wsPath, ws);
       if (commitAfter) {
         const res = await this.lfs.workspace.commit(ws, message.slice(0, 4000));
-        this.lastStoreCommit = { kind: res.kind, head: res.commit?.id ?? res.head ?? null };
+        this.recordStoreCommit({ kind: res.kind, head: res.commit?.id ?? res.head ?? null }, message);
       }
       return value;
     } catch (e) {
       if (commitAfter) {
         try {
           const res = await this.lfs.workspace.commit(ws, `${message} (failed)`.slice(0, 4000));
-          this.lastStoreCommit = { kind: res.kind, head: res.commit?.id ?? res.head ?? null };
+          this.recordStoreCommit({ kind: res.kind, head: res.commit?.id ?? res.head ?? null }, message);
         } catch (ce: any) {
           keepMounted = true;
           this.blocked = { reason: `${ce?.code ?? "Error"}: ${String(ce?.message ?? ce).slice(0, 200)}`, heldWs: ws };
@@ -1281,7 +1282,7 @@ export class LayerfsSession {
       const msg = `pi bash (exit ${code ?? "sig"}) [${this.pendingOrigins.join(",") || "bash"}]`.slice(0, 4000);
       try {
         const res = await this.lfs.workspace.commit(ws, msg);
-        this.lastStoreCommit = { kind: res.kind, head: res.commit?.id ?? res.head ?? null };
+        this.recordStoreCommit({ kind: res.kind, head: res.commit?.id ?? res.head ?? null }, "bash");
       } catch (ce: any) {
         keepMounted = true;
         this.blocked = { reason: `${ce?.code ?? "Error"}: ${String(ce?.message ?? ce).slice(0, 200)}`, heldWs: ws };
@@ -1402,11 +1403,30 @@ export class LayerfsSession {
 
   // ---------------------------------------------------------------- mutation queue & checkpoint gate
 
+  private recordStoreCommit(res: { kind: string; head: string | null }, defaultLabel: string): void {
+    this.lastStoreCommit = res;
+    if (!this.inMutate && res.kind === "Committed") {
+      const cp: Checkpoint = {
+        origins: [defaultLabel],
+        label: defaultLabel,
+        commit: res.head,
+        branch: this.workBranch,
+        changed: true,
+        at: Date.now(),
+      };
+      this.headCommit = res.head;
+      this.unapplied = true;
+      this.checkpoints.push(cp);
+      this.persistSessionBinding();
+    }
+  }
+
   mutate<T>(origin: string, label: string, fn: () => Promise<T>): Promise<{ value: T; checkpoint: Checkpoint | null; error: Error | null }> {
     const job = this.mutex.then(async () => {
       if (this.blocked) {
         throw new Error(`minilfs checkpoint failed earlier (${this.blocked.reason}); changes are blocked until /minilfs retry succeeds`);
       }
+      this.inMutate = true;
       this.pendingOrigins.push(origin);
       this.lastStoreCommit = null;
       let value: T;
@@ -1415,6 +1435,8 @@ export class LayerfsSession {
         value = await fn();
       } catch (e) {
         fnError = e;
+      } finally {
+        this.inMutate = false;
       }
       const cp = await this.finalizeCheckpoint(label);
       if (fnError) throw fnError;

@@ -658,6 +658,17 @@ try {
     assert.equal(rMcp.status, 0, rMcp.stderr);
     const mcpReply = JSON.parse(rMcp.stdout.trim().split("\n")[0]);
     assert.deepEqual(mcpReply, { jsonrpc: "2.0", id: 1, result: {} });
+
+    // 5. Direct s.writeFile() / s.exec() without mutate() still updates headCommit & unapplied so apply() works
+    const sDirect = new LayerfsSession(cwd, `direct-${id}`, { ...config, branchName: "direct-caller" });
+    await sDirect.open();
+    await sDirect.writeFile(join(cwd, "direct-no-mutate.txt"), "direct-ok\n");
+    assert.ok(sDirect.headCommit, "direct writeFile without mutate() must still advance headCommit");
+    assert.equal(sDirect.unapplied, true, "direct writeFile without mutate() must mark unapplied=true");
+    const directApply = await sDirect.apply();
+    assert.ok(directApply.applied.includes("direct-no-mutate.txt"), "apply() must write files created without mutate()");
+    assert.equal(readFileSync(join(cwd, "direct-no-mutate.txt"), "utf8"), "direct-ok\n");
+    await sDirect.close();
   });
 
 } finally {
