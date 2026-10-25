@@ -141,15 +141,15 @@ await session.open();
 
 | Command | Does |
 |---|---|
-| `/layerfs status` | branch, logical alias, checkpoints, blocked state |
-| `/layerfs diff [branch] [base]` | files changed on this session's branch (or between any two branches) |
-| `/layerfs history [n]` | checkpoints: tool, time, changed files, HEAD / applied |
-| `/layerfs apply [--revert]` | 3-way checked write back to your host folder |
-| `/layerfs sync [--full]` | sync external host edits into LayerFS `main` |
-| `/layerfs branches` | active user/worker branches with logical aliases |
-| `/layerfs merge <branch> [--ours\|--theirs]` | merge another branch into yours (with automatic path-wise fallback merge) |
-| `/layerfs clean` | remove temporary scratch build caches for this project |
-| `/layerfs retry` | retry after a failed checkpoint |
+| `/minilfs status` | branch, logical alias, checkpoints, blocked state |
+| `/minilfs diff [branch] [base]` | files changed on this session's branch (or between any two branches) |
+| `/minilfs history [n]` | checkpoints: tool, time, changed files, HEAD / applied |
+| `/minilfs apply [--revert]` | 3-way checked write back to your host folder |
+| `/minilfs sync [--full]` | sync external host edits into LayerFS `main` |
+| `/minilfs branches` | active user/worker branches with logical aliases |
+| `/minilfs merge <branch> [--ours\|--theirs]` | merge another branch into yours (with automatic path-wise fallback merge) |
+| `/minilfs clean` | remove temporary scratch build caches for this project |
+| `/minilfs retry` | retry after a failed checkpoint |
 
 ---
 
@@ -157,7 +157,7 @@ await session.open();
 
 | Env | Default |
 |---|---|
-| `MINILFS` | on; `0` turns it off (`--no-layerfs` flag also disables for one run) |
+| `MINILFS` | on; `0` turns it off (`--no-minilfs` flag also disables for one run) |
 | `MINILFS_DRIVER` | `native` (or custom registered driver name) |
 | `MINILFS_BUNDLE` | `~/.cache/minilfs/bundle-native` |
 | `MINILFS_ROOT` | `~/.cache/minilfs` (home, APFS Stores, local mounts, bindings) |

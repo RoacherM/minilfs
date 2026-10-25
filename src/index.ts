@@ -32,8 +32,8 @@ import {
 export const CHECKPOINT_ENTRY = "layerfs-checkpoint";
 export const SESSION_ENTRY = "layerfs-session";
 
-export default function layerfsExtension(pi: ExtensionAPI) {
-  pi.registerFlag("no-layerfs", { description: "Disable LayerFS isolation for this run (tools act on the host folder)", type: "boolean", default: false });
+export default function minilfsExtension(pi: ExtensionAPI) {
+  pi.registerFlag("no-minilfs", { description: "Disable minilfs isolation for this run (tools act on the host folder)", type: "boolean", default: false });
 
   let session: LayerfsSession | null = null;
   let ready: Promise<LayerfsSession> | null = null;
@@ -271,7 +271,7 @@ export default function layerfsExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (event, ctx) => {
     const config = resolveConfig();
     hostCwd = ctx.cwd;
-    disabled = !config.enabled || pi.getFlag("no-layerfs") === true;
+    disabled = !config.enabled || pi.getFlag("no-minilfs") === true;
     if (disabled) {
       status(ctx, "LayerFS off");
       if (ctx.hasUI) ctx.ui.notify("LayerFS isolation is OFF for this run: tools act directly on the host folder.", "warning");
@@ -352,18 +352,7 @@ export default function layerfsExtension(pi: ExtensionAPI) {
     ["retry", "checkpoint 失败被锁住后重试"],
     ["clean", "清理本项目的 scratch 构建缓存目录"],
   ];
-  pi.registerCommand("layerfs", {
-    description: "LayerFS workspace: status | diff | history | apply | merge | retry | sync | branches | clean",
-    // Pi's editor treats Enter on an open argument menu as "apply completion" (not submit),
-    // because the argument prefix does not start with "/". So once the typed argument is
-    // already a complete subcommand, show no menu and let Enter submit directly.
-    getArgumentCompletions: (prefix: string) => {
-      const typed = prefix.trim();
-      if (SUBCOMMANDS.some(([n]) => n === typed || typed.startsWith(`${n} `))) return null;
-      const items = SUBCOMMANDS.filter(([n]) => n.startsWith(typed)).map(([value, description]) => ({ value, label: value, description }));
-      return items.length ? items : null;
-    },
-    handler: async (args, ctx) => {
+  const commandHandler = async (args: string | undefined, ctx: ExtensionContext) => {
       const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
       const sub = argv[0] || "status";
       const say = (t: string, level: "info" | "warning" | "error" = "info") => (ctx.hasUI ? ctx.ui.notify(t, level) : console.log(t));
@@ -468,7 +457,21 @@ export default function layerfsExtension(pi: ExtensionAPI) {
           s.unapplied ? "Changes made while applying are still pending: run /layerfs apply again." : "",
         ].filter(Boolean).join("\n"), r.warnings.length ? "warning" : "info");
       }
-      return say([`未知子命令 "${sub}"。可用：`, ...SUBCOMMANDS.map(([n, d]) => `  /layerfs ${n.padEnd(9)} ${d}`)].join("\n"), "warning");
-    },
-  });
+      return say([`未知子命令 "${sub}"。可用：`, ...SUBCOMMANDS.map(([n, d]) => `  /minilfs ${n.padEnd(9)} ${d}`)].join("\n"), "warning");
+  };
+
+  const getArgumentCompletions = (prefix: string) => {
+    const typed = prefix.trim();
+    if (SUBCOMMANDS.some(([n]) => n === typed || typed.startsWith(`${n} `))) return null;
+    const items = SUBCOMMANDS.filter(([n]) => n.startsWith(typed)).map(([value, description]) => ({ value, label: value, description }));
+    return items.length ? items : null;
+  };
+
+  for (const cmdName of ["minilfs", "layerfs"]) {
+    pi.registerCommand(cmdName, {
+      description: "minilfs workspace: status | diff | history | apply | merge | retry | sync | branches | clean",
+      getArgumentCompletions,
+      handler: commandHandler,
+    });
+  }
 }

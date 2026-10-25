@@ -80,8 +80,8 @@ try {
     });
   })();
 
-  step("--no-layerfs: explicit opt-out writes the host folder", () => {
-    const r = pi([[["write", { path: "c.txt", content: "host c\n" }]]], ["--no-layerfs"]);
+  step("--no-minilfs: explicit opt-out writes the host folder", () => {
+    const r = pi([[["write", { path: "c.txt", content: "host c\n" }]]], ["--no-minilfs"]);
     assert.equal(r.status, 0, r.stderr.slice(-800));
     assert.equal(readFileSync(join(cwd, "c.txt"), "utf8"), "host c\n");
   });
