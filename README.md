@@ -1,98 +1,170 @@
-# pi-layerfs
+# pi-layerfs (`RoacherM/pi-layerfs`)
 
-Pi extension: **every Pi session works in an isolated [LayerFS](https://github.com/Ephemeral-AI-Lab/layerfs) workspace by default.**
-`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls` and user `!` commands run against a
-Linux LayerFS Branch/Workspace imported from the project folder. Your folder changes only
-when you run `/layerfs apply`.
+A **100% Native, Zero-Docker** [LayerFS](https://github.com/Ephemeral-AI-Lab/layerfs) runtime, [Pi](https://pi.dev) / [Epi](https://github.com/RoacherM/epi) extension, and universal CLI / MCP server that isolates agent file operations and shell commands on copy-on-write LayerFS branches, guarded at the OS kernel level by a Claude Code (`@anthropic-ai/sandbox-runtime` / `srt`)-inspired macOS Seatbelt (`sandbox-exec`) sandbox.
 
-Status: v0.2 (see docs/DESIGN-v0.2.md, docs/REVIEW-v0.2-opus-5.5.md), tested with stock Pi 1.2.0 and LayerFS `5fb68dd` on macOS arm64 + Docker Desktop.
-Optional in Epi: enable it explicitly via the Manifest (`epi install <path>`); machines without Docker are unaffected unless they declare it. See docs/EPI-INTEGRATION.md.
+Your real project folder changes **only** when you run `/layerfs apply` (or `layerfs_apply` / `pi-layerfs apply`).
 
-## How it works
+---
+
+## Architecture: Harness-Agnostic Core + Universal Adapters
 
 ```
-Pi (host)  ── tools ──▶ docker exec ──▶ Sandbox container: /workspaces/N  (FUSE, LayerFS)
-   │                                         ▲
-   └── SDK calls (JSON lines) ──▶ worker container (--network host, real layerfs.node)
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Upper Layer: Universal Harness Surfaces                                 │
+│  ├─ Pi & Epi Extension (`src/index.ts`)                                 │
+│  │    `epi install git:github.com/RoacherM/pi-layerfs`                  │
+│  │    `pi install git:github.com/RoacherM/pi-layerfs`                   │
+│  ├─ CLI & MCP Server (`src/cli.ts`)                                     │
+│  │    `pi-layerfs mcp` -> Claude Code / Codex / Cursor MCP Server       │
+│  │    `pi-layerfs exec -- <cmd>` -> Sandboxed branch command runner     │
+│  └─ Programmatic SDK (`@roacherm/pi-layerfs/core`, `src/core/index.ts`) │
+├─────────────────────────────────────────────────────────────────────────┤
+│ Lower Layer: Harness-Agnostic Native Workspace Engine (`src/core/`)     │
+│  Zero Pi/Epi dependencies! Pure Node.js + Native LayerFS + OS Seatbelt. │
+│  ├─ In-process APFS SQLite Store (`layerfs.node`)                       │
+│  │    read / write / edit / ls / find / grep / diff / history in ~1–8ms │
+│  ├─ Local NFSv3 Loopback Daemon (`layerfs-daemon` on 127.0.0.1)         │
+│  │    Unprivileged `/sbin/mount_nfs` per-branch Workspace mounts        │
+│  ├─ Claude Code (`srt`)-Style macOS Seatbelt Sandbox (`src/seatbelt.ts`)│
+│  │    • Deny-by-default writes: only mounted branch & scratch writable  │
+│  │    • Kernel write-lock on real host project folder & `.git/config`   │
+│  │    • Kernel read-deny & move-blocking on `.env*`, `*.key`, `~/.ssh`  │
+│  │    • Kernel `file-mount`/`file-unmount` & optional network lockdown  │
+│  └─ Multi-Agent Team DAG (`merge`, 3-way fallback, `checkout`, `sync`)  │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-Per session: filtered copy of the cwd (secrets excluded) → `project.init` → Branch `work` →
-one mounted Workspace. Every change (write/edit/bash/`!cmd`) is committed as a checkpoint
-recorded with its tool-call id (`layerfs-checkpoint` session entry). `/layerfs apply` writes
-the Branch's changes to the folder, refusing everything if you edited any of those files
-yourself since the session started.
+---
 
-## Setup
+## 1. Prerequisites (Once per Mac — Zero Docker, Zero Root, Zero macFUSE)
 
-1. Build LayerFS (no published artifacts) — see `dsh/README.md` step 1 upstream; this repo
-   used the Docker recipe into `~/.cache/epi-layerfs/bundle-5fb68dd` (`layerfs-daemon`,
-   `layerfs.node`, `sdk/js`), ~4 min cold.
-2. Runtime image: `docker build -t epi-lfs-runtime:node24-5fb68dd <layerfs>/dsh/tools/history/runtime`.
-3. Run Pi with the extension: `pi -e /path/to/pi-layerfs` (or add it as a Pi package).
+| Need | Why |
+|---|---|
+| macOS (Apple Silicon / Intel) | Uses macOS built-in `/sbin/mount_nfs` and `/usr/bin/sandbox-exec` |
+| Rust (`cargo`) & `git` | Builds the native `layerfs-daemon` and `layerfs.node` once |
+
+Build the native bundle (`~/.cache/epi-layerfs/bundle-native`, ~1 min):
+
+```bash
+git clone https://github.com/RoacherM/pi-layerfs.git
+./pi-layerfs/scripts/setup-layerfs.sh
+```
+
+---
+
+## 2. Install in Epi or Pi (Direct from GitHub!)
+
+### Epi
+
+```bash
+# Global install (~/.epi/epi.json)
+epi install git:github.com/RoacherM/pi-layerfs
+
+# Or project-only (.epi/epi.json)
+epi install -l --approve git:github.com/RoacherM/pi-layerfs
+```
+
+### Pi
+
+```bash
+# Global install (~/.pi/agent/settings.json)
+pi install git:github.com/RoacherM/pi-layerfs
+
+# Or project-only (.pi/settings.json)
+pi install -l git:github.com/RoacherM/pi-layerfs
+```
+
+---
+
+## 3. Use in Claude Code, Codex CLI, or Cursor (MCP + CLI)
+
+### As an MCP Server (`.mcp.json` or `epi mcp add`)
+
+```json
+{
+  "mcpServers": {
+    "layerfs": {
+      "command": "node",
+      "args": ["/path/to/pi-layerfs/src/cli.ts", "mcp"],
+      "env": {
+        "PI_LAYERFS_TEAM": "1"
+      }
+    }
+  }
+}
+```
+
+### As a Standalone CLI
+
+```bash
+# Run any command inside an isolated LayerFS branch + macOS Seatbelt sandbox
+node ./src/cli.ts --branch worker-1 exec -- cargo test
+
+# Inspect, diff, merge, and apply branches
+node ./src/cli.ts status
+node ./src/cli.ts branches
+node ./src/cli.ts diff worker-1
+node ./src/cli.ts merge worker-1
+node ./src/cli.ts apply
+```
+
+---
+
+## 4. Programmatic SDK (`@roacherm/pi-layerfs/core`)
+
+`src/core/index.ts` has **zero** `@earendil-works/pi-coding-agent` dependencies. Any Node.js harness can embed it directly:
+
+```ts
+import {
+  LayerfsSession,
+  resolveConfig,
+  createHarnessOperations,
+  executeLayerfsAction,
+  executeLayerfsApply,
+} from "@roacherm/pi-layerfs/core";
+
+const session = new LayerfsSession(process.cwd(), "worker-1", resolveConfig({ PI_LAYERFS_TEAM: "1" }));
+await session.open();
+
+const ops = createHarnessOperations(session);
+await session.mutate("w1", "write", () => ops.write.writeFile("src/feature.ts", "export const ok = true;\n"));
+console.log(await executeLayerfsAction(session, { action: "diff" }));
+console.log(await executeLayerfsApply(session));
+
+await session.close();
+```
+
+---
+
+## 5. Interactive Commands (`/layerfs`)
+
+| Command | Does |
+|---|---|
+| `/layerfs status` | branch, logical alias, checkpoints, blocked state |
+| `/layerfs diff [branch] [base]` | files changed on this session's branch (or between any two branches) |
+| `/layerfs history [n]` | checkpoints: tool, time, changed files, HEAD / applied |
+| `/layerfs apply [--revert]` | 3-way checked write back to your host folder |
+| `/layerfs sync [--full]` | sync external host edits into LayerFS `main` |
+| `/layerfs branches` | active user/worker branches with logical aliases |
+| `/layerfs merge <branch> [--ours\|--theirs]` | merge another branch into yours (with automatic path-wise fallback merge) |
+| `/layerfs retry` | retry after a failed checkpoint |
+
+---
+
+## 6. Configuration
 
 | Env | Default |
 |---|---|
-| `PI_LAYERFS` | on; `0` = explicit opt-out |
-| `PI_LAYERFS_BUNDLE` | `~/.cache/epi-layerfs/bundle-5fb68dd` |
-| `PI_LAYERFS_IMAGE` | `epi-lfs-runtime:node24-5fb68dd` |
-| `PI_LAYERFS_ROOT` | `~/.cache/pi-layerfs` (LayerFS home, session records) |
+| `PI_LAYERFS` | on; `0` turns it off (`--no-layerfs` flag also disables for one run) |
+| `PI_LAYERFS_BUNDLE` | `~/.cache/epi-layerfs/bundle-native` |
+| `PI_LAYERFS_ROOT` | `~/.cache/pi-layerfs` (home, APFS Stores, local mounts, bindings) |
+| `PI_LAYERFS_PREFIX` | `pi-lfs-` |
+| `PI_LAYERFS_NETWORK` | `allow` \| `localhost` \| `deny` (`offline`) — Seatbelt outbound network policy inside `bash` |
 | `PI_LAYERFS_EXCLUDES` | `.env,.env.*,*.pem,*.key,id_rsa*,id_ed25519*,.npmrc,.netrc,.pypirc` |
-| `PI_LAYERFS_ENV_ALLOW` | env vars passed into commands besides `PI_*` (host env is NOT forwarded) |
+| `PI_LAYERFS_BRANCH_ONLY` | comma-separated build-output patterns (e.g. `target/,.cargo-home/`) kept only in branches |
+| `PI_LAYERFS_TEAM` | `1` enables multi-agent `layerfs` / `layerfs_apply` tools |
+| `PI_LAYERFS_BRANCH_NAME` | logical branch alias for this session (defaults to `lead` or `s-<shortId>`) |
 
-Opt-out flag: `--no-layerfs` — put it **before** the prompt/other args (Pi boolean extension
-flags consume a following non-flag argument).
+## License
 
-## Commands
-
-`/layerfs status` · `/layerfs diff` · `/layerfs history [n]` (this session's checkpoints: tool, time, changed files, HEAD/applied; Store reads only) · `/layerfs apply` (confirm dialog when a UI exists) · `/layerfs retry`
-
-## Guarantees (each covered by tests)
-
-- Fail-closed: if Docker/image/bundle/worker is unavailable, file tools error; nothing falls back to the host folder.
-- Host folder is written only by `/layerfs apply`; apply is all-or-nothing on conflicts; `.git/` internals are never applied.
-- Files outside the project are read-only (reads go to the host, e.g. skills); writes are refused.
-- Live bash output; abort/timeout TERM→KILL the command's whole session inside the Sandbox.
-- A failed checkpoint blocks further changes until `/layerfs retry`; the next checkpoint records every pending tool-call id.
-- Parallel tool calls are serialized for mutation + checkpoint.
-- Shutdown stops commands, checkpoints, reaps processes holding the mount, unmounts, removes containers; the project volume is kept only when work is unapplied or unconfirmed.
-
-## Tests
-
-```bash
-npm test               # all suites, real LayerFS + Docker (≈4 min)
-npm run test:backend   # session backend, no Pi (16)
-npm run test:pi        # real Pi AgentSession + scripted model (17)
-npm run test:cli       # real `pi -p` binary incl. concurrent sessions (5)
-npm run test:rpc       # real `pi --mode rpc`: status line, notify, apply confirm (6)
-npm run test:scale     # APFS clone of a real repo (default ~/Projects/sides/epi)
-npm run probe:real     # low-level LayerFS probes (see probes/real/FINDINGS.md)
-```
-
-## v0.2 architecture (summary)
-
-- One long-lived Store container `<prefix>store` (`--network host`, Mac talks to it over `docker exec` + Unix socket); `project.init` runs in a throwaway container.
-- One Project Store per host folder, shared by all sessions; each session gets `b-<id>` (base anchor) + `s-<id>` (work) branches.
-- `read/write/edit/ls/find/grep` go to the Store directly (0 Sandboxes); binary, symlink, or >48 KiB-line files fall back to a short Workspace mount.
-- `bash`/`!cmd`: mount → `docker exec setsid` → commit → unmount per call.
-- `/layerfs apply` diffs base→work only, skips excludes/.git, three-way checks against the base branch, merges with main if it moved, then publishes.
-- `/tree`, `/fork`, `/resume` restore file state from checkpoint commits.
-
-## Command sandbox
-
-Each `bash` / `!cmd` runs in its own PID + mount namespace inside the Sandbox: the Workspace is
-bind-mounted at your project's real path (so absolute paths work and nothing is rewritten), and
-every process the command started, including `cmd &` and `nohup`, is killed when it ends or is
-cancelled. Background servers therefore do not survive across bash calls.
-
-## Known limits
-
-- **Startup**: first session in a folder ~0.7 s (small) / ~12.6 s (23k files); later sessions in the same folder ~0.2–0.6 s.
-- **Upstream bug**: the first Workspace of a fresh Sandbox can hit a 5 s unmount timeout; v0.2 has no prewarm, so the first fallback/bash on a new Sandbox may take ~5 s once.
-- On the default Docker bridge network the binding cannot reach a new Sandbox; the worker uses `--network host`.
-- Commands run in Linux: host (darwin) `node_modules` native addons are copied as-is and will not load there.
-- Only the 7 built-in tools and `!` commands are isolated; other extensions/MCP tools still act on the host.
-- Branches are never garbage-collected yet (Store grows; no `/layerfs gc`).
-- **No orphan GC yet**: if Pi is killed hard (SIGKILL/crash) its worker/Sandbox containers and volume stay behind (`docker ps -a --filter name=pi-lfs-`). Needs a startup sweeper or `/layerfs gc`.
-- `/layerfs apply` refuses to go backwards after `/tree` (use `/layerfs apply --revert` to do it on purpose); if updating LayerFS main fails after files were written, you get a warning and the next session resyncs main from your folder.
-- `grep` uses GNU `grep -P` in the Sandbox (not ripgrep); `find` globs use Node `path.matchesGlob`.
-- Interactive TUI rendering was not driven directly; its dialogs/status were tested through RPC mode.
+MIT.

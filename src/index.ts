@@ -7,19 +7,30 @@
  * - `/resume`, `/tree` and `/fork` restore or branch the file state alongside the conversation.
  * - The host folder is written only by `/layerfs apply` (with three-way conflict detection).
  */
-import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createBashTool, createEditTool, createFindTool, createGrepTool, createLsTool, createReadTool, createWriteTool,
   DEFAULT_MAX_BYTES, formatSize, truncateHead,
 } from "@earendil-works/pi-coding-agent";
-import { resolveConfig } from "./config.ts";
-import { LayerfsSession, type Checkpoint } from "./workspace.ts";
-import { formatHistory, hiddenPath, loadHistory } from "./history.ts";
+import {
+  cleanRelPath,
+  createHarnessOperations,
+  executeLayerfsAction,
+  executeLayerfsApply,
+  formatHistory,
+  hiddenPath,
+  LAYERFS_APPLY_TOOL_DESCRIPTION,
+  LAYERFS_APPLY_TOOL_SCHEMA,
+  LAYERFS_TOOL_DESCRIPTION,
+  LAYERFS_TOOL_SCHEMA,
+  LayerfsSession,
+  loadHistory,
+  resolveConfig,
+  type Checkpoint,
+} from "./core/index.ts";
 
 export const CHECKPOINT_ENTRY = "layerfs-checkpoint";
 export const SESSION_ENTRY = "layerfs-session";
-const IMAGE_TYPES: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" };
 
 export default function layerfsExtension(pi: ExtensionAPI) {
   pi.registerFlag("no-layerfs", { description: "Disable LayerFS isolation for this run (tools act on the host folder)", type: "boolean", default: false });
@@ -80,30 +91,20 @@ export default function layerfsExtension(pi: ExtensionAPI) {
       : "";
   }
 
+  const recordSession = (s: LayerfsSession) =>
+    pi.appendEntry(SESSION_ENTRY, { project: s.project, volume: s.volume, cwd: s.cwd, baseBranch: s.baseBranch, workBranch: s.workBranch, baseRef: s.baseRef, headCommit: s.headCommit });
+  const recordMerge = (s: LayerfsSession, other: string, r: { head: string | null; branch: string }) => {
+    if (r.head) pi.appendEntry(CHECKPOINT_ENTRY, { origins: [`merge:${other}`], label: "merge", commit: r.head, branch: r.branch, changed: true, at: Date.now(), project: s.project });
+    recordSession(s);
+  };
+  const applicableDiff = async (s: LayerfsSession) => (await s.diff()).filter((i) => i.type !== "dir" && !hiddenPath(i.path) && s.isApplicable(i.path));
+
   const withNote = (result: any, note: string) =>
     note ? { ...result, content: [...(result.content ?? []), { type: "text", text: note }] } : result;
 
   // ------------------------------------------------------------- tools
 
-  const ops = (s: LayerfsSession) => ({
-    read: {
-      readFile: (p: string) => s.readFile(p),
-      access: (p: string) => s.access(p),
-      detectImageMimeType: async (p: string) => IMAGE_TYPES[path.extname(p).toLowerCase()] ?? null,
-    },
-    write: { writeFile: (p: string, c: string) => s.writeFile(p, c), mkdir: (p: string) => s.mkdir(p) },
-    edit: { readFile: (p: string) => s.readFile(p), writeFile: (p: string, c: string) => s.writeFile(p, c), access: (p: string) => s.access(p, true) },
-    bash: { exec: (cmd: string, cwd: string, o: any) => s.exec(cmd, cwd, o) },
-    ls: {
-      exists: (p: string) => s.exists(p),
-      stat: async (p: string) => { const d = await s.isDirectory(p); return { isDirectory: () => d }; },
-      readdir: (p: string) => s.readdir(p),
-    },
-    find: {
-      exists: (p: string) => s.exists(p),
-      glob: (pattern: string, cwd: string, o: { ignore: string[]; limit: number }) => s.findFiles(pattern, cwd, o),
-    },
-  });
+  const ops = (s: LayerfsSession) => createHarnessOperations(s);
 
   pi.registerTool({
     ...local.read,
@@ -161,6 +162,49 @@ export default function layerfsExtension(pi: ExtensionAPI) {
       return { content: [{ type: "text" as const, text: t.content + (notes.length ? `\n\n[${notes.join(". ")}]` : "") }], details: undefined };
     },
   });
+
+  // ------------------------------------------------------------- team mode (PI_LAYERFS_TEAM=1)
+  // Agent-facing branch tools for multi-agent runs. `layerfs` is for every session (lead and
+  // sub-agents); `layerfs_apply` (writes the user's folder) only for the top-level session:
+  // pi-subagents children (PI_SUBAGENT_CHILD=1) never get it.
+  const boot = resolveConfig();
+  const isChild = process.env.PI_SUBAGENT_CHILD === "1";
+  if (boot.team && boot.enabled) {
+    const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: undefined });
+    pi.registerTool({
+      name: "layerfs",
+      label: "LayerFS",
+      description: LAYERFS_TOOL_DESCRIPTION,
+      parameters: LAYERFS_TOOL_SCHEMA as any,
+      async execute(_id: string, params: any, _signal: any, _onUpdate: any, ctx: ExtensionContext) {
+        if (disabled) return text("LayerFS is off for this run: there are no branches; tools act on the user's folder.");
+        const s = await need();
+        const out = await executeLayerfsAction(s, params, {
+          onStatusChange: () => status(ctx, describe(s)),
+          onMerged: (other, r) => recordMerge(s, other, r),
+        });
+        return text(out);
+      },
+    } as any);
+
+    if (!isChild) {
+      pi.registerTool({
+        name: "layerfs_apply",
+        label: "LayerFS apply",
+        description: LAYERFS_APPLY_TOOL_DESCRIPTION,
+        parameters: LAYERFS_APPLY_TOOL_SCHEMA as any,
+        async execute(_id: string, _params: any, _signal: any, _onUpdate: any, ctx: ExtensionContext) {
+          if (disabled) return text("LayerFS is off for this run: your edits are already in the user's folder.");
+          const s = await need();
+          const out = await executeLayerfsApply(s, {
+            onStatusChange: () => status(ctx, describe(s)),
+            onApplied: () => recordSession(s),
+          });
+          return text(out);
+        },
+      } as any);
+    }
+  }
 
   pi.on("user_bash", async (_event, ctx) => {
     if (disabled) return undefined;
@@ -286,6 +330,11 @@ export default function layerfsExtension(pi: ExtensionAPI) {
       `Paths under ${session?.cwd ?? "the working directory"} refer to that Branch; edits there do NOT reach the user's folder until the user runs /layerfs apply.`,
       "Files outside the working directory are read-only. Secret files such as .env are not imported.",
       "Each bash call runs in its own sandbox: background processes (`cmd &`, dev servers) end when that call ends. Start and use a server within one bash call.",
+      ...(resolveConfig().team ? [
+        isChild
+          ? "Team mode: you work on your own branch. Use the `layerfs` tool (status/diff/sync); report your branch name from `layerfs status` when you finish. You cannot write the user's folder."
+          : "Team mode: the `layerfs` tool merges other branches (e.g. sub-agents') into yours; `layerfs_apply` writes your branch into the user's folder and advances main, which new sub-agents start from.",
+      ] : []),
     ].join("\n");
     return { systemPrompt: `${event.systemPrompt}\n${note}` };
   });
@@ -299,10 +348,11 @@ export default function layerfsExtension(pi: ExtensionAPI) {
     ["apply", "把改动写回你的项目目录（有冲突则一个都不写；--revert 允许回退已写回的内容）"],
     ["sync", "把你在 Pi 外的改动同步进 LayerFS main（--full 全量重新校验）"],
     ["branches", "列出项目里所有 LayerFS 分支"],
+    ["merge", "把另一个分支（如子 agent 的分支）合并进本会话：merge <branch>"],
     ["retry", "checkpoint 失败被锁住后重试"],
   ];
   pi.registerCommand("layerfs", {
-    description: "LayerFS workspace: status | diff | history | apply | retry | sync | branches",
+    description: "LayerFS workspace: status | diff | history | apply | merge | retry | sync | branches",
     // Pi's editor treats Enter on an open argument menu as "apply completion" (not submit),
     // because the argument prefix does not start with "/". So once the typed argument is
     // already a complete subcommand, show no menu and let Enter submit directly.
@@ -323,7 +373,7 @@ export default function layerfsExtension(pi: ExtensionAPI) {
         return say([
           describe(s),
           `project ${s.project} · volume ${s.volume}`,
-          `branch ${s.workBranch} (base ${s.baseBranch} @ ${s.baseRef.slice(0, 12)}) · head ${(s.headCommit ?? "none").slice(0, 12)}`,
+          `branch ${s.workBranch} (alias: ${s.logicalBranch}, base ${s.baseBranch} @ ${s.baseRef.slice(0, 12)}) · head ${(s.headCommit ?? "none").slice(0, 12)}`,
           s.blocked ? `blocked: ${s.blocked.reason}` : "",
         ].filter(Boolean).join("\n"));
       }
@@ -333,11 +383,48 @@ export default function layerfsExtension(pi: ExtensionAPI) {
         return say(formatHistory(await loadHistory(s, limit)));
       }
       if (sub === "branches") {
-        const list = await s.listAllBranches();
-        return say(list.map((b) => `${b.name.padEnd(20)} head ${(b.head ?? "-").slice(0, 12)} base ${(b.base ?? "-").slice(0, 12)}`).join("\n"));
+        const list = await s.listUserBranches();
+        return say(list.map((b) => `${b.name.padEnd(20)} ${(b.logicalBranch ? `[${b.logicalBranch}]` : "").padEnd(14)} head ${(b.head ?? "-").slice(0, 12)} base ${(b.base ?? "-").slice(0, 12)}`).join("\n"));
+      }
+      if (sub === "merge") {
+        const otherParam = argv[1];
+        if (!otherParam) return say("用法：/layerfs merge <branch> [--ours|--theirs]（分支名见 /layerfs branches）", "warning");
+        const strategy = argv.includes("--theirs") ? "theirs" : argv.includes("--ours") ? "ours" : undefined;
+        const other = await s.resolveBranchName(otherParam);
+        const r = await s.mergeBranch(other, strategy ? { strategy } : undefined);
+        status(ctx, describe(s));
+        if (!r.merged) return say([`Conflict merging ${other}; nothing changed. Conflicting files:`, ...r.conflicts.map((c) => `  ${c.path}${c.kind ? ` (${c.kind})` : ""}`)].join("\n"), "error");
+        recordMerge(s, other, r);
+        const lwwInfo = r.lww ? (r.lwwPaths?.length ? `, ${r.lww} generated file(s) took the newer side: ${r.lwwPaths.slice(0, 5).join(", ")}${r.lwwPaths.length > 5 ? ", …" : ""}` : `, ${r.lww} generated file(s) took the newer side`) : "";
+        return say(`Merged ${other} into this session (now on ${r.branch}${lwwInfo}). /layerfs diff to review, /layerfs apply to write to your folder.`);
       }
       if (sub === "diff") {
-        const d = (await s.diff()).filter((i) => i.type !== "dir" && !hiddenPath(i.path));
+        if (argv[1]) {
+          const targetBranch = await s.resolveBranchName(argv[1]);
+          let baseBranch = s.baseBranch;
+          if (argv[2]) {
+            baseBranch = await s.resolveBranchName(argv[2]);
+          } else if (targetBranch !== "main") {
+            const bInfo = (await s.listAllBranches()).find((b) => b.name === targetBranch);
+            if (bInfo?.base) {
+              baseBranch = `h-${bInfo.base.slice(0, 20)}`;
+              await s.lfs.branch.fork(baseBranch, bInfo.base).catch(() => {});
+            }
+          }
+          const all: Array<{ path: string; kind: string; type: string }> = [];
+          for (let pos = 0; ; ) {
+            const page = await s.lfs.branch.diff_branches(baseBranch, targetBranch, 1000, pos, { hunks: false });
+            for (const it of page.items ?? []) {
+              if (it.path === "/.lww" || !it.path || it.type === "dir" || hiddenPath(it.path)) continue;
+              all.push({ path: it.path, kind: it.kind, type: it.type });
+            }
+            if (!page.hasMore || !(page.items ?? []).length) break;
+            pos = page.nextPagePos ?? (pos + page.items.length);
+          }
+          const d = all.filter((i) => s.isApplicable(i.path));
+          return say(d.length ? d.map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`).join("\n") : `No changes between ${baseBranch} and ${targetBranch}.`);
+        }
+        const d = await applicableDiff(s);
         return say(d.length ? d.map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`).join("\n") : "No changes in the LayerFS workspace.");
       }
       if (sub === "sync") {
@@ -351,7 +438,7 @@ export default function layerfsExtension(pi: ExtensionAPI) {
       }
       if (sub === "apply") {
         const allowRevert = argv.includes("--revert");
-        const d = (await s.diff()).filter((i) => i.type !== "dir" && !hiddenPath(i.path));
+        const d = await applicableDiff(s);
         if (!d.length) return say("Nothing to apply.");
         if (ctx.hasUI && !(await ctx.ui.confirm("Apply LayerFS changes to your folder?", d.map((i) => `${i.kind} ${i.path}`).slice(0, 40).join("\n")))) return say("Apply cancelled.");
         let r;

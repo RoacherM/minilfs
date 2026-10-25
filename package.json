@@ -1,11 +1,46 @@
 {
-  "name": "pi-layerfs",
-  "version": "0.2.0",
-  "private": true,
+  "name": "@roacherm/pi-layerfs",
+  "version": "0.3.0",
+  "description": "100% Native LayerFS workspace isolation + Claude Code srt-style macOS Seatbelt sandbox for Pi, Epi, Claude Code, Codex, and MCP.",
   "type": "module",
-  "description": "Pi extension: every session works in an isolated LayerFS workspace; the host folder changes only on /layerfs apply.",
+  "license": "MIT",
+  "author": "RoacherM",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RoacherM/pi-layerfs.git"
+  },
+  "homepage": "https://github.com/RoacherM/pi-layerfs#readme",
+  "bugs": "https://github.com/RoacherM/pi-layerfs/issues",
   "keywords": [
-    "pi-package"
+    "pi-package",
+    "pi-extension",
+    "epi",
+    "layerfs",
+    "sandbox",
+    "seatbelt",
+    "mcp",
+    "coding-agent"
+  ],
+  "engines": {
+    "node": ">=22.19"
+  },
+  "bin": {
+    "pi-layerfs": "./src/cli.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./core": "./src/core/index.ts",
+    "./cli": "./src/cli.ts"
+  },
+  "files": [
+    "src/",
+    "scripts/setup-layerfs.sh",
+    "scripts/setup-layerfs-native.sh",
+    "docs/EPI-INTEGRATION.md",
+    "docs/DESIGN-v0.2.md",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
   ],
   "pi": {
     "extensions": [
@@ -13,16 +48,16 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=1.2.0"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "scripts": {
-    "test": "node tests/backend.test.mjs && node tests/review-fixes.test.mjs && node tests/pi.test.mjs && node tests/cli.test.mjs && node tests/rpc.test.mjs && node tests/scale.test.mjs",
+    "test": "node tests/native-seatbelt.test.mjs && node tests/backend.test.mjs && node tests/review-fixes.test.mjs && node tests/pi.test.mjs && node tests/cli.test.mjs && node tests/rpc.test.mjs && node tests/scale.test.mjs",
+    "test:native": "node tests/native-seatbelt.test.mjs",
     "test:backend": "node tests/backend.test.mjs",
     "test:fixes": "node tests/review-fixes.test.mjs",
     "test:pi": "node tests/pi.test.mjs",
     "test:cli": "node tests/cli.test.mjs",
     "test:rpc": "node tests/rpc.test.mjs",
-    "test:scale": "node tests/scale.test.mjs",
-    "probe:real": "node probes/real/run.mjs"
+    "test:scale": "node tests/scale.test.mjs"
   }
 }

@@ -31,11 +31,14 @@
 和其他第三方 Pi 扩展一样，写进 Manifest：
 
 ```bash
-# 全局：所有项目都隔离
-epi install ~/Projects/sides/pi-layerfs
+git clone https://github.com/RoacherM/pi-extensions.git ~/pi-extensions
+~/pi-extensions/extensions/layerfs/scripts/setup-layerfs.sh   # 一次性：构建 LayerFS 前置产物
 
-# 只在某个项目里隔离（项目必须是 trusted）
-epi install -l ~/Projects/sides/pi-layerfs
+# 全局：所有项目都隔离
+epi install ~/pi-extensions/extensions/layerfs
+
+# 只在某个项目里隔离（项目必须是 trusted），推荐
+epi install -l ~/pi-extensions/extensions/layerfs
 ```
 
 写入后的 `~/.epi/epi.json`（或项目 `.epi/epi.json`）：
@@ -43,11 +46,11 @@ epi install -l ~/Projects/sides/pi-layerfs
 ```json
 {
   "version": 1,
-  "extensions": ["/Users/<you>/Projects/sides/pi-layerfs"]
+  "extensions": ["/Users/<you>/pi-extensions/extensions/layerfs"]
 }
 ```
 
-发布到 npm 或 git 之后，同样可以写成 `npm:pi-layerfs@0.2.x` 或 `git:...`。**这里没有 `epi:layerfs`**：不新增内置名字（P6）。
+发布到 npm 之后，也可以写成 `npm:@roacherm/pi-layerfs@0.2.x`。**这里没有 `epi:layerfs`**：不新增内置名字（P6）。
 
 ### 2.2 用户怎么关
 
@@ -69,7 +72,7 @@ pi-layerfs 依赖三个本地产物，全部由用户自行准备，Epi 不负�
 | LayerFS 构建产物（`layerfs-daemon`、`layerfs.node`、`sdk/js`） | `~/.cache/epi-layerfs/bundle-5fb68dd` | `PI_LAYERFS_BUNDLE` |
 | 运行时镜像 | `epi-lfs-runtime:node24-5fb68dd` | `PI_LAYERFS_IMAGE` |
 
-构建步骤见 pi-layerfs `README.md` 的 Setup 一节。
+一条命令构建：`extensions/layerfs/scripts/setup-layerfs.sh`（见 README §1）。
 
 ---
 
@@ -198,7 +201,7 @@ pi-layerfs 只隔离 7 个内置文件工具和 `!cmd`。下面这些照常直�
 | 项 | 要求 |
 |---|---|
 | Pi 版本 | Epi 锁定 Pi **1.1.0**。pi-layerfs 目前只在 Pi 1.2.0 和 1.4.0 上测过。**接入 Epi 之前必须在 Epi 内实测一遍**（§10 验收），重点是 `before_agent_start` 返回值、`session_tree` 事件和 `ctx.sessionManager.getBranch()` 在 1.1.0 上的形状 |
-| pi-layerfs 的 `peerDependencies` | 目前写的是 `>=1.2.0`。如果在 1.1.0 上测试通过，改成 `>=1.1.0` |
+| pi-layerfs 的 `peerDependencies` | `"*"`（Pi 包规范要求，宿主提供）。最低实测版本写在 README |
 | LayerFS 版本 | 固定 `5fb68dd`。bundle、镜像、Store 格式三者成组锁定，升级要成组替换 |
 | 状态目录 | `~/.cache/pi-layerfs`，和 Epi 的 `~/.epi` 分开。Epi 不读写它 |
 
