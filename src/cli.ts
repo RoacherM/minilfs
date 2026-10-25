@@ -216,7 +216,10 @@ async function main() {
     if (sub === "exec" || sub === "run") {
       const dashIdx = rest.indexOf("--");
       const cmdParts = dashIdx >= 0 ? rest.slice(dashIdx + 1) : rest.slice(1);
-      const command = cmdParts.join(" ");
+      if (!cmdParts.length) throw new Error("Usage: minilfs exec -- <command...>");
+      const shellQuote = (arg: string) =>
+        /^[A-Za-z0-9_./:@%+=,-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`;
+      const command = cmdParts.length === 1 ? cmdParts[0] : cmdParts.map(shellQuote).join(" ");
       if (!command) throw new Error("Usage: minilfs exec -- <command...>");
       const r = await s.mutate("cli-exec", "bash", () =>
         s.exec(command, s.cwd, { onData: (d) => process.stdout.write(d) }),
@@ -225,7 +228,11 @@ async function main() {
       return;
     }
     if (sub === "apply") {
-      console.log(await executeLayerfsApply(s));
+      const out = await executeLayerfsApply(s);
+      console.log(out);
+      if (out.startsWith("Nothing applied:")) {
+        process.exitCode = 1;
+      }
       return;
     }
     if (sub === "history") {
@@ -234,7 +241,8 @@ async function main() {
       return;
     }
     const strategy = rest.includes("--theirs") ? "theirs" : rest.includes("--ours") ? "ours" : undefined;
-    const positional = rest.slice(1).filter((a) => a !== "--theirs" && a !== "--ours");
+    const full = rest.includes("--full");
+    const positional = rest.slice(1).filter((a) => a !== "--theirs" && a !== "--ours" && a !== "--full");
     if (sub === "status" || sub === "branches" || sub === "clean") {
       console.log(await executeLayerfsAction(s, { action: sub }));
       return;
@@ -244,7 +252,26 @@ async function main() {
       return;
     }
     if (sub === "ls") {
-      console.log(await executeLayerfsAction(s, { action: "ls", branch: positional.length > 1 ? positional[0] : undefined, path: positional.at(-1) }));
+      let lsBranch: string | undefined;
+      let lsPath: string | undefined;
+      if (positional.length > 1) {
+        lsBranch = positional[0];
+        lsPath = positional[1];
+      } else if (positional.length === 1) {
+        const candidate = positional[0];
+        const allBranches = await s.listAllBranches();
+        const resolved = await s.resolveBranchName(candidate);
+        const isKnownBranch =
+          candidate === "main" ||
+          allBranches.some((b) => b.name === resolved || b.name === candidate);
+        if (isKnownBranch) {
+          lsBranch = candidate;
+          lsPath = "/";
+        } else {
+          lsPath = candidate;
+        }
+      }
+      console.log(await executeLayerfsAction(s, { action: "ls", branch: lsBranch, path: lsPath }));
       return;
     }
     if (sub === "show") {
@@ -264,7 +291,11 @@ async function main() {
       return;
     }
     if (sub === "sync" || sub === "merge") {
-      console.log(await executeLayerfsAction(s, { action: sub, branch: positional[0], strategy }));
+      const out = await executeLayerfsAction(s, { action: sub, branch: positional[0], strategy, full });
+      console.log(out);
+      if (out.includes("CONFLICT merging ")) {
+        process.exitCode = 1;
+      }
       return;
     }
     throw new Error(`Unknown command: ${sub}`);

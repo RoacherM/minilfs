@@ -669,6 +669,42 @@ try {
     assert.ok(directApply.applied.includes("direct-no-mutate.txt"), "apply() must write files created without mutate()");
     assert.equal(readFileSync(join(cwd, "direct-no-mutate.txt"), "utf8"), "direct-ok\n");
     await sDirect.close();
+
+    // 6. CLI exec multi-arg quoting (`sh -c 'printf "x\n" > quoted.txt'`), `ls <branch>`, `sync --full` host drift, and `apply` conflict exit code 1
+    const rMultiQuote = spawnSync("node", [cliPath, "--cwd", cwd, "--branch", "dsh-probe", "exec", "--", "sh", "-c", 'printf "quoted-ok\\n" > quoted.txt'], {
+      encoding: "utf8",
+      env: cliEnv,
+    });
+    assert.equal(rMultiQuote.status, 0, rMultiQuote.stderr);
+
+    const rLsBranch = spawnSync("node", [cliPath, "--cwd", cwd, "ls", "dsh-probe"], {
+      encoding: "utf8",
+      env: cliEnv,
+    });
+    assert.equal(rLsBranch.status, 0, rLsBranch.stderr);
+    assert.match(rLsBranch.stdout, /quoted\.txt/);
+
+    writeFileSync(join(cwd, "host-drift-sync.txt"), "from-host-drift\n");
+    const rSyncFull = spawnSync("node", [cliPath, "--cwd", cwd, "--branch", "dsh-probe", "sync", "--full"], {
+      encoding: "utf8",
+      env: cliEnv,
+    });
+    assert.equal(rSyncFull.status, 0, rSyncFull.stderr);
+    const rShowDrift = spawnSync("node", [cliPath, "--cwd", cwd, "show", "dsh-probe", "host-drift-sync.txt"], {
+      encoding: "utf8",
+      env: cliEnv,
+    });
+    assert.equal(rShowDrift.status, 0, rShowDrift.stderr);
+    assert.equal(rShowDrift.stdout.trim(), "from-host-drift");
+
+    // Trigger apply conflict exit code 1
+    writeFileSync(join(cwd, "quoted.txt"), "host-conflicting-edit\n");
+    const rConflictApply = spawnSync("node", [cliPath, "--cwd", cwd, "--branch", "dsh-probe", "apply"], {
+      encoding: "utf8",
+      env: cliEnv,
+    });
+    assert.equal(rConflictApply.status, 1, "CLI apply must exit with code 1 on conflict");
+    assert.match(rConflictApply.stdout, /Nothing applied:/);
   });
 
 } finally {

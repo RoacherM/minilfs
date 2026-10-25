@@ -1713,7 +1713,9 @@ export class LayerfsSession {
           const cid = cleanRef(c.id);
           const cbase = cleanRef(c.base);
           if (baseIsCommit && (c.id === this.baseRef || cid === cleanedBaseRef)) return true;
-          if (!baseIsCommit && c.base !== this.baseRef && cbase !== cleanedBaseRef) return false;
+          if (!baseIsCommit && c.base !== this.baseRef && cbase !== cleanedBaseRef) {
+            return await this.mergeAddsNothing(snapBranch, this.baseBranch);
+          }
         }
         if (!page.hasMore || !(page.items ?? []).length) break;
         pos = page.nextPagePos ?? (pos + page.items.length);

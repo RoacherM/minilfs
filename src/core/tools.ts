@@ -37,6 +37,7 @@ export const LAYERFS_TOOL_SCHEMA = {
     strategy: { type: "string", enum: ["ours", "theirs"], description: "conflict resolution strategy: 'ours' keeps your branch's version, 'theirs' takes the other branch's version" },
     offset: { type: "integer", description: "1-indexed starting line number (action=show, default: 1)" },
     limit: { type: "integer", description: "maximum lines to show (action=show)" },
+    full: { type: "boolean", description: "when action=sync, perform a full host-drift rescan into main before merging" },
   },
   required: ["action"],
   additionalProperties: false,
@@ -60,6 +61,7 @@ export interface LayerfsActionParams {
   strategy?: "ours" | "theirs";
   offset?: number;
   limit?: number;
+  full?: boolean;
 }
 
 export interface LayerfsActionHooks {
@@ -319,6 +321,13 @@ export async function executeLayerfsAction(
     const branchParam = action === "sync" ? (params?.branch || "main") : params?.branch;
     const target = String(branchParam ?? "").trim();
     if (!target) throw new Error("action=merge needs branch=<name> (see action=branches)");
+    let driftNote = "";
+    if (action === "sync" && target === "main") {
+      const drift = await s.syncHostDriftIntoMain({ full: Boolean(params?.full) });
+      if (drift.synced.length > 0) {
+        driftNote = `Synced ${drift.synced.length} host file(s) into main (${drift.synced.slice(0, 5).join(", ")}${drift.synced.length > 5 ? ", …" : ""}). `;
+      }
+    }
     const other = await s.resolveBranchName(target);
     if (other === s.workBranch) throw new Error("that is your own branch");
     const strategy = params?.strategy;
@@ -329,7 +338,7 @@ export async function executeLayerfsAction(
     hooks?.onStatusChange?.();
     if (!r.merged) {
       return [
-        `CONFLICT merging ${other}: nothing changed (you are still on ${s.workBranch}).`,
+        `${driftNote}CONFLICT merging ${other}: nothing changed (you are still on ${s.workBranch}).`,
         "Conflicting files:",
         ...r.conflicts.map((c) => `  ${c.path}${c.kind ? ` (${c.kind})` : ""}`),
         "How to resolve (LayerFS merges three-way, so editing only your side keeps conflicting):",
@@ -344,7 +353,7 @@ export async function executeLayerfsAction(
         : ` (${r.lww} generated file(s) took the newer side)`
       : "";
     const fallbackInfo = r.fallback ? " (via path-wise merge)" : "";
-    return `Merged ${other}${fallbackInfo}. You are now on ${r.branch}${lwwInfo}.`;
+    return `${driftNote}Merged ${other}${fallbackInfo}. You are now on ${r.branch}${lwwInfo}.`;
   }
   if (action === "clean") {
     const res = await s.cleanScratch();
