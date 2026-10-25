@@ -1,6 +1,6 @@
 // Harness-agnostic tool schemas, action executors, and file/bash operation bindings.
 // Any agent harness (Pi, Epi, Claude Code, Codex, Cursor, DSH, MCP, custom SDKs) can
-// import these directly from `@roacherm/pi-layerfs/core` with zero Pi dependencies.
+// import these directly from `@roacherm/minilfs/core` with zero Pi dependencies.
 import path from "node:path";
 import { hiddenPath } from "../history.ts";
 import { isExcludedPath, type LayerfsSession, type MergeResult } from "../workspace.ts";

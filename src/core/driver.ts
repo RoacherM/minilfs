@@ -51,7 +51,7 @@ export interface ExecutionDriver {
 /**
  * Shell prelude injected into every `LocalNativeDriver` bash execution:
  * 1. Transparently redirects `cd <hostCwd>` (and any subpath under `<hostCwd>`) into the mounted
- *    LayerFS branch workspace (`$PI_LFS_WS_REAL`), preventing agents from accidentally escaping
+ *    LayerFS branch workspace (`$MINILFS_WS_REAL`), preventing agents from accidentally escaping
  *    into the read-only host project folder.
  * 2. Provides a POSIX/bash `timeout` function on macOS hosts where GNU `timeout` is not installed.
  */
@@ -60,19 +60,19 @@ export function buildNativeShellPrelude(hostCwd: string, wsReal: string): string
   const caseBranches = hostSpellings
     .map((h) => {
       const q = h.replace(/'/g, "'\\''");
-      return `      '${q}') builtin cd "$PI_LFS_WS_REAL" ;;\n      '${q}'/*) builtin cd "$PI_LFS_WS_REAL/\${_target#'${q}'/}" ;;`;
+      return `      '${q}') builtin cd "$MINILFS_WS_REAL" ;;\n      '${q}'/*) builtin cd "$MINILFS_WS_REAL/\${_target#'${q}'/}" ;;`;
     })
     .join("\n");
 
   return [
-    `export PI_LFS_HOST_CWD=${JSON.stringify(hostCwd)}`,
-    `export PI_LFS_WS_REAL=${JSON.stringify(wsReal)}`,
+    `export MINILFS_HOST_CWD=${JSON.stringify(hostCwd)}`,
+    `export MINILFS_WS_REAL=${JSON.stringify(wsReal)}`,
     `cd() {`,
-    `  if [ $# -eq 0 ]; then builtin cd "$PI_LFS_WS_REAL"; return $?; fi`,
+    `  if [ $# -eq 0 ]; then builtin cd "$MINILFS_WS_REAL"; return $?; fi`,
     `  local _target="$1"`,
     `  if [ "$_target" = "-P" ] || [ "$_target" = "-L" ]; then`,
     `    shift`,
-    `    _target="\${1:-$PI_LFS_WS_REAL}"`,
+    `    _target="\${1:-$MINILFS_WS_REAL}"`,
     `  fi`,
     `  case "$_target" in`,
     caseBranches,
@@ -174,8 +174,6 @@ export class LocalNativeDriver implements ExecutionDriver {
       TMPDIR: "/private/tmp",
       USER: process.env.USER || "user",
       LOGNAME: process.env.LOGNAME || "user",
-      PI_LAYERFS_SCRATCH_DIR: branchScratchDir,
-      PI_LAYERFS_SHARED_CACHE_DIR: sharedCacheDir,
       MINILFS_SCRATCH_DIR: branchScratchDir,
       MINILFS_SHARED_CACHE_DIR: sharedCacheDir,
     };

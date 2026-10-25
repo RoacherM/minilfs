@@ -1,5 +1,5 @@
 /**
- * pi-layerfs v0.2: every Pi session works on an isolated LayerFS Branch in a
+ * minilfs: every session works on an isolated LayerFS Branch in a
  * shared Project Store by default.
  * - File tools (`read`, `write`, `edit`, `ls`, `find`, `grep`) go directly to the Store
  *   with automatic byte-exact Workspace fallback for binary, symlinks and >48KB lines.
@@ -163,7 +163,7 @@ export default function layerfsExtension(pi: ExtensionAPI) {
     },
   });
 
-  // ------------------------------------------------------------- team mode (PI_LAYERFS_TEAM=1)
+  // ------------------------------------------------------------- team mode (MINILFS_TEAM=1)
   // Agent-facing branch tools for multi-agent runs. `layerfs` is for every session (lead and
   // sub-agents); `layerfs_apply` (writes the user's folder) only for the top-level session:
   // pi-subagents children (PI_SUBAGENT_CHILD=1) never get it.

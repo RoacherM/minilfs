@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-// Universal CLI & MCP Server for `@roacherm/pi-layerfs` (Claude Code, Codex, Cursor, DSH, Shell).
+// Universal CLI & MCP Server for `@roacherm/minilfs` (Claude Code, Codex, Cursor, DSH, Shell).
 // Zero Pi/Epi dependencies — built directly on `src/core/index.ts`.
 //
 // Commands:
-//   pi-layerfs mcp                        Start stdio MCP server (for Claude Code / Codex / Cursor)
-//   pi-layerfs exec [--branch B] -- <cmd> Run a shell command on a LayerFS branch inside macOS Seatbelt
-//   pi-layerfs status | diff | branches | show | ls | checkout | sync | merge | apply | history
+//   minilfs mcp                        Start stdio MCP server (for Claude Code / Codex / Cursor)
+//   minilfs exec [--branch B] -- <cmd> Run a shell command on a LayerFS branch inside macOS Seatbelt
+//   minilfs status | diff | branches | show | ls | checkout | sync | merge | apply | history | clean
 import { createInterface } from "node:readline";
 import { resolve } from "node:path";
 import {
@@ -24,9 +24,9 @@ import {
 async function openCliSession(cwd = process.cwd(), branchName?: string): Promise<LayerfsSession> {
   const config = resolveConfig({
     ...process.env,
-    ...(branchName ? { PI_LAYERFS_BRANCH_NAME: branchName } : {}),
+    ...(branchName ? { MINILFS_BRANCH_NAME: branchName } : {}),
   });
-  const sessionId = process.env.PI_LAYERFS_SESSION_ID || branchName || "cli-default";
+  const sessionId = process.env.MINILFS_SESSION_ID || branchName || "cli-default";
   const s = new LayerfsSession(cwd, sessionId, config);
   await s.open({ reason: "resume" });
   return s;
@@ -34,7 +34,7 @@ async function openCliSession(cwd = process.cwd(), branchName?: string): Promise
 
 async function runMcpServer(): Promise<void> {
   const cwd = process.cwd();
-  const branchName = process.env.PI_LAYERFS_BRANCH_NAME;
+  const branchName = process.env.MINILFS_BRANCH_NAME;
   const isChild = process.env.PI_SUBAGENT_CHILD === "1";
   let sessionPromise: Promise<LayerfsSession> | null = null;
   const getSession = () => (sessionPromise ??= openCliSession(cwd, branchName));
@@ -93,7 +93,7 @@ async function runMcpServer(): Promise<void> {
           result: {
             protocolVersion: params?.protocolVersion || "2024-11-05",
             capabilities: { tools: {} },
-            serverInfo: { name: "pi-layerfs", version: "0.2.0" },
+            serverInfo: { name: "minilfs", version: "0.4.0" },
           },
         });
         continue;
@@ -211,7 +211,7 @@ async function main() {
       const dashIdx = rest.indexOf("--");
       const cmdParts = dashIdx >= 0 ? rest.slice(dashIdx + 1) : rest.slice(1);
       const command = cmdParts.join(" ");
-      if (!command) throw new Error("Usage: pi-layerfs exec -- <command...>");
+      if (!command) throw new Error("Usage: minilfs exec -- <command...>");
       const r = await s.mutate("cli-exec", "bash", () =>
         s.exec(command, s.cwd, { onData: (d) => process.stdout.write(d) }),
       );
@@ -268,6 +268,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error(`pi-layerfs: ${e?.message ?? e}`);
+  console.error(`minilfs: ${e?.message ?? e}`);
   process.exit(1);
 });

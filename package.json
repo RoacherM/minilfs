@@ -26,8 +26,7 @@
     "node": ">=22.19"
   },
   "bin": {
-    "minilfs": "./src/cli.ts",
-    "pi-layerfs": "./src/cli.ts"
+    "minilfs": "./src/cli.ts"
   },
   "exports": {
     ".": "./src/index.ts",

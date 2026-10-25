@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Builds the LayerFS prerequisites pi-layerfs needs on macOS Native mode:
+# Builds the LayerFS prerequisites minilfs needs on macOS Native mode:
 #   - layerfs-daemon and layerfs.node (macOS native arm64 build via cargo)
 #   - zero Docker requirement
-#   - bundle: ~/.cache/epi-layerfs/bundle-native/{layerfs-daemon, layerfs.node, sdk/js}
+#   - bundle: ~/.cache/minilfs/bundle-native/{layerfs-daemon, layerfs.node, sdk/js}
 #
 # Usage: scripts/setup-layerfs.sh [--ref <git ref>] [--bundle <dir>]
 set -euo pipefail
@@ -11,8 +11,8 @@ REF="833acf7b12b206396381c0b5605fe861f7f7d5a0"
 CHERRY_MOUNT="009931c56534d3c173618f00c5ef57e8ce96dc7a"
 CHERRY_APPLEDOUBLE="a700af8f492ef360d150877e5d469031767e473f"
 CHERRY_OVERLAY="c914d14baf99296f64c7e0a2266b66da4f5c7ae8"
-BUNDLE="${HOME}/.cache/epi-layerfs/bundle-native"
-SRC="${HOME}/.cache/epi-layerfs/src-native"
+BUNDLE="${HOME}/.cache/minilfs/bundle-native"
+SRC="${HOME}/.cache/minilfs/src-native"
 
 while [ $# -gt 0 ]; do
   case "$1" in

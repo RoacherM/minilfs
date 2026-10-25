@@ -1579,7 +1579,7 @@ export class LayerfsSession {
             hostIndex[rel] = { ...linkSig(next.target), mtimeMs: st.mtimeMs, size: st.size };
           } else {
             await fsp.mkdir(dirname(target), { recursive: true });
-            const tmp = join(dirname(target), `.${posix.basename(rel)}.pi-layerfs-${randomBytes(4).toString("hex")}`);
+            const tmp = join(dirname(target), `.${posix.basename(rel)}.minilfs-${randomBytes(4).toString("hex")}`);
             tmps.push(tmp);
             await fsp.writeFile(tmp, next.data, { mode: next.mode & 0o7777 });
             await fsp.chmod(tmp, next.mode & 0o7777);
@@ -1867,7 +1867,7 @@ async function scanHostDirectory(root: string, excludes: string[], cache: HostIn
       throw new LayerfsError("ScanFailed", `cannot read ${relative(root, dir) || "."}: ${e?.code ?? e}`);
     }
     for (const ent of entries) {
-      if (ent.name === ".git" || ent.name === ".lww" || ent.name.includes(".pi-layerfs-")) continue;
+      if (ent.name === ".git" || ent.name === ".lww" || ent.name.includes(".minilfs-") || ent.name.includes(".pi-layerfs-")) continue;
       const abs = join(dir, ent.name);
       const rel = relative(root, abs).split("\\").join("/");
       if (isExcludedPath(rel, excludes)) continue;

@@ -153,19 +153,20 @@ await session.open();
 
 ---
 
-## 6. Configuration (`MINILFS_*` or `PI_LAYERFS_*`)
+## 6. Configuration (`MINILFS_*`)
 
 | Env | Default |
 |---|---|
-| `MINILFS` / `PI_LAYERFS` | on; `0` turns it off (`--no-layerfs` flag also disables for one run) |
-| `MINILFS_DRIVER` / `PI_LAYERFS_DRIVER` | `native` (or custom registered driver name) |
-| `MINILFS_BUNDLE` / `PI_LAYERFS_BUNDLE` | `~/.cache/epi-layerfs/bundle-native` |
-| `MINILFS_ROOT` / `PI_LAYERFS_ROOT` | `~/.cache/pi-layerfs` |
-| `MINILFS_NETWORK` / `PI_LAYERFS_NETWORK` | `allow` \| `localhost` \| `deny` (`offline`) |
-| `MINILFS_EXCLUDES` / `PI_LAYERFS_EXCLUDES` | `.env,.env.*,*.pem,*.key,id_rsa*,id_ed25519*,.npmrc,.netrc,.pypirc` |
-| `MINILFS_BRANCH_ONLY` / `PI_LAYERFS_BRANCH_ONLY` | comma-separated build-output patterns (e.g. `target/,.cargo-home/`) |
-| `MINILFS_TEAM` / `PI_LAYERFS_TEAM` | `1` enables multi-agent `layerfs` / `layerfs_apply` tools |
-| `MINILFS_BRANCH_NAME` / `PI_LAYERFS_BRANCH_NAME` | logical branch alias for this session (defaults to `lead` or `s-<shortId>`) |
+| `MINILFS` | on; `0` turns it off (`--no-layerfs` flag also disables for one run) |
+| `MINILFS_DRIVER` | `native` (or custom registered driver name) |
+| `MINILFS_BUNDLE` | `~/.cache/minilfs/bundle-native` |
+| `MINILFS_ROOT` | `~/.cache/minilfs` (home, APFS Stores, local mounts, bindings) |
+| `MINILFS_PREFIX` | `minilfs-` |
+| `MINILFS_NETWORK` | `allow` \| `localhost` \| `deny` (`offline`) — Seatbelt outbound network policy inside `bash` |
+| `MINILFS_EXCLUDES` | `.env,.env.*,*.pem,*.key,id_rsa*,id_ed25519*,.npmrc,.netrc,.pypirc` |
+| `MINILFS_BRANCH_ONLY` | comma-separated build-output patterns (e.g. `target/,.cargo-home/`) |
+| `MINILFS_TEAM` | `1` enables multi-agent `layerfs` / `layerfs_apply` tools |
+| `MINILFS_BRANCH_NAME` | logical branch alias for this session (defaults to `lead` or `s-<shortId>`) |
 
 ## License
 
