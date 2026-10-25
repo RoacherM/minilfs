@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { resolveConfig } from "../src/config.ts";
 import { registerExecutionDriver } from "../src/core/index.ts";
 import { formatHistory, loadHistory } from "../src/history.ts";
@@ -613,6 +614,50 @@ try {
     assert.equal(calls[0].branch, "dist-worker-1");
     assert.equal((await sRemote.readFile(join(cwd, "from-remote-driver.txt"))).toString(), "distributed-ok\n");
     await sRemote.close();
+  });
+
+  await step("7.4 CLI & MCP: --branch session resume across calls + MCP ping response", async () => {
+    const cliPath = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+    const cliEnv = {
+      ...process.env,
+      MINILFS_ROOT: config.root,
+      MINILFS_PREFIX: config.prefix,
+      MINILFS_BUNDLE: config.bundle,
+    };
+
+    // 1. CLI --branch dsh-probe exec creates a file on dsh-probe
+    const rExec = spawnSync("node", [cliPath, "--cwd", cwd, "--branch", "dsh-probe", "exec", "--", "echo probe-ok > dsh-probe.txt"], {
+      encoding: "utf8",
+      env: cliEnv,
+    });
+    assert.equal(rExec.status, 0, rExec.stderr);
+
+    // 2. Subsequent CLI --branch dsh-probe diff resumes the same branch (does NOT overwrite with an empty branch!)
+    const rDiff = spawnSync("node", [cliPath, "--cwd", cwd, "--branch", "dsh-probe", "diff"], {
+      encoding: "utf8",
+      env: cliEnv,
+    });
+    assert.equal(rDiff.status, 0, rDiff.stderr);
+    assert.match(rDiff.stdout, /Added\s+dsh-probe\.txt/);
+
+    // 3. Querying diff dsh-probe from another branch also resolves dsh-probe to the committed branch
+    const rCrossDiff = spawnSync("node", [cliPath, "--cwd", cwd, "--branch", "other-viewer", "diff", "dsh-probe"], {
+      encoding: "utf8",
+      env: cliEnv,
+    });
+    assert.equal(rCrossDiff.status, 0, rCrossDiff.stderr);
+    assert.match(rCrossDiff.stdout, /Added\s+dsh-probe\.txt/);
+
+    // 4. MCP ping returns {} without -32601 error
+    const rMcp = spawnSync("node", [cliPath, "mcp"], {
+      cwd,
+      encoding: "utf8",
+      env: cliEnv,
+      input: `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" })}\n`,
+    });
+    assert.equal(rMcp.status, 0, rMcp.stderr);
+    const mcpReply = JSON.parse(rMcp.stdout.trim().split("\n")[0]);
+    assert.deepEqual(mcpReply, { jsonrpc: "2.0", id: 1, result: {} });
   });
 
 } finally {

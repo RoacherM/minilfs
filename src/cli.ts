@@ -22,12 +22,14 @@ import {
 } from "./core/index.ts";
 
 async function openCliSession(cwd = process.cwd(), branchName?: string): Promise<LayerfsSession> {
+  const effectiveBranch = branchName || process.env.MINILFS_BRANCH_NAME;
   const config = resolveConfig({
     ...process.env,
-    ...(branchName ? { MINILFS_BRANCH_NAME: branchName } : {}),
+    ...(effectiveBranch ? { MINILFS_BRANCH_NAME: effectiveBranch } : {}),
   });
-  const sessionId = process.env.MINILFS_SESSION_ID || branchName || "cli-default";
-  const s = new LayerfsSession(cwd, sessionId, config);
+  const canonicalCwd = resolve(cwd);
+  const sessionId = process.env.MINILFS_SESSION_ID || `${canonicalCwd}::${effectiveBranch || "cli-default"}`;
+  const s = new LayerfsSession(canonicalCwd, sessionId, config);
   await s.open({ reason: "resume" });
   return s;
 }
@@ -86,6 +88,10 @@ async function runMcpServer(): Promise<void> {
     if (id === undefined) continue; // notification
 
     try {
+      if (method === "ping") {
+        send({ jsonrpc: "2.0", id, result: {} });
+        continue;
+      }
       if (method === "initialize") {
         send({
           jsonrpc: "2.0",

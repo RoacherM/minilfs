@@ -349,11 +349,40 @@ export class LayerfsSession {
   }
 
   private async setupBranches(options: OpenOptions): Promise<void> {
-    const saved = options.resumeBinding;
+    let saved: Partial<SessionBinding> | undefined = options.resumeBinding;
+    if (!saved && (options.reason === "resume" || options.reason === "reload")) {
+      const byId = this.bindings.session(this.sessionId);
+      if (byId && byId.project === this.projectRecord.name) {
+        saved = byId;
+      } else if (this.config.branchName) {
+        const match = Object.entries(this.bindings.data.sessions)
+          .filter(([, s]) => s.project === this.projectRecord.name && (s.logicalBranch === this.config.branchName || s.workBranch === this.config.branchName))
+          .sort((a, b) => {
+            const aCommit = a[1].headCommit ? 1 : 0;
+            const bCommit = b[1].headCommit ? 1 : 0;
+            if (aCommit !== bCommit) return bCommit - aCommit;
+            return (b[1].updatedAt ?? 0) - (a[1].updatedAt ?? 0);
+          })[0];
+        if (match) {
+          this.sessionId = match[0];
+          saved = match[1];
+        }
+      }
+    }
     if (saved?.workBranch && (options.reason === "resume" || options.reason === "reload")) {
+      const m = /^s-([a-f0-9]+)-(\d+)$/.exec(saved.workBranch);
+      if (m) {
+        this.shortId = m[1];
+        this.seq = Math.max(this.seq, parseInt(m[2], 10), saved.seq ?? 0);
+      } else if (saved.seq) {
+        this.seq = Math.max(this.seq, saved.seq);
+      }
+      if (saved.logicalBranch && !this.config.branchName) {
+        this.logicalBranch = saved.logicalBranch;
+      }
       const branches = await this.listAllBranches();
-      const wb = branches.find((b) => b.name === saved.workBranch);
-      const bb = saved.baseBranch ? branches.find((b) => b.name === saved.baseBranch) : null;
+      const wb = branches.find((b) => b.name === saved!.workBranch);
+      const bb = saved.baseBranch ? branches.find((b) => b.name === saved!.baseBranch) : null;
       const targetRef = saved.headCommit ?? saved.baseRef;
       if (wb && bb) {
         this.baseBranch = saved.baseBranch!;
@@ -686,7 +715,12 @@ export class LayerfsSession {
 
     const sessions = Object.values(this.bindings?.data?.sessions ?? {})
       .filter((s) => s.project === this.projectRecord?.name)
-      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+      .sort((a, b) => {
+        const aCommit = a.headCommit ? 1 : 0;
+        const bCommit = b.headCommit ? 1 : 0;
+        if (aCommit !== bCommit) return bCommit - aCommit;
+        return (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
+      });
 
     for (const s of sessions) {
       if (s.logicalBranch === trimmed || (s as any).sessionId === trimmed) {
