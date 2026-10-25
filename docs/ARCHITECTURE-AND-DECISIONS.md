@@ -134,9 +134,127 @@ During our initial 9-agent Rust SQL database dogfooding run (`Quarry`), we uncov
 
 ---
 
-## 5. Production Benchmark Results
+## 5. Multi-Harness Integration Guide (Epi, Pi, DSH, Claude Code, Codex, Cursor)
 
-### 5.1 Benchmark 1: `Wayfare` (8-Agent Full-Stack Travel Planner, Node 24)
+Because `src/core/index.ts` has zero dependencies on any specific harness and shares a single state root (`~/.cache/minilfs`), all harnesses on a machine can share the **exact same repository, native binary bundle (`~/.cache/minilfs/bundle-native`), and per-project LayerFS Store**.
+
+### 5.1 Integration Modes Overview
+
+| Harness | Recommended Mode | Tool Interception (`read`/`write`/`edit`/`bash`) | Multi-Agent Team Tools (`minilfs` / `minilfs_apply`) |
+|---|---|---|---|
+| **Epi / Pi** | Native Extension (`src/index.ts`) | **Transparent (100% automatic)** | Built-in (`MINILFS_TEAM=1`) |
+| **DSH (`deepseek-harness`)** | Mode A: Native Cordis Plugin (`src/core/index.ts`)<br>Mode B: MCP Server (`src/cli.ts mcp`) | Mode A: **Transparent**<br>Mode B: Explicit (`minilfs_bash`) | Built-in (`minilfs`, `minilfs_apply`, `minilfs_bash`) |
+| **Claude Code / Codex / Cursor** | MCP Server (`src/cli.ts mcp`) + CLI (`src/cli.ts`) | Explicit (`minilfs_bash` or `minilfs exec`) | Built-in (`minilfs`, `minilfs_apply`, `minilfs_bash`) |
+
+---
+
+### 5.2 Integrating with Epi & Pi (Transparent Native Extension)
+
+```bash
+# Install from GitHub or local path
+epi install git:github.com/RoacherM/minilfs
+pi install git:github.com/RoacherM/minilfs
+```
+
+Every `read`, `write`, `edit`, `ls`, `find`, `grep`, and `bash` call is automatically intercepted and routed to the session's LayerFS branch.
+
+---
+
+### 5.3 Integrating with DSH (`deepseek-harness`)
+
+#### Option A: Via DSH MCP Client (`cordis.patch.yml`, Ready Today)
+Add `@deepseek-ai/dsh-mcp-client` to your profile's `cordis.patch.yml` (note: set `cwd` to the target project folder and give DSH its own `MINILFS_BRANCH_NAME` so it doesn't collide with `lead` in other harnesses):
+
+```yaml
+- insert:
+    - id: mcp-minilfs
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: minilfs
+        command: /opt/homebrew/bin/node
+        args: [/Users/byronwayne/Projects/sides/minilfs/src/cli.ts, mcp]
+        cwd: /path/to/your/project
+        env:
+          MINILFS_TEAM: "1"
+          MINILFS_BRANCH_NAME: "dsh-lead"
+```
+
+#### Option B: Building a Transparent Native DSH Cordis Plugin (`dsh-minilfs`)
+To transparently intercept DSH's built-in `read`, `write`, `edit`, `grep`, `find`, `ls`, and `bash` tools (just like Epi/Pi), import `@roacherm/minilfs/core` inside a Cordis plugin and replace `tool-fs` / `tool-bash` in the preset:
+
+```ts
+import {
+  LayerfsSession,
+  resolveConfig,
+  createHarnessOperations,
+  executeLayerfsAction,
+  executeLayerfsApply,
+  LAYERFS_TOOL_SCHEMA,
+  LAYERFS_TOOL_DESCRIPTION,
+  LAYERFS_APPLY_TOOL_SCHEMA,
+  LAYERFS_APPLY_TOOL_DESCRIPTION,
+} from "/Users/byronwayne/Projects/sides/minilfs/src/core/index.ts";
+
+// 1. On DSH session start:
+const config = resolveConfig({ ...process.env, MINILFS_BRANCH_NAME: `dsh-${sessionId.slice(0, 8)}` });
+const s = new LayerfsSession(projectCwd, sessionId, config);
+await s.open({ reason: "resume" });
+const ops = createHarnessOperations(s);
+
+// 2. Wire file tools directly to Store (0 mounts, 0 conflict with DSH sandbox):
+//    - read:  ops.read.readFile(path) / ops.read.access(path)
+//    - write: await s.mutate(callId, "write", () => ops.write.writeFile(path, content))
+//    - edit:  await s.mutate(callId, "edit",  () => /* readFile + replace + writeFile */)
+//    - grep:  await s.grepWorkspace({ pattern, path, glob, ignoreCase, literal, context, limit })
+//    - bash:  await s.mutate(callId, "bash",  () => ops.bash.exec(command, projectCwd, { onData, signal, timeout }))
+
+// 3. Register `minilfs` and `minilfs_apply` control tools using executeLayerfsAction(s, params) and executeLayerfsApply(s).
+```
+
+---
+
+### 5.4 Integrating with Claude Code, Codex CLI, or Cursor (`.mcp.json` + CLI)
+
+#### MCP Configuration (`.mcp.json`)
+```json
+{
+  "mcpServers": {
+    "minilfs": {
+      "command": "node",
+      "args": ["/Users/byronwayne/Projects/sides/minilfs/src/cli.ts", "mcp"],
+      "env": {
+        "MINILFS_TEAM": "1",
+        "MINILFS_BRANCH_NAME": "claude-lead"
+      }
+    }
+  }
+}
+```
+
+#### CLI Invocation from Any Agent or Shell
+Each `--branch <alias>` invocation automatically persists and resumes its branch state in `~/.cache/minilfs/state/bindings.json`:
+
+```bash
+# Worker runs build/tests inside an isolated branch + Seatbelt sandbox
+node /Users/byronwayne/Projects/sides/minilfs/src/cli.ts --branch worker-auth exec -- cargo test
+
+# Inspect or merge from another harness or terminal
+node /Users/byronwayne/Projects/sides/minilfs/src/cli.ts diff worker-auth
+node /Users/byronwayne/Projects/sides/minilfs/src/cli.ts --branch lead merge worker-auth
+node /Users/byronwayne/Projects/sides/minilfs/src/cli.ts --branch lead apply
+```
+
+### 5.5 Best Practices When Sharing a Project Across Multiple Harnesses Simultaneously
+1. **Assign Distinct `MINILFS_BRANCH_NAME` per Harness**: Set `MINILFS_BRANCH_NAME=epi-lead`, `MINILFS_BRANCH_NAME=dsh-lead`, etc., so each harness's top-level session has a distinct alias instead of all defaulting to `lead`.
+2. **Coordinate `apply` Through One Lead Session**: Merge peer harness branches into your active lead branch (`minilfs merge dsh-lead`) before running `minilfs apply`, so `apply`'s 3-way host check advances `main` cleanly without two harnesses overwriting each other on the host disk.
+3. **Do Not Mix Old Docker `dsh-layerfs` and Native `minilfs` on the Same Folder**: Ensure legacy `layerfs-store` Docker containers are stopped or unbound when switching a project to `minilfs`.
+
+---
+
+## 6. Production Benchmark Results
+
+### 6.1 Benchmark 1: `Wayfare` (8-Agent Full-Stack Travel Planner, Node 24)
 | Metric | DSH + LayerFS (Docker Baseline) | `minilfs` v0.4 (macOS Native + Seatbelt) | Delta / Improvement |
 |---|---|---|---|
 | **Runtime Architecture** | Docker Linux Container | **Zero-Docker macOS Native (`mount_nfs` + `sandbox-exec`)** | **0 Containers** |
@@ -147,7 +265,7 @@ During our initial 9-agent Rust SQL database dogfooding run (`Quarry`), we uncov
 | **Merge Conflicts / Tool Errors** | Multiple retries | **0 conflicts / 0 errors** | **Zero friction** |
 | **Store Disk Footprint** | Container Volume | **5.0 MB** | **Ultra-compact** |
 
-### 5.2 Benchmark 2: `Quarry` (9-Agent Rust SQL Database Engine, 18.6k LOC)
+### 6.2 Benchmark 2: `Quarry` (9-Agent Rust SQL Database Engine, 18.6k LOC)
 | Metric | Old LayerFS (Docker Run) | DSH + LayerFS (Docker Baseline) | `minilfs` v0.4 (macOS Native) | Delta vs Old Docker |
 |---|---|---|---|---|
 | **Runtime Architecture** | Docker (`pi-lfs-store`) | Docker (`dsh-layerfs`) | **Zero-Docker macOS Native** | **No Docker VM** |
