@@ -168,6 +168,15 @@ await session.open();
 | `MINILFS_TEAM` | `1` enables multi-agent `minilfs` / `minilfs_apply` tools |
 | `MINILFS_BRANCH_NAME` | logical branch alias for this session (defaults to `lead` or `s-<shortId>`) |
 
+## 7. Architecture & Design Decisions
+
+See **[`docs/ARCHITECTURE-AND-DECISIONS.md`](./docs/ARCHITECTURE-AND-DECISIONS.md)** for:
+- Alignment with the **LayerFS 2.0 Roadmap** (`#446`)
+- Three-Tier Architecture (`Adapters` -> `Core Engine` -> `ExecutionDriver`)
+- Root-cause diagnosis and solutions for all 10 multi-agent pain points
+- Architectural Decision Records (ADRs: Native NFSv3 + Seatbelt vs Docker/FUSE, Multi-Harness Store Sharing, Pluggable Distributed Driver)
+- Full `Wayfare` and `Quarry` multi-agent benchmark comparisons
+
 ## License
 
 MIT.
