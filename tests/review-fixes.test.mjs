@@ -870,6 +870,15 @@ try {
     assert.equal(readFileSync(join(cwd, "peer.txt"), "utf8"), "p\n");
   });
 
+  await step("apply on a fresh Branch with no edits warns nothing (no NoCommit)", async () => {
+    const cwd = project();
+    writeFileSync(join(cwd, ".gitignore"), "build/\n"); // ignore rules active, as in a real repository
+    const s = await open(cwd, "fresh");
+    const r = await s.apply();
+    assert.deepEqual(r.warnings, [], r.warnings.join("; "));
+    assert.deepEqual(r.applied, []);
+  });
+
   await step("apply with nothing to write never reports WouldRevert, even with an unknown alignment", async () => {
     const cwd = project();
     const s = await open(cwd, "nw");

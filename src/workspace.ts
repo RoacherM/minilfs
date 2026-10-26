@@ -1907,7 +1907,7 @@ export class LayerfsSession {
       const snapRef = this.headCommit ?? this.baseRef;
       this.seq++;
       const snapBranch = `a-${this.shortId}-${this.seq}`;
-      await this.lfs.branch.fork(snapBranch, snapRef);
+      const snap = await this.lfs.branch.fork(snapBranch, snapRef);
 
       const items: Array<{ path: string; kind: string; type: string }> = [];
       for (let pos = 0; ; ) {
@@ -2025,8 +2025,9 @@ export class LayerfsSession {
         guard();
         const mainVsBase = await this.lfs.branch.diff_branches("main", this.baseBranch, 1, 0, { hunks: false });
         const mainUnchanged = Boolean(mainVsBase.from?.root) && mainVsBase.from?.root === mainVsBase.to?.root;
-        let toPublish: string | null = snapBranch;
-        if (!mainUnchanged) {
+        // a snapshot with no Commit is the base Layer itself (no edits yet): nothing new for main
+        let toPublish: string | null = snap?.head ? snapBranch : null;
+        if (toPublish && !mainUnchanged) {
           const merged = `m-${this.shortId}-${(++this.seq)}`;
           const m = await this.lfs.branch.merge("main", snapBranch, merged, "merge applied session");
           if (m?.kind && m.kind !== "Merged" && m.kind !== "FastForward" && m.kind !== "UpToDate") throw new Error(`merge answered ${m.kind}`);
