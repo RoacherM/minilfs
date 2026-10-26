@@ -1,205 +1,181 @@
-# minilfs v0.5 设计：目录即主干，分支只给子 agent
+# minilfs v0.5 设计：人人在分支，主 agent 可单条提权
 
-状态：**草案 r2**（已按 Argon 评审修订，见 §10），实现前
-替代：v0.4 的"主会话也在分支里" + 本轮加的 host mode / host policy
-参考：LayerFS × DSH（`layerfs/dsh/`）、`docs/EPI-INTEGRATION.md` 第 3 阶段
+状态：**草案 r4**（已按 Argon r3 评审修订，见 §9），实现前。r1/r2 的方向（"目录即主干"）已放弃，原因见 §1.3。
+替代：v0.4 的 host mode / host policy（本轮加入，未正式发布）
+参考：LayerFS × DSH（`layerfs/dsh/`）、DSH bash 工具的单条提权（`deepseek-harness/packages/shell/tool-bash/src/index.ts:478-483`）、`docs/EPI-INTEGRATION.md` 第 3 阶段
 
 ---
 
 ## 0. 一句话
 
-**项目目录就是主干（trunk），只属于主 agent；每个子 agent 在自己的 LayerFS 分支上工作；子 agent 的成果只能由主 agent 用一个动作 `land` 合进目录。**
+**每个 agent 都在自己的 LayerFS 分支上工作，主 agent 也不例外；主 agent 的任意一条 `bash` 可以提权到真实机器上执行，默认不需要确认；子 agent 永不提权；改动通过 apply 回到项目目录。**
 
-没有模式，没有切换，没有授权策略。一个 agent 是什么角色，由运行环境在它启动时决定，之后不变。
+没有模式。提权是**某一条命令**的属性，不是会话的状态。
 
 ---
 
-## 1. 为什么要改
+## 1. 为什么这样设计
 
-### 1.1 现状（v0.4 + 本轮补丁）
+### 1.1 主 agent 留在分支里的收益
 
-主会话也在 minilfs 分支里工作。这带来一串问题，本轮都碰到了：
-
-| 问题 | 根因 |
+| 收益 | 说明 |
 |---|---|
-| `/resume` 卡在 `minilfs starting…`，大仓库首次导入 60 秒超时 | 主会话启动就要导入整个目录 |
-| 主 agent 不能 `git commit`、不能写 `.git`、不能跑 `ps`、不能挂载、不能嵌套沙箱，minilfs 不能在 minilfs 里测试自己 | 主 agent 的 bash 也在 Seatbelt 里 |
-| "未 apply"标记过期（用户 `git pull` 后仍提示有改动） | 主会话的改动有两份真相：分支和目录 |
-| 为了解决上面的问题，加了 host mode、4 种 host policy、切换前的一致性检查、`restartFromMain`、过期标记检测 | 给不该进笼子的人开门，门越开越多 |
+| 每次工具调用一个存档点 | `/tree`、`/fork`、`/resume` 能连文件一起回退，比 git 细 |
+| 先审再写 | 目录只在 apply 时改变，`/minilfs diff` 可随时看 |
+| 整合在 LayerFS 里完成 | 主 agent 用原生 merge 合并子 agent 分支，有历史；与 LayerFS × DSH 一致（"Every agent gets its own Branch"） |
+| 主 agent 的 bash 默认也有沙箱 | 防误操作的围栏；需要时再单条提权。**在默认 `auto` 下它不是安全边界**（§3.4） |
 
-### 1.2 参考设计怎么做
+### 1.2 主 agent 留在分支里的代价，以及怎么解决
 
-| 设计 | 谁在主干上 | 子 agent | 成果怎么回到主干 |
-|---|---|---|---|
-| **LayerFS × DSH** | LayerFS 的 `main`（只读）；主 agent 也开分支 | 每个 agent 一个分支，每次调用一个 Workspace | "Only the main agent publishes to main"；子 agent 报告分支，主 agent 合并后 `publish` |
-| **git worktree 式**（多数多 agent 工具） | 主工作区 | 每个 worker 一个 worktree | 主 agent 合并 worker 分支 |
-| **本设计** | **用户的项目目录** | 每个子 agent 一个 LayerFS 分支 | 主 agent `land`：三方合并进目录 |
+| 代价 | 解决 |
+|---|---|
+| 首次导入慢、`/resume` 卡住 | 已修：按 `.gitignore` 导入、超限预检、按目录加锁、并发扫描（本轮已合入） |
+| 沙箱里做不了的事：`git commit/push`、Docker、挂载、`ps`、测试 minilfs 自己 | **单条提权**（§3） |
+| 目录和分支两份内容 | 提权那一步自动收敛（§3.2）；其余时候靠 apply |
 
-LayerFS × DSH 的核心规则我们全部保留：**一个 agent 一个分支、只有主 agent 写主干、子 agent 结束时报告分支**。唯一的区别是主干的位置：DSH 把主干放在 LayerFS 里，用户要在 LayerFS 里看历史；我们的用户在自己的目录和 git 里工作，所以**主干就是目录本身**。LayerFS 的 `main` 只是目录的镜像，用来给子 agent 分叉。
+### 1.3 放弃过的方案
+
+| 方案 | 为什么放弃 |
+|---|---|
+| host mode（本轮实现过） | 是**模式**：要存状态、resume 恢复、切换前后做一致性检查，还出了"未 apply 标记过期"的问题。复杂度来自模式本身 |
+| r1/r2"目录即主干，主 agent 不进 minilfs" | 丢掉存档点、先审再写、LayerFS 内整合这三样，只换来"主 agent 有完整权限"；而单条提权能给出同样的权限 |
+
+### 1.4 用户习惯
+
+用户很少手动操作，习惯给主 agent 最高权限。所以**提权默认自动**（策略 `auto`），不弹确认；需要更严格时再改策略。
 
 ---
 
-## 2. 模型
+## 2. 角色
 
-### 2.1 三个角色，一张图
-
-```
-                    ┌────────────────────────────────────────────┐
-  主 agent ─────────▶│ 项目目录 = 主干（trunk）                      │◀── 用户、git、编辑器
-  原生工具，最高权限  └───────▲───────────────────────┬────────────┘
-                            │ land（三方合并）          │ 同步（分叉前）
-                            │ 只有主 agent 能做         ▼
-                    ┌───────┴──────────────────────────────────────┐
-                    │ LayerFS Store：main（目录的镜像）              │
-                    │   ├─ task-<jobId>   子 agent A 的分支         │
-                    │   ├─ task-<jobId>   子 agent B 的分支         │
-                    │   └─ sub-<agentId>  DSH 子 agent 的分支       │
-                    └───────▲──────────────────────────────────────┘
-                            │ 读写、bash（Seatbelt 沙箱）
-  子 agent ─────────────────┘ 只能改自己的分支；不能 land
-```
-
-| 角色 | 在哪里工作 | 工具 | 能做 | 不能做 |
+| 角色 | 工作在哪里 | 文件工具 | bash | 回到目录 |
 |---|---|---|---|---|
-| **主 agent**（顶层会话） | 项目目录 | 运行环境的原生工具，minilfs 不接管 | 一切；外加 `minilfs` 工具查看、合并子分支 | — |
-| **子 agent**（Epi task、Pi subagent、DSH subagent） | 自己的分支 | minilfs 接管的 read/write/edit/ls/find/grep/bash | 改自己的分支；`sync` 把最新主干合进来 | 写目录、land、看到别的子 agent 未合并的改动 |
-| **外部 agent**（Claude Code、Codex 通过 MCP/CLI） | `--branch <名字>` 指定的分支 | `minilfs exec` / MCP 工具 | 同子 agent | 同子 agent |
+| **主 agent**（顶层会话） | 自己的分支 | 分支 | 默认分支沙箱；可单条提权到目录 | `minilfs_apply`；提权时自动 apply |
+| **子 agent**（Epi task、Pi subagent、DSH subagent） | `task-<jobId>` / `sub-<id>` 分支 | 分支 | 只在分支沙箱 | 不能；由主 agent merge |
+| **外部 agent**（MCP/CLI，`--branch`） | 指定分支 | 分支 | 只在分支沙箱 | 不能 |
+| **用户** | — | — | `!cmd` 按提权执行（用户就是最高权限） | 同主 agent |
 
-### 2.2 一条规则决定角色
+角色由运行环境在启动时决定，之后不变（§5）。
 
-> 一个 agent 是子 agent，当且仅当运行环境说它是。否则它是主 agent，minilfs 不碰它的工具。
+---
 
-| 运行环境 | 怎么判断子 agent | 分支名 |
-|---|---|---|
-| Epi task | 见 §5.1（今天靠会话文件路径；向 Epi 提 issue 要正式的环境变量） | `task-<jobId>` |
-| Pi + pi-subagents | `PI_SUBAGENT_CHILD=1` | `sub-<sessionId 前 8 位>` |
-| DSH | `exec.agent.session.header.origin === "subagent"`（或 `parentSession` / `delegationDepth > 0`） | `sub-<agentId 前 8 位>` |
-| MCP / CLI | 显式 `--branch <名字>` | 给定的名字 |
-| 任何环境，强制 | `MINILFS_ROLE=worker` / `MINILFS_ROLE=lead` | — |
+## 3. 单条提权
 
-**分支的名字用运行环境已经给出的任务 id**，主 agent 派任务时就拿到了，不需要子 agent 报告分支名。
+### 3.1 怎么用
 
-名字分两层（现有引擎就是这样，必须保留）：
+主 agent 的 `bash` 工具多两个参数：
+
+```
+bash { command: "git commit -am 'x' && git push", elevated: true, reason: "commit and push the applied work" }
+```
+
+- `elevated: true`：这一条命令在真实项目目录执行，**不套 minilfs 沙箱**，用主机的环境、PATH、权限。执行器复用运行环境自己的 bash 实现（Pi：`createBashTool(hostCwd)`，带进程树回收、输出截断、timeout；DSH：宿主 shell），不用 `HostWorkspace.exec` 这种简化版。
+- `reason`：**`elevated: true` 时必填**（与 DSH `validateEscalationArgs` 一致），任何策略下都要填；记进存档点和状态栏，`ask` 下显示在确认框里。
+- 文件工具（read/write/edit/ls/find/grep）**永远在分支里**，不需要提权。
+
+工具说明和系统提示写明什么时候该提权：沙箱拦截（`Operation not permitted`）、需要写 `.git`（commit/push/checkout）、Docker、挂载、setuid 工具、要一直运行的服务、测试 minilfs 自己。沙箱拦截时，minilfs 在输出末尾补一行：`[minilfs] 被沙箱拦截；如需在真实目录执行，用 elevated: true 重试`。
+
+### 3.2 一次提权调用做什么
+
+| 步 | 动作 | 持有的锁 | 失败时 |
+|---|---|---|---|
+| 1 | **收敛**：分支上有未 apply 的改动，先三方 apply 进目录（现有 `applyLocked`：TOCTOU 检查；密钥、忽略、branch-only、`.git` 不写） | 会话锁 + 项目锁（apply 内部短暂持有） | 冲突或 WouldRevert：本次提权失败，列出原因，**不执行命令** |
+| 2 | **执行**：在目录里跑命令 | **只有会话锁**；项目锁释放，子 agent 可以照常 sync、新任务可以分叉 | 非零退出、abort、timeout：照常返回，**第 3 步仍执行**（进程树回收完之后），因为命令可能已改了目录 |
+| 3 | **同步回来**：(a) 目录同步进 `main`；(b) `baseBranch` 重新从新 `main` 分叉（`baseRef` 前移）；(c) 把新 `main` **合并进当前工作分支**，`main` 一侧优先（目录是刚执行完命令的权威结果）；(d) 在工作分支上产生一个 commit，记存档点 `host: <reason>` | 会话锁 + 项目锁（sync 内部短暂持有） | 同步超限或失败：标记 `mainStale`，提示原因；分支保持第 1 步后的状态 |
+
+为什么第 3 步是"合并进当前分支"而不是"从 main 重开分支"：apply 和 sync 都跳过 branch-only/忽略路径，分支里的构建产物（如 `dist/`、`target/`）只存在于分支；从 main 重开会丢掉它们，而且不产生 commit，`/tree` 无处定位。合并保留它们，并给 `/tree` 一个真实节点。
+
+**锁的粒度**：会话锁（`this.mutex`）包住三步，保证同一会话的工具调用不交错；内部调用不加锁的私有方法（`applyLocked`、sync 的内部版本），避免不可重入的互斥锁自死锁。跨进程的项目锁**绝不包住第 2 步**：长命令（`docker build`、测试、dev server）期间若持有项目锁，子 agent 的 `sync` 会在 60 秒后超时。
+
+**第 3 步的体积上限**：现在的 `syncHostDriftIntoMain` 没有大小检查，提权命令若在目录里生成大量未忽略文件（解压数据集、`git checkout` 到别的分支）会把它们全部读进内存。第 3 步对新增/修改文件套用与首次导入相同的上限（`MINILFS_MAX_IMPORT_*`）；超限时不写 Store、标记 `mainStale`，提示把目录加进 `.gitignore` 或 `.minilfsignore`。
+
+结果：提权调用正常结束时，**分支的已跟踪内容 = 目录 = main**，分支独有的产物保留，没有"未 apply"残留。
+
+说明：
+- 第 1 步的 apply 在 `auto` 下不再单独询问。这意味着在 `auto` 下"先审再写"只在两次提权之间成立；存档点和 `/tree` 仍然可用。
+- `/tree` 回到某次提权之前：分支可以回去，但提权命令对目录造成的影响（commit、push、安装的东西）回不去。之后若再 apply，`baseBranch` 已包含提权命令的改动（比如 lockfile），回退后的快照不含它们，会触发 WouldRevert，需要 `--revert` 才写目录。这是正确的保护：继续 apply 会把提权命令的结果撤掉。提示里要说清楚原因。
+- 子 agent 运行期间主 agent 提权：第 3 步更新 `main`，子 agent 下次 `sync` 拿到。
+
+### 3.3 策略
+
+| 策略 | 行为 |
+|---|---|
+| `auto`（**默认**） | 主 agent 自己决定何时提权，不确认 |
+| `ask` | 每次提权弹确认框（列出命令、理由、第 1 步要写的文件）；可选"本会话总是允许以 `<前缀>` 开头的命令"；无界面时拒绝 |
+| `never` | 不能提权；遇到沙箱拦截就停下告诉用户 |
+
+- 设置：启动参数 `--minilfs-elevate <策略>`、环境变量 `MINILFS_ELEVATE`、运行中 `/minilfs elevate <策略>`；存进对话，resume 恢复。
+- `MINILFS_ELEVATE_ALLOW="git *,docker *"`：`ask` 下匹配的命令直接通过。
+- **子 agent 永不提权**，与 DSH 一致（"children inherit the parent's sandbox mode and cannot ask for approval"）：
+  - Pi/Epi：每个进程按 `resolveRole()` 注册自己的 `bash`。主 agent 的 schema 在 Pi 的 `bashSchema`（只有 `command`、`timeout`）上扩展 `elevated`、`reason`；子 agent 用原 schema，看不到这两个参数。
+  - DSH：工具 schema 全局共享（插件只注册一次），做不到对子 agent 隐藏。参数说明里写"仅主 agent 可用"，`execute` 里按 `isChildAgent(exec)` 拒绝。
+  - 两处都在 `execute` 里再校验一次：子 agent 传了 `elevated` 就拒绝，并提示"把需要主机执行的步骤写进结果，交给主 agent"。
+- 用户的 `!cmd`：按提权执行（走 §3.2 同样三步），不受策略限制。
+
+### 3.4 安全边界（诚实说明）
+
+- 默认 `auto` 下，主 agent 的沙箱是**防误操作的围栏，不是安全边界**。被提示注入的主 agent（读了恶意 issue、网页、第三方仓库文件）可以一条 `elevated` 命令读取 `~/.ssh`、发出网络请求、写 `.git/hooks`，不会有确认。这与用户"给主 agent 最高权限"的选择一致，必须写进 README。
+- 要防提示注入：用 `ask`（配合前缀白名单减少打扰）或 `never`。
+- 子 agent 不受影响：它们永不提权，沙箱对它们是真正的边界（宿主目录只写拒绝、minilfs 状态目录不可读、密钥不可读）。
+- 子 agent 的代码进入主机的唯一路径是"主 agent merge → apply → 运行"。merge 结果里若有会被执行的文件（`package.json`、`Makefile`、`*.sh`、`build.rs`、CI 配置、`.husky/`、`.epi/`），附一行提醒。
+
+---
+
+## 4. 子 agent
+
+（r2 经评审定下的内容，保留）
+
+### 4.1 分支与名字
 
 | 层 | 例子 | 说明 |
 |---|---|---|
-| 逻辑名（对外，稳定） | `task-<jobId>` | 主 agent、提示、`land` 都用它 |
-| 物理分支（对内，会换） | `task-<jobId 前 8 位>-<seq>` | LayerFS 的 merge 只能写到新分支，所以子 agent 每次 `sync` 都会换一个物理分支（`workspace.ts` 中 `seq++`） |
+| 逻辑名（对外，稳定） | `task-<jobId>` | 主 agent、提示、merge 都用它；主 agent 派任务时就知道 |
+| 物理分支（对内，会换） | `task-<jobId 前 8 位>-<seq>` | LayerFS merge 只能写新分支，子 agent 每次 `sync` 会换（`workspace.ts` 中 `seq++`） |
 
-`resolveBranch(name)` 只做精确解析：逻辑名 → 当前物理分支；任务 id 接受**完整 id 或至少 8 位的唯一前缀**（与 Epi `findJobId` 一致，`task-runtime.js:296-302`；Epi 给模型看的是 8 位短 id，`extensions/task.js:158`）。前缀不唯一时报错并列出候选。删除的是 `lead` 别名和按会话猜测的模糊解析。
+`resolveBranch(name)`：逻辑名 → 当前物理分支；任务 id 接受完整 id 或 **≥8 位唯一前缀**（与 Epi `findJobId` 一致，`epi/dist/task-runtime.js:296-302`）；不唯一时报错并列出候选。
 
----
+### 4.2 生命周期
 
-## 3. 生命周期
+1. **分叉**：先把目录同步进 `main`（目录有 `.git/index.lock` 时最多等 10 秒），再从 `main` 分叉；基线 `baseRef` = 分叉时的 main。
+2. **工作**：每次 write/edit/bash 一个 Commit。`sync` 把最新 `main` 合进来，**成功后基线前移**。不做版本操作（提示词写明不 `git commit/checkout/reset`）；需要主机能力就停下报告。
+3. **嵌套**：孙 agent 也从 `main` 分叉；派它的子 agent 用 `merge` 合进自己的分支。
+4. **整合**：主 agent 用 `minilfs merge task-<id>`（LayerFS 原生 merge，失败时按路径兜底，`--ours/--theirs`、按文件 `resolve`）合进自己的分支，再 apply（或在下一次提权时自动 apply）。
+5. **清理**：merge 后保留 7 天，`/minilfs gc` 清理；未 merge 的分支永不自动删除，只在 `branches` 里标"陈旧"；`discard` 立即删除。
 
-### 3.1 子 agent 启动（分叉）
+### 4.3 任务结束提示（Epi）
 
-1. 第一次有子 agent 时才创建 Project Store（**主会话启动时什么都不做**，`/resume` 不再等待）。
-2. 把目录同步进 `main`：按 `.gitignore` 扫描，只写变化的文件（现有 `syncHostDriftIntoMain`，已并发、只保留需要的字节）。项目锁内完成。若目录里有 `.git/index.lock`（主 agent 正在做 git 操作），等它消失再扫，最多等 10 秒，避免拍到一半的状态。
-3. 从 `main` 分叉 `task-<jobId>`，记下**基线** `baseRef` = 本次分叉时的 `main` 快照（land 的三方合并基线，§3.3）。
-4. 子 agent 的工具全部作用在这个分支上；bash 在 Seatbelt 里跑。
-
-大仓库首次导入的上限（`MINILFS_MAX_IMPORT_*`）仍然生效，但只会让**派任务**失败并给出可操作的提示，主 agent 不受影响。
-
-### 3.2 子 agent 工作中
-
-- 每次 write/edit/bash 一个 LayerFS Commit（现有逻辑）。
-- `minilfs sync`：先同步目录进 `main`，再把 `main` 合进自己的分支，拿到主 agent 期间的改动。**成功后基线 `baseRef` 推进到这次合进来的 `main` 快照**，否则 land 会把这些主干改动误当成子 agent 的改动（三方合并基线错误）。
-- 子 agent 不做版本操作：提示词写明"不要在分支里 `git commit/checkout/reset/rebase`；提交由主 agent 在 land 后做"。`.git/` 永远不会被 land。
-- 需要主机能力（Docker、挂载、`git push`、长期运行的服务）时，子 agent 停下并在结果里请主 agent 做（与 DSH 一致：子 agent 不提权）。
-- 结束时不需要报告分支名；运行环境的任务 id 就是分支名。
-
-### 3.3 主 agent 合并（land）
-
-`minilfs land <jobId|branch> [--ours|--theirs] [--dry-run]`
-
-对子分支相对**基线 `baseRef`** 改过的每个文件，比较三方（base = `baseRef` 里的版本，ours = 目录现状，theirs = 子分支版本）：
-
-| 目录现状 | 结果 |
-|---|---|
-| 等于 base（主 agent 没动过） | 写入子分支版本 |
-| 等于子分支版本 | 跳过（已一致） |
-| 都不同，文本文件 | `git merge-file` 三方合并；干净则写入，否则冲突 |
-| 都不同，二进制 / 符号链接 / 权限位冲突 | 冲突 |
-
-- **有任何冲突就一个都不写**，列出冲突文件；`--theirs` / `--ours` 整体取一边，或 `resolve: { "<path>": "ours" | "theirs" }` 按文件取（复用 `fallbackMergeBranch` 现有的 `resolve`）。
-- 被忽略、branch-only、密钥、`.git/`、`.lww` 的路径永远不写（与现在 apply 一致）。
-- 写入是逐文件原子替换（临时文件 + rename），写前再查一次目录没变（现有 TOCTOU 检查）。
-- 成功后同步目录进 `main`，**基线推进到刚 land 的子分支快照**，并记录"已 land 到 <commit>"。所以同一个子分支可以**多次增量 land**：Epi 能用 `task({ jobId, task })` 续跑同一个任务（`task-runtime.js:353`），续跑后再 land 只合新改动。
-- 结果里若有会被执行的文件（`package.json`、`Makefile`、`*.sh`、`Cargo.toml`/`build.rs`、CI 配置、`.epi/`、`.husky/` 等），附一行提醒：这些改动来自子 agent，主 agent 运行前应先看 diff。主 agent 不在沙箱里，这是子 agent 代码影响主机的唯一路径。
-
-`land` 就是现在 `apply` 的冲突逻辑，加上一步文本三方合并（复用 `fallbackMergeBranch` 里已有的 `threeWayMerge`）。
-
-### 3.4 任务结束的提示（Epi）
-
-主 agent 的扩展**只读地**观察 Epi 的 `task_stop`（`pi.events` 频道 `epi/hooks/task/v1`，载荷 `{ event: { type, job }, context }`）。
-
-- **绝不设置 `request.run`**：那是 `epi:hooks` 的唯一决策位，`emitTaskHook` 只调用一个 `run`，返回非 `continue` 会让任务收尾抛错（`hook-events.js:2-8`，`extensions/task.js:424-427`）。监听器包在 try/catch 里，只记下 jobId，不做任何耗时操作。
-- 提示的投递放在之后：在主 agent 下一次 `before_agent_start` 时，把"已结束、有改动、未 land 的子分支"附进系统提示；交互界面同时 `ctx.ui.notify` 一次。不抢 Epi 自己的任务通知。
-- 提示内容：`task <短id> 改了 N 个文件（其中 x.ts、y.ts 主干期间也改过，land 时会三方合并）；minilfs diff <短id> 查看，minilfs land <短id> 合并`。"双方都改了"用目录索引和基线快照对比算出，毫秒级。
-- **不自动 land**：合并是主 agent 的决定，和 DSH 一致。
+- 只读观察 `task_stop`（`pi.events` 频道 `epi/hooks/task/v1`）：**绝不设置 `request.run`**（`hook-events.js:2-8`，返回非 `continue` 会让任务收尾抛错，`extensions/task.js:424-427`），try/catch 包裹，只记 jobId。
+- 主 agent 下一次 `before_agent_start` 时附上"已结束、有改动、未 merge 的子分支"；界面上 `notify` 一次。
+- 提示内容：`task <短id> 改了 N 个文件（其中 x.ts 你的分支也改过）；minilfs diff <短id> 查看，minilfs merge <短id> 合并`。
+- 不自动 merge。
 
 ---
 
-## 4. 工具面
+## 5. 运行环境接入
 
-### 4.1 主 agent 看到的
+### 5.1 角色判断 `resolveRole()`
 
-运行环境原生的 read/write/edit/bash（不接管），加一个工具。
+| 运行环境 | 子 agent 的判断 | 分支逻辑名 |
+|---|---|---|
+| Epi task | 后备：会话文件在 `<epiHome>/runtime/task/sessions/<jobId>.jsonl`；Epi 支持后改用 `EPI_TASK_JOB_ID` | `task-<jobId>` |
+| Pi + pi-subagents | `PI_SUBAGENT_CHILD=1` | `sub-<sessionId 前 8 位>` |
+| DSH | `exec.agent.session.header.origin === "subagent"`（或 `parentSession`、`delegationDepth > 0`） | `sub-<agentId 前 8 位>` |
+| MCP / CLI | `--branch <名字>` | 给定 |
+| 强制 | `MINILFS_ROLE=lead\|worker` | — |
+| 关闭 | `MINILFS=0` / `--no-minilfs`：所有 agent 直接在目录工作 | — |
 
-主 agent **没有 `LayerfsSession`**（没有自己的分支）。这些动作由一个项目级控制器 `ProjectTrunk` 执行：按目录查 `bindings`；还没有 Store 时 `branches` 直接返回空，不创建任何东西；有 Store 时才连接，操作子分支和 `main`。`LayerfsSession` 只给子 agent 用。
+默认是**主 agent**：顶层会话没有任何子 agent 线索，必须能 apply 和提权。只有**发现了子 agent 线索但解析不出任务 id**（例如会话文件在 Epi 的 `runtime/` 下但不在已知的 `task/sessions/` 位置）时，才按子 agent 处理，并在状态栏写明。
 
-| `minilfs` action | 作用 |
-|---|---|
-| `branches` | 列出子分支：任务 id、状态（运行中/已结束/已合并）、改动文件数 |
-| `diff <id>` | 子分支相对分叉点的改动 |
-| `show <id> <path>` / `ls <id> [path]` | 读子分支里的文件或目录 |
-| `land <id> [--ours\|--theirs] [--dry-run]` | 三方合并进目录（§3.3） |
-| `discard <id>` | 删除子分支 |
+### 5.2 Epi
 
-用户命令：`/minilfs branches | diff | land | discard`。
-
-### 4.2 子 agent 看到的
-
-read/write/edit/ls/find/grep/bash（作用于分支），加：
-
-| `minilfs` action | 作用 |
-|---|---|
-| `status` | 我的分支、改动数 |
-| `diff` | 我改了什么 |
-| `sync` | 把最新主干合进我的分支 |
-
-| `merge <子分支>` | 只在**嵌套**时用：自己派生的孙 agent 的分支合进自己的分支 |
-
-没有 `land`、没有 apply、没有模式切换。嵌套规则：孙 agent 也是子 agent，从 `main` 分叉；它的成果由派它的子 agent `merge` 进自己的分支，最终由主 agent 一次 land。
-
----
-
-## 5. 各运行环境的接入
-
-### 5.1 Epi
-
-- 已核实（`epi/dist`）：task worker 是独立进程，**默认加载 Manifest 里的第三方扩展**（`worker.js:317` `additionalExtensionPaths`）；子进程的 cwd 就是任务的 cwd；父进程能收到 `task_start` / `task_stop`（`extensions/task.js:424,530,557`）。
-- 缺口：Epi **不告诉子进程它是子任务**，也不给 jobId（只设 `PI_CODING_AGENT_DIR`，`task-runtime.js:594`）。
-  - 今天：子扩展用会话文件路径判断，`<epiHome>/runtime/task/sessions/<jobId>.jsonl` → 子 agent，jobId 取文件名。这依赖 Epi 的内部路径，**只作为后备**；判断失败时按主 agent 处理（不接管工具），并在状态栏写明，绝不把子 agent 误放到目录里却显示为隔离。
-  - Issue（向 Epi 提）：(1) 子进程环境加 `EPI_TASK_JOB_ID`、`EPI_TASK_PARENT_SESSION`；(2) 给扩展一个正式的任务生命周期事件（只读，不经过 hooks 的决策位）。有了 (1) 后优先用它。
-- 主 agent：扩展只注册 `minilfs` 工具、`/minilfs` 命令和 `task_stop` 提示；**不注册** read/write/edit/bash 的替身。
-
-### 5.2 Pi（pi-subagents 等）
-
-- 子进程有 `PI_SUBAGENT_CHILD=1` → 子 agent。其余同 Epi。
+- 已核实：task worker 默认加载 Manifest 的第三方扩展（`worker.js:317`），cwd 就是任务 cwd，父进程有 `task_start/task_stop`。
+- 给 Epi 提 issue：(1) 子进程加 `EPI_TASK_JOB_ID`、`EPI_TASK_PARENT_SESSION`；(2) 给扩展一个正式的只读任务生命周期事件。
 
 ### 5.3 DSH
 
-- 插件挂载一次，所有 agent 共用（已核实，`child-agent.ts:200`）。按 `exec.agent.id` 分开状态（已修）。
-- 主 agent：插件的 read/write/edit/glob/grep/bash 直接作用于目录。原因：DSH 的工具注册是全局的，不能只对子 agent 替换。实现用 `FolderWorkspace`（由现在的 `HostWorkspace` 改来），并修两点：**去掉密钥拦截**（主 agent 有完整权限，和原生工具一致），**补齐插件用到的全部方法**（`access/isDirectory/readdir/mkdir` 等）。
-- 主 agent 调 `minilfs` 工具时用 `ProjectTrunk`（§4.1），不能把 `FolderWorkspace` 传给 `executeLayerfsAction`（它要 `session.lfs`，会抛错）。
-- 子 agent：工具作用于 `sub-<agentId>` 分支；`minilfs_apply` 删除，换成主 agent 的 `land`。
-
-### 5.4 MCP / CLI
-
-- `minilfs --branch <name> exec|diff|sync`：外部 agent 当子 agent 用。
-- `minilfs land <name>`：在目录里执行的人（或主 agent）合并。
+- 插件挂载一次，所有 agent 共用，按 `exec.agent.id` 分开会话（已修）。
+- 主 agent 的 `bash` 有 `elevated` 参数；`ask` 走 DSH 的审批服务 `ctx.approval.request(...)`，无应答时拒绝（与 DSH 自己的 bash 提权同一机制）。
+- 子 agent：`elevated` 拒绝；`minilfs_apply` 拒绝（已修）。
 
 ---
 
@@ -209,83 +185,61 @@ read/write/edit/ls/find/grep/bash（作用于分支），加：
 
 | 删除 | 位置 |
 |---|---|
-| host mode：`workspace_mode` 工具、`/minilfs mode`、`switchMode`、`MODE_*`、`MINILFS_MODE` | `src/core/mode.ts`、`src/index.ts` |
-| host policy：`ask/auto/bypass/never`、`--minilfs-host`、`MINILFS_HOST_POLICY`、`/minilfs policy` | 同上 |
-| 过期标记处理：`restartFromMain`、`pendingAlreadyOnHost` | `src/workspace.ts` |
-| `minilfs_apply` 换成 `land`；子 agent 的 `apply` 能力 | `src/core/tools.ts` |
-| 主会话分支：启动导入、`/tree` `/fork` `/resume` 的文件还原、checkpoint 条目、`resumeLost`、启动阶段显示、`/minilfs retry` 的重启 | `src/index.ts`、`src/workspace.ts` |
-| 主 agent 的工具接管（Pi/Epi） | `src/index.ts` |
-| `minilfs_apply`、`MINILFS_TEAM`、`lead` 别名、`resolveBranchName` 的别名猜测 | `src/core/tools.ts`、`src/workspace.ts` |
-| DSH 补丁里的 mode / policy 部分 | `docs/patches/` |
+| `workspace_mode` 工具、`/minilfs mode`、模式状态（`MODE_ENTRY` 的 mode 字段）、`switchMode`、`initialMode`、`MINILFS_MODE` | `src/core/mode.ts`、`src/index.ts` |
+| `HostWorkspace` 的文件操作（只保留主机执行，给提权和 DSH 用） | `src/core/host.ts` |
+| host policy 的 `bypass` 档（单条提权下等同 `auto`）；名字改为 elevate | 同上 |
+| `MINILFS_TEAM` 开关：主 agent 总有 `minilfs` 和 `minilfs_apply`，子 agent 总有 `minilfs`（无 apply） | `src/index.ts` |
+| `resolveBranchName` 的模糊猜测（保留精确解析，§4.1） | `src/workspace.ts` |
+| DSH 补丁里的 `workspace_mode` 部分 | `docs/patches/` |
 
 ### 6.2 保留
 
-- 总开关 `MINILFS=0` / `--no-minilfs`：关掉后子 agent 也直接在目录工作（单次调试、超大仓库），不用改 Manifest。
-- 分支引擎：Store 直写、按需挂载、Seatbelt、`ps` 替身、按 `.gitignore` 导入、密钥排除与 `!` 放行、导入上限、并发扫描、按目录的初始化锁、路径多种写法。
-- 合并：原生 merge + 按路径兜底合并、`--ours/--theirs`、mtime 修正。
-- apply 的冲突逻辑（变成 land）。
-- DSH 的"每个 agent 一个分支"。
+- 分支引擎全部：Store 直写、按需挂载、Seatbelt、`ps` 替身、按 `.gitignore` 导入、密钥排除与 `!` 放行、导入上限、并发扫描、按目录加锁、路径多种写法。
+- 存档点、`/tree` `/fork` `/resume` 文件回退、apply、merge 及兜底。
+- `pendingAlreadyOnHost`（过期标记检测）。`restartFromMain` 删除：第 3 步改为合并进当前分支（§3.2）。
+- 策略机制（改名 elevate，三档）。
 
 ### 6.3 新增
 
 | 新增 | 说明 |
 |---|---|
-| 角色判断 `resolveRole()` | §2.2 的表，一个函数，各运行环境共用；`MINILFS=0` 时返回 disabled |
-| `ProjectTrunk` | 主 agent 的项目级控制器（§4.1），无 Store 时零开销 |
-| `resolveBranch()` | 逻辑名 → 物理分支；≥8 位唯一前缀（§2.2） |
-| `land` | §3.3；基线是子分支的 `baseRef`（分叉、sync、land 后推进） |
-| `task_stop` 提示 | §3.4 |
-| `FolderWorkspace`（由 `HostWorkspace` 改名） | 只给 DSH 主 agent 用 |
-| Epi issue | `EPI_TASK_JOB_ID`、`EPI_TASK_PARENT_SESSION` |
+| `bash` 的 `elevated` / `reason` 参数与 §3.2 三步流程 | 核心 |
+| 沙箱拦截提示 | §3.1 |
+| `resolveRole()`、`resolveBranch()` | §5.1、§4.1 |
+| 子分支基线前移、嵌套 merge、`gc` | §4.2 |
+| Epi `task_stop` 只读观察与延后提示 | §4.3 |
 
 ---
 
-## 7. 迁移
-
-- 现有 Store、分支不删。旧的 `s-*` 会话分支在 `minilfs branches` 里显示为"旧会话分支"，可以 `land` 或 `discard`。
-- 主会话以前在分支里没 apply 的改动：升级后第一次启动时提示一次，给出 `minilfs land <旧分支>`。
-- 配置项删除后若仍设置（`MINILFS_TEAM`、`MINILFS_MODE` 等），启动时警告一次，不报错。
-
----
-
-## 8. 测试
+## 7. 测试
 
 | 测试 | 内容 |
 |---|---|
-| 角色 | 各运行环境的判断表；强制 `MINILFS_ROLE` |
-| 主 agent 不受影响 | Epi/Pi 主会话：工具是原生的；启动不创建 Store；`git commit`、`ps`、嵌套沙箱可用 |
-| 分叉 | 首个子 agent 才建 Store；分叉前同步目录；分叉点记录正确 |
-| 隔离 | 两个子 agent 互相看不到；子 agent 写不到目录；子 agent 不能 land |
-| land | 四种三方情况；文本合并；冲突时一个不写；`--ours/--theirs` 和按文件 `resolve`；`--dry-run`；忽略/密钥/`.git` 不写；land 后 main 同步、基线推进；**子 agent `sync` 后再 land，主干期间的改动不被误判**；同一分支两次增量 land；会执行文件的提醒 |
-| 名字 | sync 后物理分支换了，`land task-<id>` 仍命中最新；8 位前缀；前缀不唯一报错 |
-| 嵌套 | 子 agent 派孙 agent → 子 agent merge 孙分支 → 主 agent 一次 land |
-| Epi 钩子 | `task_stop` 监听器不设 `run`、抛错不影响任务收尾 |
-| Epi 端到端 | 主 agent 派 2 个 task 改不同文件 → 各自分支 → `task_stop` 提示 → land 两个 → 目录里都有 |
-| DSH | 主 agent 在目录；子 agent 在分支；主 agent land |
-| 现有 | native-seatbelt、backend、scale 等去掉主会话部分后保留 |
+| 提权 | 有未 apply 改动 → 先 apply 再执行 → 结束后已跟踪内容分支=目录=main；apply 冲突或 WouldRevert 时不执行；非零退出、abort、timeout 后仍同步；**分支里的 branch-only 产物（`dist/`）提权后仍在**；提权后产生 `host:` 存档点且 `/tree` 能定位；`reason` 缺失时拒绝 |
+| 锁 | 提权命令运行 90 秒期间，子 agent 的 `sync` 成功（项目锁未被占用）；同会话的第二个工具调用排队 |
+| 体积 | 提权命令生成超限的未忽略文件 → 第 3 步不写 Store、标记 `mainStale`、提示 |
+| 提权能力 | 提权命令里 `git commit`、写 `.git`、`/bin/ps`、嵌套 `sandbox-exec`、挂载可用 |
+| 策略 | `auto` 不问；`ask` 确认/拒绝/无界面/前缀白名单；`never` 拒绝；子 agent 永远拒绝；用户 `!cmd` 不受策略限制 |
+| 角色 | 顶层会话无线索 → 主 agent；Epi 会话路径在 `task/sessions/` → 子 agent；有线索但无法解析 → 子 agent |
+| schema | Pi/Epi 主 agent 的 bash 有 `elevated`/`reason`，子 agent 没有；DSH 共享 schema、子 agent 调用被拒 |
+| 沙箱拦截提示 | 输出含 `Operation not permitted` 时补提示 |
+| 子 agent | 名字两层、8 位前缀、sync 后基线前移、嵌套 merge、主 agent merge 后 apply |
+| Epi | 主 agent 派 2 个 task → `task_stop` 提示 → merge → apply；监听器不设 `run` |
+| 回归 | 现有 native-seatbelt、backend、review-fixes、pi、cli、rpc、scale 去掉 mode 相关后保留 |
 
 ---
 
-## 9. 已决定（r2）
+## 8. 已决定（r4）
 
-1. **land 冲突**：一个都不写；支持整体 `--ours/--theirs` 和按文件 `resolve`。
-2. **分支保留**：land 后保留 7 天，`/minilfs gc` 清理；**未 land 的分支永不自动删除**，只在 `branches` 里标"陈旧"；discard 立即删。
-3. **双方都改了的文件**：在 `task_stop` 提示和 `diff` 里预先标出。
-4. **子 agent 需要主机能力**：不提权，报告给主 agent（与 DSH 一致；这是删除 host mode 的前提）。
+1. **提权前的 apply 在 `auto` 下不问**：接受；冲突或 WouldRevert 时中止，不执行命令（Argon r3 同意）。
+2. **提权命令的改动**（lockfile、`npm install` 等）：第 3 步同步进 main 并合并进分支；受体积上限保护（§3.2）。
 
-## 10. 评审记录
+---
 
-r1 由 Gemini 4 Argon 评审（结论：有条件通过）。逐条核对源码后全部采纳：
+## 9. 评审记录
 
-| # | 级别 | 问题 | 处理 |
+| 轮 | 评审 | 结论 | 处理 |
 |---|---|---|---|
-| 1 | 阻断 | sync 会换物理分支名（`seq++`），删掉解析会让 `land task-<id>` 找不到最新分支 | §2.2 两层名字，保留精确解析 |
-| 2 | 阻断 | sync 后基线不推进，land 把主干改动误当子 agent 改动 | §3.2 sync 推进基线；§3.3 land 后推进，支持增量 land |
-| 3 | 阻断 | Epi 给模型的是 8 位短 id | §2.2 ≥8 位唯一前缀 |
-| 4 | 重要 | DSH `FolderWorkspace` 拦密钥、缺方法；`minilfs` 工具不能传它 | §5.3 |
-| 5 | 重要 | 主 agent 没有会话时，`branches/diff/land` 怎么跑没定义 | §4.1 `ProjectTrunk` |
-| 6 | 重要 | `task_stop` 设 `run` 会破坏任务收尾 | §3.4 只读观察，提示延后投递 |
-| 7 | 重要 | 主 agent 做 git 时同步拍到半状态；子 agent 在分支里做 git | §3.1 等 `index.lock`；§3.2 不做版本操作 |
-| 8 | 重要 | 嵌套子 agent 无法汇总 | §4.2 子 agent 保留 `merge`；§3.2 嵌套规则 |
-| 9 | 重要 | 主 agent 不在沙箱，子 agent 的构建脚本 land 后会以主机权限运行 | §3.3 会执行文件的提醒 |
-| 10 | 次要 | 删掉 `MINILFS=0` 太激进 | §6.2 保留总开关 |
+| r1 | Gemini 4 Argon | 有条件通过，10 条 | r2 全部采纳。其中子 agent 相关的（两层名字、8 位前缀、基线前移、嵌套 merge、`task_stop` 只读、`MINILFS=0` 保留）在 r3 继续有效；`ProjectTrunk`、`FolderWorkspace`、land 进目录三条随方向改变而不再需要 |
+| r3 | Gemini 4 Argon | 有条件通过，6 条（2 阻断） | r4 全部采纳，逐条核对源码确认：(1) 阻断：`restartFromMain` 丢 branch-only 产物且无 commit → 第 3 步改为合并进当前分支并产生 `host:` 存档点；(2) 阻断：锁粒度 → 会话锁包三步、项目锁不包命令执行、abort 后仍同步；(3) Pi 按角色注册 bash schema，DSH 共享 schema 靠 execute 拒绝；(4) `auto` 不是安全边界，写明；`reason` 必填；复用运行环境的 bash 执行器；(5) 角色默认主 agent，有线索无法解析才按子 agent；(6) 第 3 步加体积上限 |
+| r4 | 待用户确认 | — | — |
