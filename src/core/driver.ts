@@ -13,6 +13,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { LayerfsConfig } from "../config.ts";
 import { bothSpellings, buildSeatbeltProfile } from "../seatbelt.ts";
+import { ensureBundle, missingBundleFiles } from "../bundle.ts";
 import type { Workspace } from "../workspace.ts";
 import { run } from "./exec-helper.ts";
 import { ensurePsShim } from "./ps-shim.ts";
@@ -121,13 +122,9 @@ export class LocalNativeDriver implements ExecutionDriver {
 
   async preflight(config: LayerfsConfig): Promise<string> {
     const problems: string[] = [];
-    for (const f of ["layerfs.node", "layerfs-daemon", "sdk/js/src/index.js"]) {
-      try {
-        await fsp.access(join(config.bundle, f), fsc.R_OK);
-      } catch {
-        problems.push(`missing ${join(config.bundle, f)}`);
-      }
-    }
+    const fetchProblem = await ensureBundle(config.bundle).catch((e) => `installing the LayerFS bundle failed: ${e?.message ?? e}`);
+    for (const f of await missingBundleFiles(config.bundle)) problems.push(`missing ${f}`);
+    if (fetchProblem && problems.length) problems.push(fetchProblem);
     for (const bin of ["/sbin/mount_nfs", "/usr/bin/sandbox-exec"]) {
       try {
         await fsp.access(bin, fsc.X_OK);

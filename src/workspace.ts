@@ -4,6 +4,7 @@ import { constants as fsc, createReadStream, existsSync, mkdtempSync, promises a
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { IgnoreRules } from "./ignore.ts";
+import { ensureBundle, missingBundleFiles } from "./bundle.ts";
 import { BindingStore, type HostEntry, type HostIndex, type ProjectRecord, type SessionBinding } from "./bindings.ts";
 import type { LayerfsConfig } from "./config.ts";
 import { createProjectClient, ensureNativeDirs, type NativeSpec } from "./core/client.ts";
@@ -194,11 +195,12 @@ export class LayerfsSession {
 
   // ---------------------------------------------------------------- startup & project sharing
 
-  static async preflight(config: LayerfsConfig): Promise<string> {
+  static async preflight(config: LayerfsConfig, onPhase?: (phase: string) => void): Promise<string> {
     const problems: string[] = [];
-    for (const f of ["layerfs.node", "layerfs-daemon", "sdk/js/src/index.js"]) {
-      try { await fsp.access(join(config.bundle, f), fsc.R_OK); } catch { problems.push(`missing ${join(config.bundle, f)}`); }
-    }
+    // first start on a new Mac: fetch the prebuilt bundle instead of failing
+    const fetchProblem = await ensureBundle(config.bundle, (m) => onPhase?.(m)).catch((e) => `installing the LayerFS bundle failed: ${e?.message ?? e}`);
+    for (const f of await missingBundleFiles(config.bundle)) problems.push(`missing ${f}`);
+    if (fetchProblem && problems.length) problems.push(fetchProblem);
     for (const bin of ["/sbin/mount_nfs", "/usr/bin/sandbox-exec"]) {
       try { await fsp.access(bin, fsc.X_OK); } catch { problems.push(`missing or non-executable ${bin}`); }
     }
@@ -208,7 +210,7 @@ export class LayerfsSession {
 
   async open(options: OpenOptions = {}): Promise<void> {
     const t0 = Date.now();
-    await LayerfsSession.preflight(this.config);
+    await LayerfsSession.preflight(this.config, options.onPhase);
     this.spec = ensureNativeDirs(this.config);
     this.bindings = new BindingStore(join(this.config.root, "state"));
     this.leases = new MountLeases(join(this.config.root, "state", "mounts"));

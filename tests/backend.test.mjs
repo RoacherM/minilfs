@@ -60,9 +60,15 @@ writeFileSync(outside, "outside-host\n");
 let sA, sB, sC;
 
 try {
-  await step("preflight refuses missing bundle (no resources created)", async () => {
+  await step("preflight refuses a missing bundle it cannot fetch (no resources created)", async () => {
     const bad = { ...config, bundle: "/tmp/non-existent-bundle" };
-    await assert.rejects(new LayerfsSession(cwd, "bad", bad).open(), (e) => e.code === "Preflight" && /missing/.test(e.message));
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => { throw Object.assign(new Error("offline"), { cause: { code: "ENOTFOUND" } }); };
+    try {
+      await assert.rejects(new LayerfsSession(cwd, "bad", bad).open(), (e) => e.code === "Preflight" && /missing/.test(e.message) && /setup-layerfs\.sh/.test(e.message));
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 
   await step("open session A: initializes shared Project Store; 0 Sandboxes started", async () => {

@@ -244,7 +244,9 @@ try {
   });
 
   await step("fail-closed: broken minilfs -> tools error, host never written", async () => {
-    process.env.MINILFS_BUNDLE = "/tmp/nonexistent-bundle";
+    // a bundle path that cannot be installed (its parent is a file): the download cannot help
+    writeFileSync(join(base, "not-a-dir"), "x");
+    process.env.MINILFS_BUNDLE = join(base, "not-a-dir", "bundle");
     const bad = await makeSession();
     try {
       const [r, w] = await bad.run([["read", { path: "README.md" }], ["write", { path: "fallback.txt", content: "x" }]]);

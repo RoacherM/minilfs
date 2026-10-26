@@ -43,6 +43,10 @@ It isolates coding agents' file operations and shell commands on copy-on-write L
 
 ## 1. Prerequisites (Once per Mac — Zero Docker, Zero Root, Zero macFUSE)
 
+Nothing on Apple silicon (macOS 11+): the first start downloads the prebuilt LayerFS bundle (`layerfs-daemon`, `layerfs.node`, JS SDK; ~8 MB) from this repository's [GitHub release](https://github.com/RoacherM/minilfs/releases/tag/bundle-layerfs-833acf7), checks its sha256 and installs it in `~/.cache/minilfs/bundle-native` (`MINILFS_BUNDLE`).
+
+To build it from LayerFS source instead (needs Rust), or on another machine:
+
 ```bash
 git clone https://github.com/RoacherM/minilfs.git
 ./minilfs/scripts/setup-layerfs.sh
@@ -158,7 +162,7 @@ await session.open();
 |---|---|
 | `MINILFS` | on; `0` turns it off (`--no-minilfs` flag also disables for one run) |
 | `MINILFS_DRIVER` | `native` (or custom registered driver name) |
-| `MINILFS_BUNDLE` | `~/.cache/minilfs/bundle-native` |
+| `MINILFS_BUNDLE` | `~/.cache/minilfs/bundle-native` (downloaded on first start when missing) |
 | `MINILFS_ROOT` | `~/.cache/minilfs` (home, APFS Stores, local mounts, bindings) |
 | `MINILFS_PREFIX` | `minilfs-` |
 | `MINILFS_NETWORK` | `allow` \| `localhost` \| `deny` (`offline`) — Seatbelt outbound network policy inside `bash` |

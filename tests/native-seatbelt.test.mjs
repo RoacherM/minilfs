@@ -91,10 +91,16 @@ try {
     assert.equal(res, "native", "preflight must return 'native'");
 
     const badConfig = { ...config, bundle: "/tmp/non-existent-bundle" };
-    await assert.rejects(
-      LayerfsSession.preflight(badConfig),
-      (e) => e.code === "Preflight" && /missing/.test(e.message),
-    );
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: false, status: 404, statusText: "Not Found" });
+    try {
+      await assert.rejects(
+        LayerfsSession.preflight(badConfig),
+        (e) => e.code === "Preflight" && /missing/.test(e.message),
+      );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 
   await step("1.2 open session A: initializes native APFS Store with 0 Docker containers and 0 daemons", async () => {
