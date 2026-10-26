@@ -10,6 +10,7 @@ import { createProjectClient, ensureNativeDirs, type NativeSpec } from "./core/c
 import { resolveExecutionDriver, type ExecutionDriver } from "./core/driver.ts";
 import { run } from "./core/exec-helper.ts";
 import { bothSpellings, buildSeatbeltProfile } from "./seatbelt.ts";
+import { isOrphan, MountLeases } from "./mount-leases.ts";
 
 export interface Workspace { sandbox: string; path: string; image?: string }
 export interface Checkpoint { origins: string[]; label: string; commit: string | null; branch: string; changed: boolean; at: number }
@@ -150,6 +151,9 @@ export class LayerfsSession {
   private inMutate = false;
   private activeSids = new Map<string, () => Promise<void>>();
   private pendingUnmounts = new Set<Promise<unknown>>();
+  /** Workspaces this session has mounted and not yet unmounted, by `ws.path`. */
+  private mounts = new Map<string, { ws: Workspace; wsReal: string }>();
+  private leases!: MountLeases;
   private mutex: Promise<unknown> = Promise.resolve();
   private closed = false;
   private openAborted = false;
@@ -201,6 +205,7 @@ export class LayerfsSession {
     await LayerfsSession.preflight(this.config);
     this.spec = ensureNativeDirs(this.config);
     this.bindings = new BindingStore(join(this.config.root, "state"));
+    this.leases = new MountLeases(join(this.config.root, "state", "mounts"));
     await this.ignore.load();
 
     const phase = (p: string) => {
@@ -232,6 +237,7 @@ export class LayerfsSession {
         await this.syncHostDriftIntoMain();
       }
     }
+    await this.reclaimOrphanMounts().catch((e) => this.log(`reclaiming orphan mounts failed: ${e?.message ?? e}`));
 
     phase("preparing branch…");
     await this.setupBranches(options);
@@ -1319,6 +1325,82 @@ export class LayerfsSession {
     await assertInsideWorkspace(wsReal, candidate, allowFinalSymlink);
   }
 
+  /**
+   * Mounts a Workspace of `branch` and records it twice: in `this.mounts` (released by `close()`)
+   * and as a lease file (reclaimed by the next session if this process dies without cleanup).
+   */
+  private async mountWorkspace(branch: string): Promise<{ ws: Workspace; wsReal: string }> {
+    const ws: Workspace = await this.lfs.workspace.mount(branch);
+    // synchronous until the lease is on disk: a reused slot path must not look orphaned meanwhile
+    const wsReal = (() => { try { return realpathSync(ws.path); } catch { return ws.path; } })();
+    this.mounts.set(ws.path, { ws, wsReal });
+    try { this.leases.add(this.projectRecord.name, ws, wsReal); } catch (e: any) { this.log(`mount lease not written: ${e?.message ?? e}`); }
+    return { ws, wsReal };
+  }
+
+  /**
+   * Ends a Workspace so that neither the OS mount nor the daemon's Workspace slot leaks:
+   * reap holders, unmount (`discard` as asked), then retry once with discard, then force the
+   * OS unmount. The lease stays when LayerFS still holds the Workspace, so a later session retries.
+   */
+  private async releaseWorkspace(ws: Workspace, wsReal: string, discard: boolean, owner = process.pid, lfs = this.lfs): Promise<void> {
+    await this.reapHolders(wsReal).catch(() => {});
+    let err: any = null;
+    let gone = false;
+    for (const d of discard ? [true] : [false, true]) {
+      try {
+        await lfs.workspace.unmount(ws, d);
+        err = null;
+        break;
+      } catch (e: any) {
+        err = e;
+        if (e?.code === "NotMounted" || e?.code === "NoSuchSandbox") { err = null; gone = true; break; }
+        if (!d) this.log(`unmount ${ws.path} refused (${e?.code ?? e?.message}); retrying with discard`);
+        await this.reapHolders(wsReal).catch(() => {});
+      }
+    }
+    this.mounts.delete(ws.path);
+    if (err) this.log(`unmount ${ws.path} failed (${err?.code ?? "Error"}: ${String(err?.message ?? err).slice(0, 200)}); forcing the OS unmount`);
+    // also after NotMounted/NoSuchSandbox: a daemon that died leaves its NFS mount in the OS table.
+    // Skip when a live process has mounted a new Workspace at this path meanwhile (its lease replaced ours).
+    const current = this.leases?.read(ws.path);
+    if ((err || gone) && (!current || current.pid === owner)) await forceUnmount(wsReal);
+    if (!err) this.leases?.remove(ws.path, owner);
+  }
+
+  /**
+   * Unmounts Workspaces left by processes that died while one was mounted (found by their lease),
+   * for every project under this root: a project nobody reopens would otherwise keep its daemon.
+   * Their changes were never committed, so they are discarded.
+   */
+  private async reclaimOrphanMounts(): Promise<number> {
+    if (!this.leases || !this.spec || !this.bindings) return 0;
+    if (this.leases.orphans().length === 0) return 0;
+    // one reclaimer at a time, so two sessions never unmount the same path twice
+    return this.bindings.withProjectLock("_mounts", () => this.reclaimOrphanMountsLocked(), 15_000);
+  }
+
+  private async reclaimOrphanMountsLocked(): Promise<number> {
+    let n = 0;
+    const clients = new Map<string, any>();
+    for (const lease of this.leases.orphans()) {
+      // re-check right before acting: another session may have reclaimed it meanwhile
+      if (!isOrphan(this.leases.read(lease.path))) continue;
+      let lfs = lease.project === this.projectRecord?.name ? this.lfs : clients.get(lease.project);
+      if (!lfs) {
+        const record = this.bindings.byName(lease.project);
+        if (!record) { this.leases.remove(lease.path, lease.pid); continue; }
+        lfs = (await createProjectClient(this.spec, record)).lfs;
+        clients.set(lease.project, lfs);
+      }
+      this.log(`reclaiming Workspace ${lease.path} left by exited process ${lease.pid}`);
+      await this.releaseWorkspace({ sandbox: lease.sandbox, path: lease.path }, lease.wsReal, true, lease.pid, lfs);
+      n++;
+    }
+    for (const c of clients.values()) { try { await c.close?.(); } catch {} }
+    return n;
+  }
+
   /** Mounts `branch`, runs `fn`, optionally commits, reaps holders of `ws.path`, and unmounts immediately. */
   private async withMountedBranch<T>(
     branch: string,
@@ -1326,8 +1408,7 @@ export class LayerfsSession {
     message: string,
     fn: (wsPath: string, ws: Workspace) => Promise<T>,
   ): Promise<T> {
-    const ws = await this.lfs.workspace.mount(branch);
-    const wsPath = await fsp.realpath(ws.path).catch(() => ws.path);
+    const { ws, wsReal: wsPath } = await this.mountWorkspace(branch);
     let keepMounted = false;
     try {
       const value = await fn(wsPath, ws);
@@ -1348,10 +1429,7 @@ export class LayerfsSession {
       }
       throw e;
     } finally {
-      if (!keepMounted) {
-        await this.reapHolders(wsPath).catch(() => {});
-        await this.lfs.workspace.unmount(ws, !commitAfter).catch(() => {});
-      }
+      if (!keepMounted) await this.releaseWorkspace(ws, wsPath, !commitAfter);
     }
   }
 
@@ -1387,63 +1465,44 @@ export class LayerfsSession {
   ): Promise<{ exitCode: number | null }> {
     if (options.signal?.aborted) throw new Error("aborted");
 
-    const ws = await this.lfs.workspace.mount(this.workBranch);
-    const wsReal = await fsp.realpath(ws.path).catch(() => ws.path);
-
-    if (this.touchPathsOnNextExec.size > 0 || this.mergedFileMtimes.size > 0) {
-      const nowMs = Date.now();
-      for (const p of this.touchPathsOnNextExec) {
-        if (!this.mergedFileMtimes.has(p)) this.mergedFileMtimes.set(p, nowMs);
-      }
-      this.touchPathsOnNextExec.clear();
-      for (const [p, mergedAt] of this.mergedFileMtimes.entries()) {
-        const full = join(wsReal, p);
-        try {
-          await this.assertInsideWs(wsReal, full, true);
-          const st = await fsp.lstat(full).catch(() => null);
-          if (st && st.mtimeMs < mergedAt && typeof fsp.lutimes === "function") {
-            const d = new Date(mergedAt);
-            await fsp.lutimes(full, d, d).catch(() => {});
-          }
-        } catch {}
-      }
-    }
-
-    await this.prepareNativeGit(wsReal);
-
-    const scratchDir = join(this.config.root, "scratch");
-    const branchScratchDir = join(scratchDir, this.projectRecord.name, "branches", this.logicalBranch);
-    const sharedCacheDir = join(scratchDir, this.projectRecord.name, "shared");
-    const relCwd = this.toRel(hostCwd);
-    const runCwd = relCwd ? join(wsReal, relCwd) : wsReal;
-    const lwwContent = LWW_DEFAULT + this.config.branchOnly.map((p) => `${p}\n`).join("");
-
+    const { ws, wsReal } = await this.mountWorkspace(this.workBranch);
+    // Everything after the mount sits inside this try, so a throw anywhere still releases the Workspace.
     let keepMounted = false;
-    let code: number | null = null;
     let execErr: unknown = null;
     try {
-      const res = await this.driver.execInWorkspace({
-        ws,
-        wsReal,
-        hostCwd: this.cwd,
-        runCwd,
-        scratchDir,
-        branchScratchDir,
-        sharedCacheDir,
-        config: this.config,
-        projectName: this.projectRecord.name,
-        logicalBranch: this.logicalBranch,
-        outsideSecrets: OUTSIDE_SECRET_PATTERNS,
-        lwwContent,
-        command,
-        options,
-      });
-      code = res.exitCode;
-    } catch (e) {
-      execErr = e;
-    }
+      await this.restoreMergedMtimes(wsReal);
+      await this.prepareNativeGit(wsReal);
 
-    try {
+      const scratchDir = join(this.config.root, "scratch");
+      const branchScratchDir = join(scratchDir, this.projectRecord.name, "branches", this.logicalBranch);
+      const sharedCacheDir = join(scratchDir, this.projectRecord.name, "shared");
+      const relCwd = this.toRel(hostCwd);
+      const runCwd = relCwd ? join(wsReal, relCwd) : wsReal;
+      const lwwContent = LWW_DEFAULT + this.config.branchOnly.map((p) => `${p}\n`).join("");
+
+      let code: number | null = null;
+      try {
+        const res = await this.driver.execInWorkspace({
+          ws,
+          wsReal,
+          hostCwd: this.cwd,
+          runCwd,
+          scratchDir,
+          branchScratchDir,
+          sharedCacheDir,
+          config: this.config,
+          projectName: this.projectRecord.name,
+          logicalBranch: this.logicalBranch,
+          outsideSecrets: OUTSIDE_SECRET_PATTERNS,
+          lwwContent,
+          command,
+          options,
+        });
+        code = res.exitCode;
+      } catch (e) {
+        execErr = e;
+      }
+
       const msg = `pi bash (exit ${code ?? "sig"}) [${this.pendingOrigins.join(",") || "bash"}]`.slice(0, 4000);
       try {
         const res = await this.lfs.workspace.commit(ws, msg);
@@ -1454,15 +1513,37 @@ export class LayerfsSession {
       }
       if (execErr) throw execErr;
       return { exitCode: code };
+    } catch (e) {
+      execErr ??= e;
+      throw e;
     } finally {
       if (!keepMounted) {
-        const u = (async () => {
-          await this.reapHolders(wsReal).catch(() => {});
-          await this.lfs.workspace.unmount(ws).catch(() => {});
-        })();
+        // after a Commit nothing in the Workspace is worth keeping; before one (setup failed) nothing was made yet
+        const u = this.releaseWorkspace(ws, wsReal, true);
         if (options.signal?.aborted || Boolean(execErr)) this.pendingUnmounts.add(u.finally(() => this.pendingUnmounts.delete(u)));
         else await u;
       }
+    }
+  }
+
+  /** Gives files brought in by a merge a fresh mtime, so build tools see them as changed. */
+  private async restoreMergedMtimes(wsReal: string): Promise<void> {
+    if (this.touchPathsOnNextExec.size === 0 && this.mergedFileMtimes.size === 0) return;
+    const nowMs = Date.now();
+    for (const p of this.touchPathsOnNextExec) {
+      if (!this.mergedFileMtimes.has(p)) this.mergedFileMtimes.set(p, nowMs);
+    }
+    this.touchPathsOnNextExec.clear();
+    for (const [p, mergedAt] of this.mergedFileMtimes.entries()) {
+      const full = join(wsReal, p);
+      try {
+        await this.assertInsideWs(wsReal, full, true);
+        const st = await fsp.lstat(full).catch(() => null);
+        if (st && st.mtimeMs < mergedAt && typeof fsp.lutimes === "function") {
+          const d = new Date(mergedAt);
+          await fsp.lutimes(full, d, d).catch(() => {});
+        }
+      } catch {}
     }
   }
 
@@ -1652,8 +1733,8 @@ export class LayerfsSession {
       if (held) {
         try {
           const res = await this.lfs.workspace.commit(held, `retry [${this.pendingOrigins.join(",") || "retry"}]`);
-          await this.lfs.workspace.unmount(held, false);
           this.blocked = null;
+          await this.releaseWorkspace(held, this.mounts.get(held.path)?.wsReal ?? held.path, true);
           this.lastStoreCommit = { kind: res.kind, head: res.commit?.id ?? res.head ?? null };
           return await this.finalizeCheckpoint("retry");
         } catch (e: any) {
@@ -1951,8 +2032,13 @@ export class LayerfsSession {
     this.closed = true;
     await Promise.allSettled([...this.activeSids.values()].map((k) => k()));
     await Promise.allSettled([...this.pendingUnmounts]);
-    if (this.blocked?.heldWs) {
-      await this.lfs?.workspace.unmount(this.blocked.heldWs, true).catch(() => {});
+    if (this.blocked?.heldWs && !this.mounts.has(this.blocked.heldWs.path)) {
+      this.mounts.set(this.blocked.heldWs.path, { ws: this.blocked.heldWs, wsReal: this.blocked.heldWs.path });
+    }
+    // every Workspace still mounted (a held checkpoint, one dropped by /tree, an interrupted call)
+    if (this.lfs) {
+      await Promise.allSettled([...this.mounts.values()].map(({ ws, wsReal }) => this.releaseWorkspace(ws, wsReal, true)));
+      await this.reclaimOrphanMounts().catch(() => {});
     }
     this.persistSessionBinding();
     try { await this.lfs?.close?.(); } catch {}
@@ -2272,6 +2358,22 @@ function runLocal(cmd: string, args: string[]): Promise<{ code: number | null; s
     child.on("error", (e) => resolveRun({ code: -1, stderr: e.message }));
     child.on("close", (code) => resolveRun({ code, stderr }));
   });
+}
+
+/** True if `path` (any spelling) is a mount point in the OS mount table. */
+async function isMountPoint(path: string): Promise<boolean> {
+  const r = await run("/sbin/mount", [], { timeoutMs: 5000 }).catch(() => null);
+  if (!r?.stdout) return false;
+  const table = r.stdout.toString();
+  return bothSpellings(path).some((p) => table.includes(` on ${p} (`));
+}
+
+/** Last resort when LayerFS cannot end a Workspace: remove its NFS mount from the OS mount table. */
+async function forceUnmount(wsReal: string): Promise<void> {
+  for (const p of bothSpellings(wsReal)) {
+    if (!(await isMountPoint(p))) continue;
+    await run("/sbin/umount", ["-f", p], { timeoutMs: 10_000 }).catch(() => null);
+  }
 }
 
 export async function stopNativeDaemons(localDir?: string): Promise<void> {

@@ -23,7 +23,7 @@ function readOwner(lockDir: string): Owner | null {
   try { return JSON.parse(readFileSync(join(lockDir, "owner.json"), "utf8")); } catch { return null; }
 }
 
-function alive(pid: number): boolean {
+export function alive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; }
 }
 
