@@ -490,7 +490,11 @@ export class LayerfsSession {
    */
   async restartFromMain(): Promise<boolean> {
     const job = this.mutex.then(async () => {
-      if (this.unapplied || this.blocked) return false;
+      if (this.blocked) return false;
+      // "unapplied" can be stale: the same content reached the folder another way (git pull, a
+      // copy, an apply from another harness). Only real pending work keeps the old Branch.
+      if (this.unapplied && !(await this.pendingAlreadyOnHost())) return false;
+      this.unapplied = false;
       this.seq++;
       const base = `b-${this.shortId}-${this.seq}`;
       const work = `s-${this.shortId}-${this.seq}`;
@@ -1851,6 +1855,19 @@ export class LayerfsSession {
     const p = String(path ?? "").replace(/^\/+/, "");
     if (!p || p === ".lww") return false;
     return (this.config.branchOnly.length > 0 && isExcludedPath(p, this.config.branchOnly)) || this.ignore.isIgnored(p);
+  }
+
+  /** true when every applicable change on the Branch already has identical bytes in the host folder */
+  async pendingAlreadyOnHost(): Promise<boolean> {
+    for (const it of await this.diff()) {
+      if (it.type === "dir" || !this.isApplicable(it.path)) continue;
+      const rel = it.path.replace(/^\/+/, "");
+      const host = await fsp.readFile(join(this.cwd, rel)).catch(() => null);
+      if (it.kind === "Removed" || it.kind === "deleted") { if (host !== null) return false; continue; }
+      const mine = await this.readBytesAtRef(this.workBranch, it.path).catch(() => null);
+      if (host === null || mine === null || !host.equals(mine)) return false;
+    }
+    return true;
   }
 
   private async hasApplicable(): Promise<boolean> {

@@ -19,7 +19,8 @@ Object.assign(ws.LayerfsSession.prototype, {
     this.projectRecord = { name: "p", volume: "v" }; this.workBranch = "s-x-1"; this.baseBranch = "b-x-1"; this.baseRef = "r";
   },
   async syncHostDriftIntoMain() { return { synced }; },
-  async restartFromMain() { if (this.unapplied) return false; restarts++; this.workBranch = `s-x-${1 + restarts}`; return true; },
+  async restartFromMain() { if (this.unapplied && !this.staleUnapplied) return false; restarts++; this.workBranch = `s-x-${1 + restarts}`; return true; },
+  async pendingAlreadyOnHost() { return Boolean(this.staleUnapplied); },
   async mergeBranch() { return { merged: true, conflicts: [] }; },
   async close() { return { kept: true, notes: [] }; },
 });
@@ -53,6 +54,13 @@ try {
     live.unapplied = true;
     assert.match(await mode(e, ctx, { mode: "host", reason: "nested sandbox" }), /^Refused: the Branch s-x-1 has unapplied changes/);
   });
+  await step("a stale unapplied flag (folder already has the same bytes) does not block host mode", async () => {
+    live.staleUnapplied = true;
+    assert.match(await mode(e, ctx, { mode: "host" }), /^Now in host mode/);
+    assert.match(await mode(e, ctx, { mode: "branch" }), /fresh Branch s-x-2 from main/);
+    live.staleUnapplied = false; live.workBranch = "s-x-1"; restarts = 0; live.unapplied = true;
+  });
+
   await step("discard=true switches; read/write act on the real folder; the switch is recorded", async () => {
     assert.match(await mode(e, ctx, { mode: "host", reason: "nested sandbox", discard: true }), /^Now in host mode \(nested sandbox\).*Unapplied changes stay on s-x-1/);
     assert.match(T(await e.tools.read.execute("r", { path: join(dir, "a.txt") }, undefined, undefined, ctx)), /host-original/);

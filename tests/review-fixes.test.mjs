@@ -727,6 +727,23 @@ try {
     assert.deepEqual((await s.syncHostDriftIntoMain()).synced, [], "ignored host edits are not synced");
   });
 
+  await step("mode switch: stale unapplied (folder got the same bytes, e.g. git pull) does not block host mode; back to branch includes host edits", async () => {
+    const { switchMode } = await import("../src/core/mode.ts");
+    const cwd = project();
+    const s = await open(cwd, "stale");
+    await s.mutate("w", "write", () => s.writeFile(join(cwd, "a.txt"), "v2\n"));
+    assert.equal(await s.pendingAlreadyOnHost(), false, "real pending work is detected");
+    assert.match((await switchMode(s, "branch", "host")).message, /^Refused/);
+    writeFileSync(join(cwd, "a.txt"), "v2\n"); // the same bytes reach the folder another way
+    assert.equal(await s.pendingAlreadyOnHost(), true);
+    assert.match((await switchMode(s, "branch", "host")).message, /^Now in host mode/);
+    writeFileSync(join(cwd, "b.txt"), "host edit\n");
+    const back = await switchMode(s, "host", "branch");
+    assert.match(back.message, /fresh Branch .* from main/, back.message);
+    assert.equal((await s.readFile(join(cwd, "b.txt"))).toString(), "host edit\n");
+    assert.equal(s.unapplied, false);
+  });
+
   await step("too-large first import is refused before copying, naming the largest folders", async () => {
     const cwd = project();
     mkdirSync(join(cwd, "big"));

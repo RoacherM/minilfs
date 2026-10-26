@@ -70,7 +70,8 @@ export async function switchMode(
     return { ok: true, mode: current, message: `Already in ${current} mode.` };
   }
   if (target === "host") {
-    if (session && session.unapplied && !options.discard) {
+    // a stale "unapplied" (the folder already has the same bytes, e.g. after git pull) is no reason to refuse
+    if (session && session.unapplied && !options.discard && !(await session.pendingAlreadyOnHost().catch(() => false))) {
       return {
         ok: false, mode: current,
         message: `Refused: the Branch ${session.workBranch} has unapplied changes. Host work would start without them and the two would diverge. ` +
