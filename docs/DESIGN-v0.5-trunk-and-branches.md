@@ -190,7 +190,7 @@ bash { command: "git commit -am 'x' && git push", elevated: true, reason: "commi
 | host policy 的 `bypass` 档（单条提权下等同 `auto`）；名字改为 elevate | 同上 |
 | `MINILFS_TEAM` 开关：主 agent 总有 `minilfs` 和 `minilfs_apply`，子 agent 总有 `minilfs`（无 apply） | `src/index.ts` |
 | `resolveBranchName` 的模糊猜测（保留精确解析，§4.1） | `src/workspace.ts` |
-| DSH 补丁里的 `workspace_mode` 部分 | `docs/patches/` |
+| DSH 补丁 `docs/patches/`（已删除：改动已直接进 DSH 插件） | — |
 
 ### 6.2 保留
 
