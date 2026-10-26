@@ -1,0 +1,89 @@
+diff --git a/minilfs-plugin/index.js b/minilfs-plugin/index.js
+--- a/minilfs-plugin/index.js	2026-10-26 09:59:44
++++ b/minilfs-plugin/index.js	2026-10-26 10:00:04
+@@ -59,6 +59,12 @@
+   branchOnly: Schema.string().default(''),
+   /** Extra environment variable names forwarded into `bash`. */
+   envAllow: Schema.string().default(''),
++  /**
++   * Who may move an Agent to host mode (the real folder, no Branch): `ask` asks the user through
++   * DSH's approval service on each switch; `auto` lets the Agent switch; `bypass` starts every
++   * Agent in host mode; `never` keeps Agents on their Branch. Empty: MINILFS_HOST_POLICY, else ask.
++   */
++  hostPolicy: Schema.union(['', 'ask', 'auto', 'bypass', 'never']).default(''),
+ })
+ 
+ /**
+@@ -115,11 +121,12 @@
+    * @type {Map<string, { session: any, opening: Promise<any> | null, summary: string, mode: 'branch' | 'host', host: any }>}
+    */
+   const agents = new Map()
++  const policy = core.hostPolicy?.(env, config.hostPolicy) ?? 'ask'
+   const keyOf = exec => String(exec?.agent?.id ?? exec?.agent?.session?.id ?? `dsh-${process.pid}`)
+   const slot = (key) => {
+     let entry = agents.get(key)
+     if (entry === undefined) {
+-      entry = { session: null, opening: null, summary: '', mode: core.initialMode?.(env) ?? 'branch', host: null }
++      entry = { session: null, opening: null, summary: '', mode: policy === 'bypass' ? 'host' : (core.initialMode?.(env) ?? 'branch'), host: null }
+       agents.set(key, entry)
+     }
+     return entry
+@@ -188,6 +195,25 @@
+     const entry = slot(key)
+     if (target === 'status') {
+       return entry.mode === 'host' ? `host mode: tools act on ${(await hostFor(exec, entry)).cwd} directly.` : `branch mode${entry.session ? ` on ${entry.session.workBranch}` : ''}.`
++    }
++    if (target === 'host' && entry.mode !== 'host') {
++      if (policy === 'never') return 'Refused: the host policy is "never"; you cannot leave the Branch. Tell the user if a step cannot work here.'
++      if (policy === 'ask') {
++        // DSH's approval service (ctx.approval): fails closed when no answerer is composed (headless)
++        const approval = ctx.get('approval')
++        const outcome = approval && exec?.agent
++          ? await approval.request({
++            agent: exec.agent, toolName: 'workspace_mode', callId: exec.callId, signal: exec.signal,
++            reason: `Switch to host mode: ${reason || 'no reason given'}`,
++            displayReason: `Let the agent work directly on your folder (no isolation): ${reason || 'no reason given'}`,
++          }).catch(() => 'unavailable')
++          : 'unavailable'
++        if (outcome !== 'allowed-once') {
++          return outcome === 'rejected' || outcome === 'cancelled'
++            ? 'The user declined host mode. Stay on the Branch, or ask the user what to do.'
++            : 'Refused: switching to host mode needs the user\'s approval and none is available here (headless). Set hostPolicy: auto to allow it.'
++        }
++      }
+     }
+     let session = entry.session
+     let startError = null
+diff --git a/minilfs-plugin/test/plugin.test.mjs b/minilfs-plugin/test/plugin.test.mjs
+--- a/minilfs-plugin/test/plugin.test.mjs	2026-10-26 09:59:44
++++ b/minilfs-plugin/test/plugin.test.mjs	2026-10-26 10:00:04
+@@ -221,7 +221,14 @@
+   })
+ 
+   it('switches one Agent between its branch and the host folder', async () => {
+-    const { tools, project, exec } = await setup()
++    // setup() mounts with the default policy (ask) and this fake context has no approval service,
++    // so an ask would be refused: mount a second instance with hostPolicy: auto on the same project.
++    const { project, exec, store } = await setup()
++    const fake = fakeContext()
++    fake.ctx.cwd = project
++    contexts.push(fake)
++    await apply(fake.ctx, { corePath: CORE, root: store, branch: '', team: true, network: 'deny', excludes: '', branchOnly: '', envAllow: '', hostPolicy: 'auto' })
++    const tools = fake.tools
+     const mode = async p => (await tools.get('workspace_mode').execute(p, exec)).text
+     await tools.get('write').execute({ file_path: join(project, 'b.txt'), content: 'on branch\n' }, exec)
+     assert.match(await mode({ mode: 'host' }), /^Refused: .*unapplied/u, 'unapplied branch work blocks host mode')
+@@ -232,6 +239,13 @@
+     assert.match(await mode({ mode: 'branch' }), /^Back in branch mode .*host edit/u)
+     const seen = await tools.get('read').execute({ file_path: 'h.txt' }, exec)
+     assert.equal(seen.lines[0].text, 'on host', 'the branch continues from the host edits')
++  })
++
++  it('asks before host mode by default and refuses when no approval is available', async () => {
++    const { tools, exec } = await setup()
++    const text = (await tools.get('workspace_mode').execute({ mode: 'host', reason: 'git push' }, exec)).text
++    assert.match(text, /^Refused: .*approval/u, 'headless ask fails closed')
++    assert.match((await tools.get('workspace_mode').execute({ mode: 'status' }, exec)).text, /^branch mode/u)
+   })
+ 
+   it('reports a sandbox denial instead of writing outside the workspace', async () => {

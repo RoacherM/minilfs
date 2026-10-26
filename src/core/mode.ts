@@ -42,6 +42,20 @@ export function initialMode(env: NodeJS.ProcessEnv = process.env): WorkspaceMode
 }
 
 /**
+ * Who may move an agent to host mode (the user can always switch with /minilfs mode).
+ *   ask     (default) the agent asks; the user confirms each switch. Without a UI it is refused.
+ *   auto    the agent switches on its own when it judges the Branch cannot do the job.
+ *   bypass  every session starts in host mode and the agent switches freely ("bypass permissions").
+ *   never   the agent cannot leave the Branch.
+ */
+export type HostPolicy = "ask" | "auto" | "bypass" | "never";
+
+export function hostPolicy(env: NodeJS.ProcessEnv = process.env, flag?: unknown): HostPolicy {
+  const v = String(flag || env.MINILFS_HOST_POLICY || "ask").toLowerCase();
+  return v === "auto" || v === "bypass" || v === "never" ? v : "ask";
+}
+
+/**
  * Validates and performs a switch. `session` is null when minilfs did not start; then only host
  * mode is possible and switching to branch reports why.
  */

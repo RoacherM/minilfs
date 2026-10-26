@@ -18,7 +18,9 @@ import {
   executeLayerfsApply,
   formatHistory,
   hiddenPath,
+  hostPolicy,
   initialMode,
+  type HostPolicy,
   MODE_TOOL_DESCRIPTION,
   MODE_TOOL_NAME,
   MODE_TOOL_SCHEMA,
@@ -41,6 +43,7 @@ const boot0 = () => resolveConfig();
 
 export default function minilfsExtension(pi: ExtensionAPI) {
   pi.registerFlag("no-minilfs", { description: "Disable minilfs isolation for this run (tools act on the host folder)", type: "boolean", default: false });
+  pi.registerFlag("minilfs-host", { description: "Who may switch the agent to host mode: ask (default) | auto | bypass (start in host mode) | never", type: "string", default: "" });
 
   let session: LayerfsSession | null = null;
   let ready: Promise<LayerfsSession> | null = null;
@@ -51,6 +54,8 @@ export default function minilfsExtension(pi: ExtensionAPI) {
    * or the user switches; tools read this on every call, so a switch takes effect immediately.
    */
   let mode: WorkspaceMode = initialMode();
+  /** set at session start from --minilfs-host / MINILFS_HOST_POLICY; /minilfs policy changes it */
+  let policy: HostPolicy = hostPolicy();
   let lastCtx: ExtensionContext | undefined;
   const onHostNow = () => disabled || mode === "host";
   let startError: Error | null = null;
@@ -183,11 +188,22 @@ export default function minilfsExtension(pi: ExtensionAPI) {
   // ------------------------------------------------------------- workspace mode (branch | host)
 
   /** Switches mode for the agent tool and /minilfs mode; shows the result to the user. */
-  async function changeMode(target: "branch" | "host" | "status", reason: string | undefined, discard: boolean, ctx: ExtensionContext | undefined) {
+  async function changeMode(target: "branch" | "host" | "status", reason: string | undefined, discard: boolean, ctx: ExtensionContext | undefined, byUser = false) {
     if (target === "status") {
-      return mode === "host"
+      const where = mode === "host"
         ? `host mode: tools act on ${hostCwd} directly.`
         : `branch mode${session?.workBranch ? ` on ${session.workBranch}` : ""}: tools act on the isolated Branch.`;
+      return `${where} Host policy: ${policy}.`;
+    }
+    if (target === "host" && mode !== "host" && !byUser) {
+      if (policy === "never") return "Refused: the host policy is \"never\"; the agent cannot leave the Branch. The user can switch with /minilfs mode host or /minilfs policy.";
+      if (policy === "ask") {
+        const c = ctx ?? lastCtx;
+        if (!c?.hasUI) return "Refused: switching to host mode needs the user's approval and there is no UI. Start with --minilfs-host auto, or have the user run /minilfs mode host.";
+        const ok = await c.ui.confirm("Let the agent work on your real folder (host mode)?",
+          `${reason || "no reason given"}\n\nFile tools and bash will act directly on ${hostCwd}, without isolation, until the agent switches back.\nTo stop being asked: /minilfs policy auto`);
+        if (!ok) return "The user declined host mode. Stay on the Branch, or ask the user what to do.";
+      }
     }
     let s: LayerfsSession | null = null;
     // To host: do not wait behind a start still in progress (e.g. a long first import); use the
@@ -198,7 +214,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     if (r.ok && r.mode !== mode) {
       mode = r.mode;
       if (s) recordSession(s);
-      pi.appendEntry(MODE_ENTRY, { mode, reason: reason ?? "", at: Date.now() });
+      pi.appendEntry(MODE_ENTRY, { mode, policy, reason: reason ?? "", at: Date.now() });
       const c = ctx ?? lastCtx;
       status(c, s ? describe(s) : mode === "host" ? "minilfs HOST mode · edits go to your folder" : undefined);
       if (c?.hasUI) c.ui.notify(`minilfs: ${r.message}`, mode === "host" ? "warning" : "info");
@@ -214,7 +230,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       parameters: MODE_TOOL_SCHEMA as any,
       async execute(_id: string, params: any, _signal: any, _onUpdate: any, ctx: ExtensionContext) {
         if (disabled) return { content: [{ type: "text" as const, text: "minilfs is off for this run: tools already act on the user's folder." }], details: undefined };
-        const text = await changeMode(params.mode, params.reason, Boolean(params.discard), ctx);
+        const text = await changeMode(params.mode, params.reason, Boolean(params.discard), ctx, false);
         return { content: [{ type: "text" as const, text }], details: undefined };
       },
     } as any);
@@ -337,7 +353,8 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     lastCtx = ctx;
     const branchEntries = ctx.sessionManager.getBranch();
     const lastMode = [...branchEntries].reverse().find((e: any) => e.type === "custom" && e.customType === MODE_ENTRY) as any;
-    mode = lastMode?.data?.mode === "host" ? "host" : initialMode();
+    policy = lastMode?.data?.policy ?? hostPolicy(process.env, pi.getFlag("minilfs-host"));
+    mode = lastMode?.data?.mode === "host" || (!lastMode && policy === "bypass") ? "host" : initialMode();
     const branchInfo = inspectBranchEntries(branchEntries);
     const forkRef = event.reason === "fork" ? (pendingForkRef ?? branchInfo.headCommit ?? branchInfo.baseRef ?? null) : null;
     pendingForkRef = null;
@@ -416,7 +433,9 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     const note = [
       "",
       "File tools and bash run on an isolated minilfs Branch of this project.",
-      "If a step cannot work on the Branch (nested sandbox, mounts, setuid/privileged tools, a long-running dev server, testing minilfs itself), switch with workspace_mode mode=host, then back to mode=branch.",
+      policy === "never"
+        ? "You cannot leave the Branch (host policy: never). If a step cannot work here, tell the user."
+        : `If a step cannot work on the Branch (nested sandbox, mounts, setuid/privileged tools, git operations on the user's repo, a long-running dev server, testing minilfs itself), switch with workspace_mode mode=host, then back to mode=branch.${policy === "ask" ? " The user approves each switch to host." : ""}`,
       `Paths under ${session?.cwd ?? "the working directory"} refer to that Branch; edits there do NOT reach the user's folder until the user runs /minilfs apply.`,
       "Files outside the working directory are read-only. Secret files such as .env are not imported.",
       "Each bash call runs in its own sandbox: background processes (`cmd &`, dev servers) end when that call ends. Start and use a server within one bash call.",
@@ -442,10 +461,11 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     ["retry", "checkpoint 失败被锁住后重试；启动失败（如目录太大）后重新启动"],
     ["clean", "清理本项目的 scratch 构建缓存目录"],
     ["mode", "切换工作位置：mode branch（隔离分支，默认）| mode host（直接在你的目录）| mode（查看）"],
+    ["policy", "agent 能否自己切到 host：ask（默认，每次问你）| auto（自己切）| bypass（直接在 host 工作）| never"],
   ];
 
   pi.registerCommand("minilfs", {
-    description: "minilfs workspace: status | diff | history | apply | merge | retry | sync | branches | clean | mode",
+    description: "minilfs workspace: status | diff | history | apply | merge | retry | sync | branches | clean | mode | policy",
     getArgumentCompletions: (prefix: string) => {
       const typed = prefix.trim();
       if (SUBCOMMANDS.some(([n]) => n === typed || typed.startsWith(`${n} `))) return null;
@@ -460,7 +480,16 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       if (sub === "mode") {
         const target = (argv[1] ?? "status") as any;
         if (!["branch", "host", "status"].includes(target)) return say("用法：/minilfs mode [branch|host] [--discard]", "warning");
-        return say(await changeMode(target, "user command", argv.includes("--discard"), ctx));
+        return say(await changeMode(target, "user command", argv.includes("--discard"), ctx, true));
+      }
+      if (sub === "policy") {
+        const v = argv[1];
+        if (!v) return say(`Host policy: ${policy} (ask | auto | bypass | never).`);
+        if (!["ask", "auto", "bypass", "never"].includes(v)) return say("用法：/minilfs policy ask|auto|bypass|never", "warning");
+        policy = v as HostPolicy;
+        pi.appendEntry(MODE_ENTRY, { mode, policy, reason: "policy change", at: Date.now() });
+        if (policy === "bypass" && mode !== "host") return say(`Host policy: bypass. ${await changeMode("host", "bypass permissions", argv.includes("--discard"), ctx, true)}`);
+        return say(`Host policy: ${policy}.`);
       }
       if (sub === "retry" && startError && restart) {
         say("Restarting minilfs…");

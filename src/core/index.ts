@@ -93,11 +93,13 @@ export {
 } from "./tools.ts";
 
 export {
+  hostPolicy,
   initialMode,
   MODE_TOOL_DESCRIPTION,
   MODE_TOOL_NAME,
   MODE_TOOL_SCHEMA,
   switchMode,
+  type HostPolicy,
   type ModeSwitchResult,
   type WorkspaceMode,
 } from "./mode.ts";

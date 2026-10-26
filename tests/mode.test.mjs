@@ -36,7 +36,8 @@ const mk = () => {
     appendEntry: (t, d) => entries.push({ type: "custom", customType: t, data: d }), events: { emit() {} } });
   return { h, c, tools, entries };
 };
-const ctxOf = (branch = []) => ({ cwd: dir, hasUI: true, ui: { notify() {}, setStatus() {} }, sessionManager: { getBranch: () => branch, getSessionId: () => "sid" } });
+// the user approves every host switch in these scenarios (default policy "ask")
+const ctxOf = (branch = []) => ({ cwd: dir, hasUI: true, ui: { notify() {}, setStatus() {}, confirm: async () => true }, sessionManager: { getBranch: () => branch, getSessionId: () => "sid" } });
 const T = (r) => r.content.map((x) => x.text).join("");
 const mode = (e, ctx, p) => e.tools.workspace_mode.execute("x", p, null, null, ctx).then(T);
 const settle = () => new Promise((r) => setTimeout(r, 20));
@@ -87,6 +88,30 @@ try {
     assert.match(await mode(e3, ctx3, { mode: "branch" }), /^Cannot switch to branch mode: minilfs is not running \(folder too large\)/);
     failOpen = false;
   });
+  await step("host policy: ask confirms (yes/no/no UI), auto switches, bypass starts on host, never refuses; the user can always switch", async () => {
+    const run = async (flag, answer, hasUI = true) => {
+      const h = {}, c = {}, tools = {}, asked = [];
+      ext({ registerFlag() {}, registerTool: (t) => (tools[t.name] = t), getFlag: (n) => (n === "minilfs-host" ? flag : false), on: (n, f) => (h[n] = f),
+        registerCommand: (n, x) => (c[n] = x), appendEntry() {}, events: { emit() {} } });
+      const pctx = { cwd: dir, hasUI, ui: { notify() {}, setStatus() {}, confirm: async () => { asked.push(1); return answer; } }, sessionManager: { getBranch: () => [], getSessionId: () => "p" } };
+      await h.session_start({ reason: "startup" }, pctx); await settle();
+      const st = await mode({ tools }, pctx, { mode: "status" });
+      const sw = await mode({ tools }, pctx, { mode: "host", reason: "git push" });
+      return { st, sw, asked, c, pctx };
+    };
+    live = null;
+    let r = await run("", true); assert.match(r.st, /Host policy: ask/); assert.equal(r.asked.length, 1); assert.match(r.sw, /^Now in host mode/);
+    r = await run("", false); assert.match(r.sw, /^The user declined/);
+    r = await run("", true, false); assert.match(r.sw, /^Refused: .*no UI/);
+    r = await run("auto", false); assert.equal(r.asked.length, 0); assert.match(r.sw, /^Now in host mode/);
+    r = await run("bypass", false); assert.match(r.st, /^host mode.*bypass/); assert.match(r.sw, /^Already in host mode/);
+    r = await run("never", true); assert.match(r.sw, /^Refused: the host policy is "never"/);
+    const out = []; const uctx = { ...r.pctx, ui: { ...r.pctx.ui, notify: (m) => out.push(m) } };
+    await r.c.minilfs.handler("mode host", uctx); assert.match(out.at(-1), /^Now in host mode/, "user override under never");
+    await r.c.minilfs.handler("mode branch", uctx);
+    await r.c.minilfs.handler("policy bypass", uctx); assert.match(out.at(-1), /^Host policy: bypass\. Now in host mode/);
+  });
+
   await step("paths in any macOS spelling of the project root map into the Branch (/var vs /private/var, /tmp)", async () => {
     const { LayerfsSession, resolveConfig } = await import("../src/core/index.ts");
     const real = "/private/var/folders/ct/xx/T/dsh-minilfs-test-c86npk/project";
