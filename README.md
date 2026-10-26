@@ -1,5 +1,7 @@
 # minilfs (`RoacherM/minilfs`)
 
+> **One-sentence summary:** `minilfs` is a copy-on-write worktree and OS sandbox for coding agents: every agent edits and runs commands on its own isolated LayerFS branch (with per-step checkpoints and multi-agent branch `merge`), while the real project folder stays untouched until `apply` writes changes back with a three-way check.
+
 **minilfs** (`@roacherm/minilfs`) is a **100% Native, Zero-Docker** [LayerFS](https://github.com/Ephemeral-AI-Lab/layerfs) workspace runtime, [Pi](https://pi.dev) / [Epi](https://github.com/RoacherM/epi) extension, universal CLI / MCP server, and pluggable distributed execution engine.
 
 It isolates coding agents' file operations and shell commands on copy-on-write LayerFS branches, guarded at the OS kernel level by a Claude Code (`@anthropic-ai/sandbox-runtime` / `srt`)-inspired macOS Seatbelt (`sandbox-exec`) sandbox — while providing a clean `ExecutionDriver` seam to route workloads to remote or distributed Sandboxes without changing a single upper-layer call.
