@@ -706,7 +706,8 @@ try {
     writeFileSync(join(cwd, "forced.log"), "tracked\n");
     writeFileSync(join(cwd, ".env.example"), "API_KEY=\n");
     writeFileSync(join(cwd, ".env"), "API_KEY=secret\n");
-    git("init", "-q"); git("add", "-A"); git("add", "-f", "forced.log"); git("commit", "-qm", "i");
+    // .minilfsignore is not a git ignore file: keep data/ untracked (a tracked file is always imported)
+    git("init", "-q"); git("add", "-A", "--", ".", ":!data"); git("add", "-f", "forced.log"); git("commit", "-qm", "i");
     const s = await open(cwd, "ig");
     for (const p of ["runs/r1/big.bin", "data/set.csv", "debug.log", ".env"]) assert.equal(await s.exists(join(cwd, p)), false, `${p} not imported`);
     for (const p of ["keep.log", "forced.log", ".env.example", ".gitignore", "src/app.js"]) assert.equal(await s.exists(join(cwd, p)), true, `${p} imported`);
