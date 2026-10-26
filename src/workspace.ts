@@ -1909,14 +1909,6 @@ export class LayerfsSession {
       const snapBranch = `a-${this.shortId}-${this.seq}`;
       await this.lfs.branch.fork(snapBranch, snapRef);
 
-      if (!options.allowRevert && !(await this.snapshotContainsBase(snapBranch))) {
-        throw new LayerfsError("WouldRevert", "this Branch may lack files that are already in your folder (it went back with /tree or /fork, or the folder moved on); applying could revert them, so nothing was written. Run the minilfs tool with action=sync (it merges the folder's state into the Branch and keeps your edits), then apply again. To revert the folder on purpose: /minilfs apply --revert.");
-      }
-      // name the next base now: a taken name must fail before the folder is touched, not after
-      this.seq++;
-      const nextBase = `b-${this.shortId}-${this.seq}`;
-      const fb = await this.lfs.branch.fork(nextBase, snapRef);
-
       const items: Array<{ path: string; kind: string; type: string }> = [];
       for (let pos = 0; ; ) {
         const page = await this.lfs.branch.diff_branches(this.baseBranch, snapBranch, 1000, pos, { hunks: false });
@@ -1928,6 +1920,14 @@ export class LayerfsSession {
         if (!page.hasMore || !(page.items ?? []).length) break;
         pos = page.nextPagePos ?? (pos + page.items.length);
       }
+      // nothing to write cannot revert anything: check only when apply would change the folder
+      if (!options.allowRevert && (await this.changesBytes(items, snapBranch)) && !(await this.snapshotContainsBase(snapBranch))) {
+        throw new LayerfsError("WouldRevert", "this Branch may lack files that are already in your folder (it went back with /tree or /fork, or the folder moved on); applying could revert them, so nothing was written. Run the minilfs tool with action=sync (it merges the folder's state into the Branch and keeps your edits), then apply again. To revert the folder on purpose: /minilfs apply --revert.");
+      }
+      // name the next base now: a taken name must fail before the folder is touched, not after
+      this.seq++;
+      const nextBase = `b-${this.shortId}-${this.seq}`;
+      const fb = await this.lfs.branch.fork(nextBase, snapRef);
       if (!items.length && !this.config.branchOnly.length && !this.ignore.active) {
         this.unapplied = false;
         this.persistSessionBinding();
@@ -2142,13 +2142,21 @@ export class LayerfsSession {
   }
 
   private async hasApplicable(): Promise<boolean> {
-    const d = (await this.diff()).filter((i) => i.type !== "dir" && this.isApplicable(i.path));
-    for (const i of d) {
-      // a merge that rewrites a file reports it "Modified" with identical bytes (new inode): not real work
+    return this.changesBytes(await this.diff(), this.workBranch);
+  }
+
+  /**
+   * true when some applicable path of `items` (a base..`branch` diff) differs in bytes. A merge that
+   * rewrites a file reports it "Modified" with identical bytes (new inode): not a change.
+   */
+  private async changesBytes(items: Array<{ path: string; kind: string; type: string }>, branch: string): Promise<boolean> {
+    for (const i of items) {
+      const rel = i.path.replace(/^\/+/, "");
+      if (i.type === "dir" || rel === ".lww" || !this.isApplicable(i.path)) continue;
       if (i.kind === "Modified") {
         const [a, b] = await Promise.all([
           this.readBytesAtRef(this.baseBranch, i.path).catch(() => null),
-          this.readBytesAtRef(this.workBranch, i.path).catch(() => null),
+          this.readBytesAtRef(branch, i.path).catch(() => null),
         ]);
         if (a && b && a.equals(b)) continue;
       }

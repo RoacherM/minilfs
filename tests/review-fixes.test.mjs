@@ -870,6 +870,19 @@ try {
     assert.equal(readFileSync(join(cwd, "peer.txt"), "utf8"), "p\n");
   });
 
+  await step("apply with nothing to write never reports WouldRevert, even with an unknown alignment", async () => {
+    const cwd = project();
+    const s = await open(cwd, "nw");
+    const before = s.effectiveRef;
+    await s.mutate("1", "write", () => s.writeFile(join(cwd, "n.txt"), "n\n"));
+    await s.apply();
+    await s.switchToRef(before); // a real rewind: the Branch lacks n.txt
+    await s.mutate("2", "write", () => s.writeFile(join(cwd, "n.txt"), "n\n")); // ...and puts it back as it is
+    s.alignedRef = null; // a session made by an older version
+    const r = await s.apply();
+    assert.deepEqual(r.applied, []);
+  });
+
   await step("/tree back before an apply still refuses to revert (WouldRevert kept for real rewinds)", async () => {
     const cwd = project();
     const s = await open(cwd, "tw");

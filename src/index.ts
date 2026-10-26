@@ -156,7 +156,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
   };
   const BLOCKED_HINT = "\n[minilfs] The sandbox blocked this. If the step must run on the real folder, retry with elevated: true and a reason.";
   // sandboxed git reads the folder's repository but may not write it (see LayerfsSession.attachHostGit)
-  const GIT_WRITE = /unable to index file|cannot lock ref|Cannot save the current index state|insufficient permission for adding an object|\.git\/[^\s']*': Operation not permitted|unable to create temporary file: Operation not permitted/;
+  const GIT_WRITE = /unable to index file|cannot lock ref|Cannot save the current index state|insufficient permission for adding an object|(?:\.git|\/branches\/[^\s'\/]+\/git)\/[^\s']*': Operation not permitted|unable to create temporary file: Operation not permitted/;
   const GIT_HINT = "\n[minilfs] In the sandbox git reads your folder's real repository but cannot change it: run git add, commit, reset, checkout/switch, stash, merge, rebase, pull and push with elevated: true. Apply (or the elevated command itself) writes the Branch's files first.";
 
   /** asks the user under the `ask` policy; true = run */
