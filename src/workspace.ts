@@ -481,6 +481,30 @@ export class LayerfsSession {
     this.unapplied = fromRef !== "main" ? (await this.diff()).filter((i) => i.type !== "dir").length > 0 : false;
   }
 
+  /**
+   * Starts a fresh base + work Branch from current main (after host-mode work was synced into main).
+   * Only when nothing is unapplied, so no Branch work is dropped; returns false otherwise.
+   */
+  async restartFromMain(): Promise<boolean> {
+    const job = this.mutex.then(async () => {
+      if (this.unapplied || this.blocked) return false;
+      this.seq++;
+      const base = `b-${this.shortId}-${this.seq}`;
+      const work = `s-${this.shortId}-${this.seq}`;
+      const fb = await this.lfs.branch.fork(base, "main");
+      const fw = await this.lfs.branch.fork(work, "main");
+      this.baseBranch = base;
+      this.workBranch = work;
+      this.baseRef = fb.head ?? fb.base;
+      this.headCommit = fw.head ?? null;
+      this.pendingOrigins = [];
+      this.persistSessionBinding();
+      return true;
+    });
+    this.mutex = job.catch(() => {});
+    return job;
+  }
+
   /** Switches `workBranch` to a historical Commit or Layer ref (for `/tree` and `/fork`). */
   async switchToRef(targetRef: string | null | undefined): Promise<{ branch: string; ref: string }> {
     const job = this.mutex.then(async () => {

@@ -1,6 +1,6 @@
 diff --git a/minilfs-plugin/index.js b/minilfs-plugin/index.js
 --- a/minilfs-plugin/index.js	2026-10-26 07:34:59
-+++ b/minilfs-plugin/index.js	2026-10-26 07:35:25
++++ b/minilfs-plugin/index.js	2026-10-26 09:22:17
 @@ -13,8 +13,9 @@
   * changes back to the branch. The host folder is written only by
   * `minilfs_apply`, which is three-way checked.
@@ -13,7 +13,7 @@ diff --git a/minilfs-plugin/index.js b/minilfs-plugin/index.js
   *
   * @module @local/dsh-minilfs
   */
-@@ -118,7 +119,23 @@
+@@ -118,7 +119,24 @@
      )
    }
  
@@ -23,14 +23,15 @@ diff --git a/minilfs-plugin/index.js b/minilfs-plugin/index.js
 +   * subagent joins that same mount (agent-preset-registry `composeFrom`), so closure state is
 +   * shared by the lead and all its children. Key everything on `exec.agent.id`: it is unique per
 +   * child and stable across resume (it is the child's session id).
-+   * @type {Map<string, { session: any, opening: Promise<any> | null, summary: string }>}
++   * `mode` is where this Agent's tools act: 'branch' (default, isolated) or 'host' (the real folder).
++   * @type {Map<string, { session: any, opening: Promise<any> | null, summary: string, mode: 'branch' | 'host', host: any }>}
 +   */
 +  const agents = new Map()
 +  const keyOf = exec => String(exec?.agent?.id ?? exec?.agent?.session?.id ?? `dsh-${process.pid}`)
 +  const slot = (key) => {
 +    let entry = agents.get(key)
 +    if (entry === undefined) {
-+      entry = { session: null, opening: null, summary: '' }
++      entry = { session: null, opening: null, summary: '', mode: core.initialMode?.(env) ?? 'branch', host: null }
 +      agents.set(key, entry)
 +    }
 +    return entry
@@ -38,7 +39,7 @@ diff --git a/minilfs-plugin/index.js b/minilfs-plugin/index.js
  
    /** The Agent's working directory; the session project is fixed from it. */
    const cwdFor = async (exec) => {
-@@ -131,48 +148,57 @@
+@@ -131,49 +149,89 @@
    }
  
    /**
@@ -74,6 +75,7 @@ diff --git a/minilfs-plugin/index.js b/minilfs-plugin/index.js
 -    state.opening = (async () => {
 +    const key = keyOf(exec)
 +    const entry = slot(key)
++    if (entry.mode === 'host') return hostFor(exec, entry)
 +    if (entry.session !== null) return entry.session
 +    if (entry.opening !== null) return entry.opening
 +    entry.opening = (async () => {
@@ -103,12 +105,43 @@ diff --git a/minilfs-plugin/index.js b/minilfs-plugin/index.js
 -  /** Refresh the model-facing facts after a call that changed the branch. */
 -  const touch = () => {
 -    state.summary = describeSession(state.session)
++  /** The Agent's host workspace (real folder, no Branch layer), created on first use. */
++  const hostFor = async (exec, entry) => {
++    if (entry.host === null) entry.host = new core.HostWorkspace(await cwdFor(exec), core.resolveConfig(env))
++    return entry.host
+   }
+ 
+-  const definitions = createTools({ core, ensureSession, cwdFor, touch })
++  /**
++   * Switch where one Agent's tools act. Branch -> host is refused while the Branch has unapplied
++   * work (unless discard); host -> branch brings host edits into the Branch (core.switchMode).
++   */
++  const changeMode = async (exec, target, reason, discard) => {
++    const key = keyOf(exec)
++    const entry = slot(key)
++    if (target === 'status') {
++      return entry.mode === 'host' ? `host mode: tools act on ${(await hostFor(exec, entry)).cwd} directly.` : `branch mode${entry.session ? ` on ${entry.session.workBranch}` : ''}.`
++    }
++    let session = entry.session
++    let startError = null
++    if (target === 'branch' && session === null) {
++      entry.mode = 'branch'
++      try { session = await ensureSession(exec) } catch (error) { startError = error?.message ?? String(error); entry.mode = 'host' }
++    }
++    const result = await core.switchMode(session, entry.mode, target, { reason, discard, startError })
++    if (result.ok) entry.mode = result.mode
++    entry.summary = entry.mode === 'host'
++      ? `HOST mode: file tools and bash act directly on ${(await hostFor(exec, entry)).cwd}, without isolation. Switch back with workspace_mode mode=branch when done.`
++      : describeSession(session)
++    return result.message
++  }
++
 +  /** Refresh the model-facing facts of the calling Agent after a call that changed its branch. */
 +  const touch = (exec) => {
 +    const entry = agents.get(keyOf(exec))
-+    if (entry?.session) entry.summary = describeSession(entry.session)
-   }
- 
++    if (entry?.session && entry.mode === 'branch') entry.summary = describeSession(entry.session)
++  }
++
 +  /** Close one Agent's session (child finished) and forget it. */
 +  const closeAgent = (key) => {
 +    const entry = agents.get(key)
@@ -118,10 +151,11 @@ diff --git a/minilfs-plugin/index.js b/minilfs-plugin/index.js
 +    return session.close({}).then(() => undefined, () => undefined)
 +  }
 +
-   const definitions = createTools({ core, ensureSession, cwdFor, touch })
++  const definitions = createTools({ core, ensureSession, cwdFor, touch, changeMode })
    for (const definition of definitions) {
      try {
-@@ -193,22 +219,22 @@
+       ctx.tools.register(definition)
+@@ -193,22 +251,22 @@
      interpolate: false,
    })
  
@@ -156,8 +190,17 @@ diff --git a/minilfs-plugin/index.js b/minilfs-plugin/index.js
  }
 diff --git a/minilfs-plugin/src/tools.js b/minilfs-plugin/src/tools.js
 --- a/minilfs-plugin/src/tools.js	2026-10-26 07:34:59
-+++ b/minilfs-plugin/src/tools.js	2026-10-26 07:34:59
-@@ -168,7 +168,7 @@
++++ b/minilfs-plugin/src/tools.js	2026-10-26 09:22:28
+@@ -151,7 +151,7 @@
+  * @param options - the core module, resolved config, the Agent context, and session hooks.
+  * @returns tool definitions ready for `ctx.tools.register`.
+  */
+-export function createTools({ core, ensureSession, cwdFor, touch }) {
++export function createTools({ core, ensureSession, cwdFor, touch, changeMode }) {
+   /**
+    * Run one branch mutation through the session's checkpoint queue, then
+    * refresh the prompt facts. `mutate()` is what finalizes the checkpoint and
+@@ -168,12 +168,24 @@
        const outcome = await session.mutate(String(exec?.callId ?? label), label, body)
        return outcome.value
      } finally {
@@ -166,7 +209,28 @@ diff --git a/minilfs-plugin/src/tools.js b/minilfs-plugin/src/tools.js
      }
    }
  
-@@ -439,7 +439,7 @@
+   return [
+     {
++      name: core.MODE_TOOL_NAME ?? 'workspace_mode',
++      description: core.MODE_TOOL_DESCRIPTION,
++      parameters: core.MODE_TOOL_SCHEMA,
++      output: {
++        schema: { type: 'object', additionalProperties: false, required: ['text'], properties: { text: { type: 'string' } } },
++        render: (_args, value) => text(value.text),
++      },
++      async execute(args, exec) {
++        return { text: await changeMode(exec, args.mode, args.reason, args.discard === true) }
++      },
++    },
++    {
+       name: 'read',
+       description: 'Read a UTF-8 text file from this session\'s LayerFS branch and return line-numbered content. '
+         + 'Reads and searches see the branch only; the user\'s folder is untouched.',
+@@ -436,10 +448,11 @@
+       },
+       async execute(args, exec) {
+         const session = await ensureSession(exec)
++        if (session.mode === 'host') return { text: 'Host mode: there is no Branch right now; tools act on the user\'s folder. Switch back with workspace_mode mode=branch to use minilfs actions.' }
          try {
            return { text: await core.executeLayerfsAction(session, args) }
          } finally {
@@ -175,10 +239,11 @@ diff --git a/minilfs-plugin/src/tools.js b/minilfs-plugin/src/tools.js
          }
        },
      },
-@@ -458,10 +458,14 @@
+@@ -458,10 +471,15 @@
        },
        async execute(_args, exec) {
          const session = await ensureSession(exec)
++        if (session.mode === 'host') return { text: 'Host mode: your edits are already in the user\'s folder; nothing to apply. Switch back with workspace_mode mode=branch.' }
 +        // DSH shares one tool set with subagents, so the "lead only" rule is enforced here.
 +        if (session.isChildAgent) {
 +          return { text: `Refused: you are a subagent (branch ${session.workBranch}). Only the lead writes the user's folder; report your branch and let the lead merge it.` }
@@ -193,11 +258,22 @@ diff --git a/minilfs-plugin/src/tools.js b/minilfs-plugin/src/tools.js
      },
 diff --git a/minilfs-plugin/test/plugin.test.mjs b/minilfs-plugin/test/plugin.test.mjs
 --- a/minilfs-plugin/test/plugin.test.mjs	2026-10-26 07:34:59
-+++ b/minilfs-plugin/test/plugin.test.mjs	2026-10-26 07:34:59
-@@ -188,6 +188,38 @@
++++ b/minilfs-plugin/test/plugin.test.mjs	2026-10-26 09:23:41
+@@ -110,7 +110,7 @@
+   it('exposes the branch-scoped tool set once', async () => {
+     const { tools, sections } = await setup()
+     assert.deepEqual([...tools.keys()].sort(), [
+-      'bash', 'edit', 'glob', 'grep', 'minilfs', 'minilfs_apply', 'read', 'write',
++      'bash', 'edit', 'glob', 'grep', 'minilfs', 'minilfs_apply', 'read', 'workspace_mode', 'write',
+     ])
+     for (const definition of tools.values()) {
+       assert.equal(typeof definition.output.render, 'function', `${definition.name} declares a renderer`)
+@@ -186,6 +186,52 @@
+     assert.match(applied.text, /Applied 1 file\(s\)/u)
+     assert.equal(existsSync(join(project, 'made.txt')), true)
      assert.equal((await readFile(join(project, 'made.txt'), 'utf8')).trim(), 'made-in-branch')
-   })
- 
++  })
++
 +  it('gives every subagent its own branch on the shared plugin mount; only the lead applies', async () => {
 +    // DSH mounts the plugin once and every subagent shares it (agent-preset-registry composeFrom):
 +    // per-agent state must come from exec.agent, never from the mount.
@@ -230,6 +306,18 @@ diff --git a/minilfs-plugin/test/plugin.test.mjs b/minilfs-plugin/test/plugin.te
 +    assert.equal(await readFile(join(project, 'w1.txt'), 'utf8'), 'from w1\n')
 +  })
 +
++  it('switches one Agent between its branch and the host folder', async () => {
++    const { tools, project, exec } = await setup()
++    const mode = async p => (await tools.get('workspace_mode').execute(p, exec)).text
++    await tools.get('write').execute({ file_path: join(project, 'b.txt'), content: 'on branch\n' }, exec)
++    assert.match(await mode({ mode: 'host' }), /^Refused: .*unapplied/u, 'unapplied branch work blocks host mode')
++    await tools.get('minilfs_apply').execute({}, exec)
++    assert.match(await mode({ mode: 'host', reason: 'nested sandbox' }), /^Now in host mode/u)
++    await tools.get('write').execute({ file_path: join(project, 'h.txt'), content: 'on host\n' }, exec)
++    assert.equal(await readFile(join(project, 'h.txt'), 'utf8'), 'on host\n', 'host mode writes the folder directly')
++    assert.match(await mode({ mode: 'branch' }), /^Back in branch mode .*host edit/u)
++    const seen = await tools.get('read').execute({ file_path: 'h.txt' }, exec)
++    assert.equal(seen.lines[0].text, 'on host', 'the branch continues from the host edits')
+   })
+ 
    it('reports a sandbox denial instead of writing outside the workspace', async () => {
-     const { tools, exec } = await setup()
-     // /private/tmp is writable by design (build caches); the home folder root is not.

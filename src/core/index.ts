@@ -92,3 +92,16 @@ export {
   type LayerfsActionParams,
 } from "./tools.ts";
 
+export {
+  initialMode,
+  MODE_TOOL_DESCRIPTION,
+  MODE_TOOL_NAME,
+  MODE_TOOL_SCHEMA,
+  switchMode,
+  type ModeSwitchResult,
+  type WorkspaceMode,
+} from "./mode.ts";
+
+export { IgnoreRules } from "../ignore.ts";
+
+export { HostWorkspace } from "./host.ts";

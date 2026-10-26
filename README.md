@@ -169,12 +169,15 @@ await session.open();
 | `MINILFS_BRANCH_NAME` | logical branch alias for this session (defaults to `lead` or `s-<shortId>`) |
 | `MINILFS_MAX_IMPORT_FILES` | `100000` — first import is refused above this (LayerFS Init has a fixed 60 s deadline) |
 | `MINILFS_MAX_IMPORT_MB` | `4096` — same, by total size |
+| `MINILFS_MODE` | `branch` (default) \| `host` — where tools act when a session starts; switch any time with `workspace_mode` or `/minilfs mode` |
 
 **What is imported: the files git sees.** A session's Branch holds the project as `git status` sees it: tracked files plus untracked files that are not ignored, and `.git/` itself. Git-ignored paths (`.gitignore` in every directory, `.git/info/exclude`, `core.excludesFile`) are not imported, not synced from the host and never applied back; agents can still create them inside their Branch (build output, `node_modules/` after an install). A tracked file is always imported, even if a pattern matches it. There is no switch for this.
 
 `<project>/.minilfsignore` adds patterns for minilfs only (gitignore syntax, `!` re-includes), for folders you keep out of git's ignore list but agents need not edit. Secrets (`MINILFS_EXCLUDES`) are excluded on top of both.
 
 A first import is refused before copying when the files to import exceed `MINILFS_MAX_IMPORT_FILES` / `MINILFS_MAX_IMPORT_MB` (LayerFS Init has a fixed 60 s limit); the error lists the largest folders to ignore. After fixing, `/minilfs retry` starts again without restarting.
+
+**Branch mode and host mode.** Every session starts in **branch mode**: file tools and `bash` act on the isolated Branch. When a step cannot work there (a nested sandbox such as `sandbox-exec` or Docker, mounts, setuid or privileged tools, a dev server that must outlive one call, testing minilfs itself, or minilfs failed to start), the agent calls `workspace_mode mode=host` (users: `/minilfs mode host`). Tools then act directly on the real folder, without the Branch layer and without the minilfs Seatbelt profile, and the status bar shows `HOST mode`. Switching to host is refused while the Branch has unapplied changes (apply first, or `discard=true`). Switching back (`mode=branch`) syncs the host edits into main and continues on a Branch that contains them. The mode is saved with the conversation and restored on resume. `MINILFS_MODE=host` starts in host mode. Harnesses that use the core directly get the same switch through `switchMode()` and `HostWorkspace`.
 
 **Isolation is for writes, not reads.** `bash` runs under a "wide read, narrow write" Seatbelt profile (like Claude Code's srt): it can read host files outside the Branch except the secret patterns (`.env`, `*.pem`, `~/.ssh`, the Store, …). Do not treat minilfs as a confidentiality boundary.
 

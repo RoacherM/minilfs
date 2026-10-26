@@ -18,6 +18,12 @@ import {
   executeLayerfsApply,
   formatHistory,
   hiddenPath,
+  initialMode,
+  MODE_TOOL_DESCRIPTION,
+  MODE_TOOL_NAME,
+  MODE_TOOL_SCHEMA,
+  switchMode,
+  type WorkspaceMode,
   LAYERFS_APPLY_TOOL_DESCRIPTION,
   LAYERFS_APPLY_TOOL_SCHEMA,
   LAYERFS_TOOL_DESCRIPTION,
@@ -30,6 +36,8 @@ import {
 
 export const CHECKPOINT_ENTRY = "minilfs-checkpoint";
 export const SESSION_ENTRY = "minilfs-session";
+export const MODE_ENTRY = "minilfs-mode";
+const boot0 = () => resolveConfig();
 
 export default function minilfsExtension(pi: ExtensionAPI) {
   pi.registerFlag("no-minilfs", { description: "Disable minilfs isolation for this run (tools act on the host folder)", type: "boolean", default: false });
@@ -37,7 +45,17 @@ export default function minilfsExtension(pi: ExtensionAPI) {
   let session: LayerfsSession | null = null;
   let ready: Promise<LayerfsSession> | null = null;
   let disabled = false;
+  /**
+   * Where tools act right now. "branch" (default): the minilfs Branch. "host": the real folder, for
+   * work the Branch cannot do (nested sandboxes, mounts, privileged tools, host services). The agent
+   * or the user switches; tools read this on every call, so a switch takes effect immediately.
+   */
+  let mode: WorkspaceMode = initialMode();
+  let lastCtx: ExtensionContext | undefined;
+  const onHostNow = () => disabled || mode === "host";
   let startError: Error | null = null;
+  /** the session once open() succeeded (null while starting or after a failed start) */
+  let openSession: LayerfsSession | null = null;
   let pendingForkRef: string | null = null;
 
   const proto = process.cwd();
@@ -68,6 +86,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     } catch {}
   };
   const describe = (s: LayerfsSession) => {
+    if (mode === "host") return "minilfs HOST mode · edits go to your folder";
     if (s.blocked) return "minilfs BLOCKED · /minilfs retry";
     const pending = s.unapplied ? ` · ${s.checkpoints.length} unapplied` : "";
     return `minilfs ${s.workBranch}${pending}`;
@@ -75,9 +94,10 @@ export default function minilfsExtension(pi: ExtensionAPI) {
 
   async function need(): Promise<LayerfsSession> {
     if (disabled) throw new Error("minilfs is disabled for this run");
-    if (startError) throw new Error(`minilfs failed to start: ${startError.message}. File tools are disabled (no fallback to the host folder).`);
+    const hint = "Fix the cause and run /minilfs retry, or switch to host mode (workspace_mode mode=host) to work on the folder directly.";
+    if (startError) throw new Error(`minilfs failed to start: ${startError.message}. ${hint}`);
     if (!ready) throw new Error("minilfs has not started (no session)");
-    return ready.catch((e) => { throw new Error(`minilfs failed to start: ${e.message}. File tools are disabled (no fallback to the host folder).`); });
+    return ready.catch((e) => { throw new Error(`minilfs failed to start: ${e.message}. ${hint}`); });
   }
 
   function report(ctx: ExtensionContext | undefined, s: LayerfsSession, r: { checkpoint: Checkpoint | null; error: Error | null }) {
@@ -106,7 +126,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
   pi.registerTool({
     ...local.read,
     async execute(id, params, signal, onUpdate) {
-      if (disabled) return onHost("read", id, params, signal, onUpdate);
+      if (onHostNow()) return onHost("read", id, params, signal, onUpdate);
       const s = await need();
       return createReadTool(s.cwd, { operations: ops(s).read }).execute(id, params, signal, onUpdate);
     },
@@ -116,7 +136,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     pi.registerTool({
       ...local[name],
       async execute(id: string, params: any, signal: any, onUpdate: any, ctx: ExtensionContext) {
-        if (disabled) return onHost(name, id, params, signal, onUpdate);
+        if (onHostNow()) return onHost(name, id, params, signal, onUpdate);
         const s = await need();
         const o = ops(s);
         const tool: any = name === "write" ? createWriteTool(s.cwd, { operations: o.write })
@@ -131,7 +151,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
   pi.registerTool({
     ...local.ls,
     async execute(id, params, signal, onUpdate) {
-      if (disabled) return onHost("ls", id, params, signal, onUpdate);
+      if (onHostNow()) return onHost("ls", id, params, signal, onUpdate);
       const s = await need();
       return createLsTool(s.cwd, { operations: ops(s).ls }).execute(id, params, signal, onUpdate);
     },
@@ -140,7 +160,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
   pi.registerTool({
     ...local.find,
     async execute(id, params, signal, onUpdate) {
-      if (disabled) return onHost("find", id, params, signal, onUpdate);
+      if (onHostNow()) return onHost("find", id, params, signal, onUpdate);
       const s = await need();
       return createFindTool(s.cwd, { operations: ops(s).find }).execute(id, params, signal, onUpdate);
     },
@@ -149,7 +169,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
   pi.registerTool({
     ...local.grep,
     async execute(id, params: any, signal, onUpdate) {
-      if (disabled) return onHost("grep", id, params, signal, onUpdate);
+      if (onHostNow()) return onHost("grep", id, params, signal, onUpdate);
       const s = await need();
       const g = await s.grepWorkspace(params);
       if (g.matches === 0) return { content: [{ type: "text" as const, text: "No matches found" }], details: undefined };
@@ -159,6 +179,46 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       return { content: [{ type: "text" as const, text: t.content + (notes.length ? `\n\n[${notes.join(". ")}]` : "") }], details: undefined };
     },
   });
+
+  // ------------------------------------------------------------- workspace mode (branch | host)
+
+  /** Switches mode for the agent tool and /minilfs mode; shows the result to the user. */
+  async function changeMode(target: "branch" | "host" | "status", reason: string | undefined, discard: boolean, ctx: ExtensionContext | undefined) {
+    if (target === "status") {
+      return mode === "host"
+        ? `host mode: tools act on ${hostCwd} directly.`
+        : `branch mode${session?.workBranch ? ` on ${session.workBranch}` : ""}: tools act on the isolated Branch.`;
+    }
+    let s: LayerfsSession | null = null;
+    // To host: do not wait behind a start still in progress (e.g. a long first import); use the
+    // session only if it is already open. To branch: the Branch must exist, so wait for it.
+    if (target === "host") s = openSession;
+    else { try { s = await need(); } catch { s = null; } }
+    const r = await switchMode(s, mode, target, { reason, discard, startError: startError?.message ?? null });
+    if (r.ok && r.mode !== mode) {
+      mode = r.mode;
+      if (s) recordSession(s);
+      pi.appendEntry(MODE_ENTRY, { mode, reason: reason ?? "", at: Date.now() });
+      const c = ctx ?? lastCtx;
+      status(c, s ? describe(s) : mode === "host" ? "minilfs HOST mode · edits go to your folder" : undefined);
+      if (c?.hasUI) c.ui.notify(`minilfs: ${r.message}`, mode === "host" ? "warning" : "info");
+    }
+    return r.message;
+  }
+
+  if (boot0().enabled) {
+    pi.registerTool({
+      name: MODE_TOOL_NAME,
+      label: "workspace mode",
+      description: MODE_TOOL_DESCRIPTION,
+      parameters: MODE_TOOL_SCHEMA as any,
+      async execute(_id: string, params: any, _signal: any, _onUpdate: any, ctx: ExtensionContext) {
+        if (disabled) return { content: [{ type: "text" as const, text: "minilfs is off for this run: tools already act on the user's folder." }], details: undefined };
+        const text = await changeMode(params.mode, params.reason, Boolean(params.discard), ctx);
+        return { content: [{ type: "text" as const, text }], details: undefined };
+      },
+    } as any);
+  }
 
   // ------------------------------------------------------------- team mode (MINILFS_TEAM=1)
   const boot = resolveConfig();
@@ -201,7 +261,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
   }
 
   pi.on("user_bash", async (_event, ctx) => {
-    if (disabled) return undefined;
+    if (onHostNow()) return undefined;
     const s = await need();
     return {
       operations: {
@@ -274,7 +334,11 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       status(ctx, describe(session));
       return;
     }
-    const branchInfo = inspectBranchEntries(ctx.sessionManager.getBranch());
+    lastCtx = ctx;
+    const branchEntries = ctx.sessionManager.getBranch();
+    const lastMode = [...branchEntries].reverse().find((e: any) => e.type === "custom" && e.customType === MODE_ENTRY) as any;
+    mode = lastMode?.data?.mode === "host" ? "host" : initialMode();
+    const branchInfo = inspectBranchEntries(branchEntries);
     const forkRef = event.reason === "fork" ? (pendingForkRef ?? branchInfo.headCommit ?? branchInfo.baseRef ?? null) : null;
     pendingForkRef = null;
     restart = () => start(ctx, event.reason, branchInfo, forkRef);
@@ -290,6 +354,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     const event = { reason };
     const s = new LayerfsSession(ctx.cwd, ctx.sessionManager.getSessionId(), config);
     session = s;
+    openSession = null;
     startError = null;
     // Show the phase and elapsed seconds, so a long first import is visible instead of a frozen "starting…".
     const t0 = Date.now();
@@ -308,13 +373,14 @@ export default function minilfsExtension(pi: ExtensionAPI) {
         project: s.project, volume: s.volume, cwd: s.cwd,
         baseBranch: s.baseBranch, workBranch: s.workBranch, baseRef: s.baseRef, headCommit: s.headCommit,
       });
+      if (session === s) openSession = s;
       status(ctx, describe(s));
       if (s.resumeLost && ctx.hasUI) ctx.ui.notify(`minilfs: ${s.resumeLost}.`, "warning");
       return s;
     }, (e) => {
       startError = e;
       status(ctx, "minilfs FAILED · /minilfs retry");
-      if (ctx.hasUI) ctx.ui.notify(`minilfs failed to start: ${e.message}\nFile tools are disabled; nothing is written to the host folder. Fix the cause, then /minilfs retry.`, "error");
+      if (ctx.hasUI) ctx.ui.notify(`minilfs failed to start: ${e.message}\nNothing is written to the host folder. Fix the cause, then /minilfs retry, or /minilfs mode host to work on the folder directly.`, "error");
       throw e;
     });
     ready.catch(() => {});
@@ -324,6 +390,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     if (event.reason === "reload") return;
     const s = session;
     session = null;
+    openSession = null;
     const r = ready;
     ready = null;
     if (!s) return;
@@ -343,9 +410,13 @@ export default function minilfsExtension(pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event) => {
     if (disabled) return undefined;
+    if (mode === "host") {
+      return { systemPrompt: `${event.systemPrompt}\n\nminilfs is in HOST mode: file tools and bash act directly on ${hostCwd}, without isolation; edits are immediate and not undoable. Switch back with workspace_mode mode=branch as soon as the host-only step is done.` };
+    }
     const note = [
       "",
       "File tools and bash run on an isolated minilfs Branch of this project.",
+      "If a step cannot work on the Branch (nested sandbox, mounts, setuid/privileged tools, a long-running dev server, testing minilfs itself), switch with workspace_mode mode=host, then back to mode=branch.",
       `Paths under ${session?.cwd ?? "the working directory"} refer to that Branch; edits there do NOT reach the user's folder until the user runs /minilfs apply.`,
       "Files outside the working directory are read-only. Secret files such as .env are not imported.",
       "Each bash call runs in its own sandbox: background processes (`cmd &`, dev servers) end when that call ends. Start and use a server within one bash call.",
@@ -370,10 +441,11 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     ["merge", "把另一个分支（如子 agent 的分支）合并进本会话：merge <branch>"],
     ["retry", "checkpoint 失败被锁住后重试；启动失败（如目录太大）后重新启动"],
     ["clean", "清理本项目的 scratch 构建缓存目录"],
+    ["mode", "切换工作位置：mode branch（隔离分支，默认）| mode host（直接在你的目录）| mode（查看）"],
   ];
 
   pi.registerCommand("minilfs", {
-    description: "minilfs workspace: status | diff | history | apply | merge | retry | sync | branches | clean",
+    description: "minilfs workspace: status | diff | history | apply | merge | retry | sync | branches | clean | mode",
     getArgumentCompletions: (prefix: string) => {
       const typed = prefix.trim();
       if (SUBCOMMANDS.some(([n]) => n === typed || typed.startsWith(`${n} `))) return null;
@@ -385,6 +457,11 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       const sub = argv[0] || "status";
       const say = (t: string, level: "info" | "warning" | "error" = "info") => (ctx.hasUI ? ctx.ui.notify(t, level) : console.log(t));
       if (disabled) return say("minilfs is off for this run.", "warning");
+      if (sub === "mode") {
+        const target = (argv[1] ?? "status") as any;
+        if (!["branch", "host", "status"].includes(target)) return say("用法：/minilfs mode [branch|host] [--discard]", "warning");
+        return say(await changeMode(target, "user command", argv.includes("--discard"), ctx));
+      }
       if (sub === "retry" && startError && restart) {
         say("Restarting minilfs…");
         restart();
