@@ -42,7 +42,7 @@ export function parseMessage(message: string | null | undefined): { label: strin
   return { label: m[1] || "change", origins };
 }
 
-async function changedFiles(s: LayerfsSession, from: string | null, to: string): Promise<{ files: HistoryFile[]; more: boolean }> {
+async function changedFiles(s: LayerfsSession, from: string | null, to: string): Promise<{ files: HistoryFile[]; more: boolean; build: number }> {
   const page = from
     ? await s.lfs.branch.diff_commits(from, to, 200, 0, { hunks: false })
     : null;
@@ -112,7 +112,7 @@ async function pinBranch(s: LayerfsSession, ref: string): Promise<string> {
   return name;
 }
 
-async function firstCommitFiles(s: LayerfsSession, c: any): Promise<{ files: HistoryFile[]; more: boolean }> {
+async function firstCommitFiles(s: LayerfsSession, c: any): Promise<{ files: HistoryFile[]; more: boolean; build: number }> {
   const from = await pinBranch(s, c.base);
   const to = await pinBranch(s, c.id);
   const d = await s.lfs.branch.diff_branches(from, to, 200, 0, { hunks: false });

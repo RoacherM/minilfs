@@ -317,7 +317,7 @@ export class LayerfsSession {
   /**
    * Detects host edits made outside Pi (editor, git pull) and syncs them into "main" before forking.
    */
-  async syncHostDriftIntoMain(options: { full?: boolean } = {}): Promise<{ synced: string[] }> {
+  async syncHostDriftIntoMain(options: { full?: boolean; limitToImport?: boolean } = {}): Promise<{ synced: string[] }> {
     return this.bindings.withProjectLock(this.projectRecord.name, async (guard) => {
       await this.ignore.load(); // .gitignore / tracked files may have changed since the last session
       const full = options.full || Boolean(this.bindings.byName(this.projectRecord.name)?.mainStale);
@@ -334,6 +334,13 @@ export class LayerfsSession {
       // ignore rules applied keep their node_modules etc. instead of a mass delete)
       const skip = this.hostSkip;
       for (const rel of Object.keys(prev)) if (!curr[rel] && !skip(rel, false)) removed.push(rel);
+      if (options.limitToImport && changed.length) {
+        // after an elevated command: refuse to pull a huge new tree into memory and the Store
+        const bytes = changed.reduce((n, rel) => n + (curr[rel]?.size ?? 0), 0);
+        if (changed.length > this.config.maxImportFiles || bytes > this.config.maxImportBytes) {
+          throw new LayerfsError("TooLarge", `${changed.length} changed file(s), ${Math.round(bytes / 1048576)} MB in your folder exceed the import limit; ignore large output folders in .gitignore or .minilfsignore`);
+        }
+      }
       if (!changed.length && !removed.length) {
         this.bindings.writeHostIndex(this.projectRecord.name, curr);
         if (full) this.bindings.setMainStale(this.projectRecord.name, false);
@@ -485,28 +492,62 @@ export class LayerfsSession {
   }
 
   /**
-   * Starts a fresh base + work Branch from current main (after host-mode work was synced into main).
-   * Only when nothing is unapplied, so no Branch work is dropped; returns false otherwise.
+   * Runs one command on the real project folder, outside the Branch and its sandbox ("elevated").
+   * The session mutex is held for all three steps so tool calls of this session do not interleave;
+   * the cross-process project lock is held only inside steps 1 and 3, never while the command runs.
+   *   1. converge: apply pending Branch changes to the folder (refused on conflict / WouldRevert)
+   *   2. run the command in the folder
+   *   3. sync the folder into main, move the base to the new main, merge main into the work branch
+   *      (main wins: the folder is the authority right after the command); keeps branch-only output
+   * Step 3 runs even when the command fails or is cancelled, since it may already have changed files.
    */
-  async restartFromMain(): Promise<boolean> {
+  async runElevated<T>(
+    run: () => Promise<T>,
+    options: { reason: string },
+  ): Promise<{ value: T; applied: string[]; synced: string[]; checkpoint: Checkpoint | null; note: string }> {
     const job = this.mutex.then(async () => {
-      if (this.blocked) return false;
-      // "unapplied" can be stale: the same content reached the folder another way (git pull, a
-      // copy, an apply from another harness). Only real pending work keeps the old Branch.
-      if (this.unapplied && !(await this.pendingAlreadyOnHost())) return false;
-      this.unapplied = false;
-      this.seq++;
-      const base = `b-${this.shortId}-${this.seq}`;
-      const work = `s-${this.shortId}-${this.seq}`;
-      const fb = await this.lfs.branch.fork(base, "main");
-      const fw = await this.lfs.branch.fork(work, "main");
-      this.baseBranch = base;
-      this.workBranch = work;
-      this.baseRef = fb.head ?? fb.base;
-      this.headCommit = fw.head ?? null;
-      this.pendingOrigins = [];
-      this.persistSessionBinding();
-      return true;
+      if (this.blocked) throw new Error(`minilfs checkpoint failed earlier (${this.blocked.reason}); run /minilfs retry before an elevated command`);
+      // 1. converge
+      let applied: string[] = [];
+      if (this.unapplied && !(await this.pendingAlreadyOnHost().catch(() => false))) {
+        const r = await this.applyLocked({});
+        if (r.conflicts.length) {
+          throw new LayerfsError("ElevateConflict", `not run: applying this Branch's changes to your folder first conflicts on ${r.conflicts.join(", ")} (changed in the folder meanwhile). Resolve them (e.g. apply after checking the files) and retry.`);
+        }
+        applied = r.applied;
+      }
+      // 2. run
+      let value: T | undefined;
+      let runError: unknown = null;
+      try { value = await run(); } catch (e) { runError = e; }
+      // 3. sync back
+      let synced: string[] = [];
+      let checkpoint: Checkpoint | null = null;
+      let note = "";
+      try {
+        synced = (await this.syncHostDriftIntoMain({ limitToImport: true })).synced;
+        // merge first, against the old base (base..main = what the command changed); then move the base
+        if (synced.length) {
+          const m = await this.mergeBranchLocked("main", { strategy: "theirs" });
+          if (!m.merged) throw new LayerfsError("Conflict", `merging the folder's changes into the Branch conflicts on ${m.conflicts.map((c) => c.path).join(", ")}`);
+          if (m.head) {
+            checkpoint = { origins: [`host: ${options.reason}`.slice(0, 200)], label: "host", commit: m.head, branch: m.branch, changed: true, at: Date.now() };
+            this.checkpoints.push(checkpoint);
+          }
+        }
+        this.seq++;
+        const nextBase = `b-${this.shortId}-${this.seq}`;
+        const fb = await this.lfs.branch.fork(nextBase, "main");
+        this.baseBranch = nextBase;
+        this.baseRef = fb.head ?? fb.base;
+        this.unapplied = await this.hasApplicable();
+        this.persistSessionBinding();
+      } catch (e: any) {
+        this.bindings.setMainStale(this.projectRecord.name, true);
+        note = `\n[minilfs] The command ran in your folder, but bringing its changes back into the Branch failed (${e?.code ?? "Error"}: ${String(e?.message ?? e).slice(0, 200)}). The Branch does not have them yet; the next start resyncs main from your folder.`;
+      }
+      if (runError) throw Object.assign(runError as object, { minilfsNote: note });
+      return { value: value as T, applied, synced, checkpoint, note };
     });
     this.mutex = job.catch(() => {});
     return job;
@@ -538,12 +579,27 @@ export class LayerfsSession {
     other: string,
     options?: { strategy?: "ours" | "theirs"; resolve?: Record<string, "ours" | "theirs"> }
   ): Promise<MergeResult> {
-    const job = this.mutex.then(async () => {
+    const job = this.mutex.then(() => this.mergeBranchLocked(other, options));
+    this.mutex = job.catch(() => {});
+    return job;
+  }
+
+  /** mergeBranch body; the caller holds the session mutex. */
+  private async mergeBranchLocked(
+    other: string,
+    options?: { strategy?: "ours" | "theirs"; resolve?: Record<string, "ours" | "theirs"> }
+  ): Promise<MergeResult> {
+    {
       if (this.blocked) throw new Error(`cannot merge while a checkpoint is pending (${this.blocked.reason}); run /minilfs retry`);
-      const resolvedOther = await this.resolveBranchName(other);
-      const branches = await this.listAllBranches();
-      const known = branches.find((b) => b.name === resolvedOther);
-      if (!known) throw new LayerfsError("NoSuchBranch", `no LayerFS branch named ${other} (see /minilfs branches)`);
+      let resolvedOther = await this.resolveBranchName(other);
+      if (resolvedOther === "main") {
+        // "main" is the trunk layer, not a Branch: LayerFS merge needs a Branch, so pin a snapshot of it
+        resolvedOther = `h-main-${this.shortId}-${Date.now().toString(36)}`; // does not consume seq: work-branch names stay -1, -2, …
+        await this.lfs.branch.fork(resolvedOther, "main");
+      } else {
+        const branches = await this.listAllBranches();
+        if (!branches.some((b) => b.name === resolvedOther)) throw new LayerfsError("NoSuchBranch", `no LayerFS branch named ${other} (see /minilfs branches)`);
+      }
 
       if (options?.strategy || options?.resolve) {
         return await this.fallbackMergeBranch(resolvedOther, options);
@@ -600,9 +656,7 @@ export class LayerfsSession {
         }
         throw e;
       }
-    });
-    this.mutex = job.catch(() => {});
-    return job;
+    }
   }
 
   private async fallbackMergeBranch(
@@ -1871,8 +1925,19 @@ export class LayerfsSession {
   }
 
   private async hasApplicable(): Promise<boolean> {
-    const d = await this.diff();
-    return d.some((i) => i.type !== "dir" && this.isApplicable(i.path));
+    const d = (await this.diff()).filter((i) => i.type !== "dir" && this.isApplicable(i.path));
+    for (const i of d) {
+      // a merge that rewrites a file reports it "Modified" with identical bytes (new inode): not real work
+      if (i.kind === "Modified") {
+        const [a, b] = await Promise.all([
+          this.readBytesAtRef(this.baseBranch, i.path).catch(() => null),
+          this.readBytesAtRef(this.workBranch, i.path).catch(() => null),
+        ]);
+        if (a && b && a.equals(b)) continue;
+      }
+      return true;
+    }
+    return false;
   }
 
   async stopNativeDaemons(): Promise<void> {

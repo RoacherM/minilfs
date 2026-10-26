@@ -727,21 +727,59 @@ try {
     assert.deepEqual((await s.syncHostDriftIntoMain()).synced, [], "ignored host edits are not synced");
   });
 
-  await step("mode switch: stale unapplied (folder got the same bytes, e.g. git pull) does not block host mode; back to branch includes host edits", async () => {
-    const { switchMode } = await import("../src/core/mode.ts");
+  await step("elevated: applies pending Branch work first, runs on the folder, brings changes back, keeps branch-only output, records a host checkpoint", async () => {
     const cwd = project();
-    const s = await open(cwd, "stale");
-    await s.mutate("w", "write", () => s.writeFile(join(cwd, "a.txt"), "v2\n"));
-    assert.equal(await s.pendingAlreadyOnHost(), false, "real pending work is detected");
-    assert.match((await switchMode(s, "branch", "host")).message, /^Refused/);
-    writeFileSync(join(cwd, "a.txt"), "v2\n"); // the same bytes reach the folder another way
-    assert.equal(await s.pendingAlreadyOnHost(), true);
-    assert.match((await switchMode(s, "branch", "host")).message, /^Now in host mode/);
-    writeFileSync(join(cwd, "b.txt"), "host edit\n");
-    const back = await switchMode(s, "host", "branch");
-    assert.match(back.message, /fresh Branch .* from main/, back.message);
-    assert.equal((await s.readFile(join(cwd, "b.txt"))).toString(), "host edit\n");
-    assert.equal(s.unapplied, false);
+    const s = new LayerfsSession(cwd, `elev-${id}`, { ...config, branchOnly: ["dist/"] });
+    sessions.push(s); await s.open();
+    // branch work: a source edit (applicable) + build output (branch-only, never applied)
+    await s.mutate("w", "write", () => s.writeFile(join(cwd, "a.txt"), "edited on branch\n"));
+    const o = out();
+    await s.mutate("b", "bash", () => s.exec("mkdir -p dist && echo built > dist/app.js", cwd, o));
+    assert.equal(s.unapplied, true);
+    const run = () => new Promise((done) => {
+      const r = spawnSync("bash", ["-c", "cat a.txt > seen.txt && echo host-made > host.txt"], { cwd, encoding: "utf8" });
+      done({ exitCode: r.status });
+    });
+    const r = await s.runElevated(run, { reason: "test" });
+    assert.deepEqual(r.applied, ["a.txt"], "pending branch change applied first");
+    assert.equal(readFileSync(join(cwd, "seen.txt"), "utf8"), "edited on branch\n", "the command saw the applied change");
+    assert.ok(r.synced.includes("host.txt") && r.synced.includes("seen.txt"), `synced: ${r.synced}`);
+    assert.equal((await s.readFile(join(cwd, "host.txt"))).toString(), "host-made\n", "host change is in the Branch");
+    assert.equal((await s.readFile(join(cwd, "dist/app.js"))).toString(), "built\n", "branch-only output survives");
+    assert.equal(existsSync(join(cwd, "dist/app.js")), false, "branch-only output never reached the folder");
+    assert.ok(r.checkpoint?.commit, "host checkpoint has a commit for /tree");
+    assert.match(r.checkpoint.origins[0], /^host: test/);
+    assert.equal(s.unapplied, false, "Branch == folder after an elevated command");
+  });
+
+  await step("elevated: refused before running when applying conflicts; failing command still syncs back", async () => {
+    const cwd = project();
+    const s = await open(cwd, "elevc");
+    await s.mutate("w", "write", () => s.writeFile(join(cwd, "a.txt"), "branch\n"));
+    writeFileSync(join(cwd, "a.txt"), "folder edit\n"); // conflicting edit in the folder
+    let ran = false;
+    await assert.rejects(s.runElevated(async () => { ran = true; }, { reason: "x" }), (e) => e.code === "ElevateConflict" && /a\.txt/.test(e.message));
+    assert.equal(ran, false, "command not run on conflict");
+    const cwd2 = project();
+    const s2 = await open(cwd2, "elevf");
+    await assert.rejects(s2.runElevated(async () => { writeFileSync(join(cwd2, "partial.txt"), "p\n"); throw new Error("boom"); }, { reason: "x" }), /boom/);
+    assert.equal((await s2.readFile(join(cwd2, "partial.txt"))).toString(), "p\n", "changes made before the failure come back");
+  });
+
+  await step("elevated: the project lock is free while the command runs (a sub-agent can sync meanwhile)", async () => {
+    const cwd = project();
+    const lead = await open(cwd, "elevl");
+    const worker = new LayerfsSession(cwd, `elevw-${id}`, { ...config, branchName: "task-lockcheck" });
+    sessions.push(worker); await worker.open();
+    let release;
+    const gate = new Promise((r) => (release = r));
+    const elevated = lead.runElevated(() => gate, { reason: "long command" });
+    await new Promise((r) => setTimeout(r, 300));
+    const t0 = Date.now();
+    await worker.syncHostDriftIntoMain(); // takes the project lock
+    assert.ok(Date.now() - t0 < 5000, "worker sync not blocked by the running command");
+    release({ exitCode: 0 });
+    await elevated;
   });
 
   await step("too-large first import is refused before copying, naming the largest folders", async () => {

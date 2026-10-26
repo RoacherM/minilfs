@@ -81,10 +81,7 @@ pi install -l git:github.com/RoacherM/minilfs
   "mcpServers": {
     "minilfs": {
       "command": "node",
-      "args": ["/path/to/minilfs/src/cli.ts", "mcp"],
-      "env": {
-        "MINILFS_TEAM": "1"
-      }
+      "args": ["/path/to/minilfs/src/cli.ts", "mcp"]
     }
   }
 }
@@ -165,12 +162,12 @@ await session.open();
 | `MINILFS_NETWORK` | `allow` \| `localhost` \| `deny` (`offline`) — Seatbelt outbound network policy inside `bash` |
 | `MINILFS_EXCLUDES` | `.env,.env.*,!.env.example,!.env.sample,!.env.template,!.env.dist,!.env.defaults,*.pem,*.key,id_rsa*,id_ed25519*,.npmrc,.netrc,.pypirc` — secrets: never imported, read or written; `!pattern` re-includes |
 | `MINILFS_BRANCH_ONLY` | comma-separated build-output patterns (e.g. `target/,.cargo-home/`) |
-| `MINILFS_TEAM` | `1` enables multi-agent `minilfs` / `minilfs_apply` tools |
 | `MINILFS_BRANCH_NAME` | logical branch alias for this session (defaults to `lead` or `s-<shortId>`) |
 | `MINILFS_MAX_IMPORT_FILES` | `100000` — first import is refused above this (LayerFS Init has a fixed 60 s deadline) |
 | `MINILFS_MAX_IMPORT_MB` | `4096` — same, by total size |
-| `MINILFS_HOST_POLICY` | `ask` (default) \| `auto` \| `bypass` \| `never` — who may move the agent to host mode; same as `--minilfs-host` |
-| `MINILFS_MODE` | `branch` (default) \| `host` — where tools act when a session starts; switch any time with `workspace_mode` or `/minilfs mode` |
+| `MINILFS_ELEVATE` | `auto` (default) \| `ask` \| `never` — single elevated bash commands of the main agent; same as `--minilfs-elevate` and `/minilfs elevate` |
+| `MINILFS_ELEVATE_ALLOW` | comma-separated command prefixes that need no confirmation under `ask`, e.g. `git *,docker *` |
+| `MINILFS_ROLE` | force `lead` or `worker` (normally detected: Pi sub-agents, Epi tasks) |
 
 **What is imported: the files git sees.** A session's Branch holds the project as `git status` sees it: tracked files plus untracked files that are not ignored, and `.git/` itself. Git-ignored paths (`.gitignore` in every directory, `.git/info/exclude`, `core.excludesFile`) are not imported, not synced from the host and never applied back; agents can still create them inside their Branch (build output, `node_modules/` after an install). A tracked file is always imported, even if a pattern matches it. There is no switch for this.
 
@@ -178,7 +175,12 @@ await session.open();
 
 A first import is refused before copying when the files to import exceed `MINILFS_MAX_IMPORT_FILES` / `MINILFS_MAX_IMPORT_MB` (LayerFS Init has a fixed 60 s limit); the error lists the largest folders to ignore. After fixing, `/minilfs retry` starts again without restarting.
 
-**Branch mode and host mode.** Every session starts in **branch mode**: file tools and `bash` act on the isolated Branch. When a step cannot work there (a nested sandbox such as `sandbox-exec` or Docker, mounts, setuid or privileged tools, a dev server that must outlive one call, testing minilfs itself, or minilfs failed to start), the agent calls `workspace_mode mode=host` (users: `/minilfs mode host`). Tools then act directly on the real folder, without the Branch layer and without the minilfs Seatbelt profile, and the status bar shows `HOST mode`. Who may switch is the **host policy** (`--minilfs-host` flag, `MINILFS_HOST_POLICY`, or `/minilfs policy` at runtime): `ask` (default: the user confirms each switch the agent requests), `auto` (the agent switches on its own), `bypass` (sessions start in host mode and the agent switches freely, like "bypass permissions"), `never` (the agent stays on the Branch). The user can always switch with `/minilfs mode`. Switching to host is refused while the Branch has unapplied changes (apply first, or `discard=true`). Switching back (`mode=branch`) syncs the host edits into main and continues on a Branch that contains them. The mode is saved with the conversation and restored on resume. `MINILFS_MODE=host` starts in host mode. Harnesses that use the core directly get the same switch through `switchMode()` and `HostWorkspace`.
+**Every agent on a Branch; the main agent can elevate single commands.** Every agent's file tools and `bash` act on its own isolated Branch, the main agent included (checkpoints per tool call, `/tree` restores files, the folder changes only on apply). When a step cannot run in the sandbox (git commit/push, Docker, mounts, setuid tools like `ps`, long-running services, "Operation not permitted"), the main agent runs **that one** `bash` call with `elevated: true` and a `reason`: the Branch's unapplied changes are applied to the folder first, the command runs on the real folder with the host's permissions, and the folder's changes come back into the Branch as a `host:` checkpoint. There is no mode to switch.
+
+- Policy (`--minilfs-elevate`, `MINILFS_ELEVATE`, `/minilfs elevate`): `auto` (default, no confirmation), `ask` (the user confirms each command; "always allow" remembers a command prefix), `never`.
+- **Under `auto` the main agent's sandbox is a guard rail, not a security boundary**: a prompt-injected main agent can run anything on the host. Use `ask` or `never` if that matters.
+- Sub-agents (Pi sub-agents, Epi tasks) never elevate and have no `minilfs_apply`; their branches reach the folder when the main agent merges them (`minilfs merge <branch>`) and applies.
+- The user's `!cmd` runs on the real folder (same apply-first / sync-back steps).
 
 **Isolation is for writes, not reads.** `bash` runs under a "wide read, narrow write" Seatbelt profile (like Claude Code's srt): it can read host files outside the Branch except the secret patterns (`.env`, `*.pem`, `~/.ssh`, the Store, …). Do not treat minilfs as a confidentiality boundary.
 

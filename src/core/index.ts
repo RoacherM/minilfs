@@ -55,7 +55,7 @@ export {
 export {
   acquireLock,
   acquireLockSync,
-  type FileLock,
+  type LockHandle,
 } from "../lock.ts";
 
 export {
@@ -93,17 +93,14 @@ export {
 } from "./tools.ts";
 
 export {
-  hostPolicy,
-  initialMode,
-  MODE_TOOL_DESCRIPTION,
-  MODE_TOOL_NAME,
-  MODE_TOOL_SCHEMA,
-  switchMode,
-  type HostPolicy,
-  type ModeSwitchResult,
-  type WorkspaceMode,
-} from "./mode.ts";
+  ELEVATE_PARAM_DESCRIPTIONS,
+  elevateAllowed,
+  elevatePolicy,
+  resolveRole,
+  type ElevatePolicy,
+  type Role,
+  type RoleInfo,
+} from "./role.ts";
 
 export { IgnoreRules } from "../ignore.ts";
 
-export { HostWorkspace } from "./host.ts";

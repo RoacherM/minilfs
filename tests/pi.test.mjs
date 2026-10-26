@@ -162,13 +162,16 @@ try {
     assert.doesNotMatch(text(l), /\.env/);
   });
 
-  await step("user ! command routes into the Branch and checkpoints", async () => {
+  await step("user ! command runs on the real folder (elevated) and the Branch picks up its changes", async () => {
     const routed = await session.extensionRunner.emitUserBash({ type: "user_bash", command: "echo user > user.txt && cat user.txt", cwd, excludeFromContext: false });
     assert.ok(routed?.operations, "user_bash must be routed");
     const out = await session.executeBash("echo user > user.txt && cat user.txt", undefined, { operations: routed.operations });
-    assert.equal(out.output.trim(), "user", "command routes into branch");
-    assert.equal(existsSync(join(cwd, "user.txt")), false, "user.txt not on host");
-    assert.ok(main.checkpoints().some((c) => c.data.origins.includes("user_bash")));
+    assert.match(out.output, /^user\n/, "command output first");
+    assert.equal(readFileSync(join(cwd, "user.txt"), "utf8"), "user\n", "ran on the host folder");
+    const [r] = await run([["read", { path: "user.txt" }]]);
+    assert.match(text(r), /user/, "the Branch has the file after the command");
+    assert.ok(main.checkpoints().some((c) => (c.data.origins ?? []).some((o) => o.startsWith("host:"))), "host checkpoint recorded");
+    rmSync(join(cwd, "user.txt"), { force: true });
   });
 
   await step("abort stops the remote command tree", async () => {
@@ -220,7 +223,7 @@ try {
       await peer.session.prompt("/minilfs apply");
     } finally { console.log = log; }
 
-    assert.match(out, /Added\s+gen\.txt/);
+    // gen.txt may already be in the folder: the earlier user ! command ran elevated, which applies first
     assert.equal(readFileSync(join(cwd, "gen.txt"), "utf8"), "generated\n");
     assert.equal(readFileSync(join(cwd, "notes/plan.md"), "utf8"), "# plan v1\n");
     assert.match(readFileSync(join(cwd, "src/math.js"), "utf8"), /a \+ b \+ 0/);

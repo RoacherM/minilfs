@@ -1,6 +1,8 @@
 /**
- * minilfs: every session works on an isolated LayerFS Branch in a
- * shared Project Store by default.
+ * minilfs: every agent works on an isolated LayerFS Branch in a shared Project Store.
+ * - The main agent (top-level session) may run single bash commands "elevated" on the real folder
+ *   (default policy: auto). Sub-agents never elevate; their work reaches the folder through the main
+ *   agent (merge, then apply).
  * - File tools (`read`, `write`, `edit`, `ls`, `find`, `grep`) go directly to the Store
  *   with automatic byte-exact Workspace fallback for binary, symlinks and >48KB lines.
  * - `bash` and `!cmd` mount a Workspace on demand, stream output, and unmount immediately.
@@ -18,14 +20,12 @@ import {
   executeLayerfsApply,
   formatHistory,
   hiddenPath,
-  hostPolicy,
-  initialMode,
-  type HostPolicy,
-  MODE_TOOL_DESCRIPTION,
-  MODE_TOOL_NAME,
-  MODE_TOOL_SCHEMA,
-  switchMode,
-  type WorkspaceMode,
+  ELEVATE_PARAM_DESCRIPTIONS,
+  elevateAllowed,
+  elevatePolicy,
+  resolveRole,
+  type ElevatePolicy,
+  type RoleInfo,
   LAYERFS_APPLY_TOOL_DESCRIPTION,
   LAYERFS_APPLY_TOOL_SCHEMA,
   LAYERFS_TOOL_DESCRIPTION,
@@ -38,29 +38,22 @@ import {
 
 export const CHECKPOINT_ENTRY = "minilfs-checkpoint";
 export const SESSION_ENTRY = "minilfs-session";
-export const MODE_ENTRY = "minilfs-mode";
-const boot0 = () => resolveConfig();
+export const POLICY_ENTRY = "minilfs-policy";
 
 export default function minilfsExtension(pi: ExtensionAPI) {
   pi.registerFlag("no-minilfs", { description: "Disable minilfs isolation for this run (tools act on the host folder)", type: "boolean", default: false });
-  pi.registerFlag("minilfs-host", { description: "Who may switch the agent to host mode: ask (default) | auto | bypass (start in host mode) | never", type: "string", default: "" });
+  pi.registerFlag("minilfs-elevate", { description: "Elevated bash for the main agent: auto (default, no confirmation) | ask | never", type: "string", default: "" });
 
   let session: LayerfsSession | null = null;
   let ready: Promise<LayerfsSession> | null = null;
   let disabled = false;
-  /**
-   * Where tools act right now. "branch" (default): the minilfs Branch. "host": the real folder, for
-   * work the Branch cannot do (nested sandboxes, mounts, privileged tools, host services). The agent
-   * or the user switches; tools read this on every call, so a switch takes effect immediately.
-   */
-  let mode: WorkspaceMode = initialMode();
-  /** set at session start from --minilfs-host / MINILFS_HOST_POLICY; /minilfs policy changes it */
-  let policy: HostPolicy = hostPolicy();
-  let lastCtx: ExtensionContext | undefined;
-  const onHostNow = () => disabled || mode === "host";
+  /** decided once at load: sub-agents get a Branch but no apply and no elevation */
+  let role: RoleInfo = resolveRole();
+  /** --minilfs-elevate / MINILFS_ELEVATE; /minilfs elevate changes it; saved in the conversation */
+  let policy: ElevatePolicy = elevatePolicy();
+  /** command prefixes the user allowed for this session ("always allow" in the ask dialog) */
+  const allowedPrefixes: string[] = [];
   let startError: Error | null = null;
-  /** the session once open() succeeded (null while starting or after a failed start) */
-  let openSession: LayerfsSession | null = null;
   let pendingForkRef: string | null = null;
 
   const proto = process.cwd();
@@ -91,7 +84,6 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     } catch {}
   };
   const describe = (s: LayerfsSession) => {
-    if (mode === "host") return "minilfs HOST mode · edits go to your folder";
     if (s.blocked) return "minilfs BLOCKED · /minilfs retry";
     const pending = s.unapplied ? ` · ${s.checkpoints.length} unapplied` : "";
     return `minilfs ${s.workBranch}${pending}`;
@@ -99,7 +91,9 @@ export default function minilfsExtension(pi: ExtensionAPI) {
 
   async function need(): Promise<LayerfsSession> {
     if (disabled) throw new Error("minilfs is disabled for this run");
-    const hint = "Fix the cause and run /minilfs retry, or switch to host mode (workspace_mode mode=host) to work on the folder directly.";
+    const hint = role.role === "lead"
+      ? "Fix the cause and run /minilfs retry. A single bash command can still run on the folder with elevated: true."
+      : "Fix the cause and run /minilfs retry.";
     if (startError) throw new Error(`minilfs failed to start: ${startError.message}. ${hint}`);
     if (!ready) throw new Error("minilfs has not started (no session)");
     return ready.catch((e) => { throw new Error(`minilfs failed to start: ${e.message}. ${hint}`); });
@@ -131,32 +125,105 @@ export default function minilfsExtension(pi: ExtensionAPI) {
   pi.registerTool({
     ...local.read,
     async execute(id, params, signal, onUpdate) {
-      if (onHostNow()) return onHost("read", id, params, signal, onUpdate);
+      if (disabled) return onHost("read", id, params, signal, onUpdate);
       const s = await need();
       return createReadTool(s.cwd, { operations: ops(s).read }).execute(id, params, signal, onUpdate);
     },
   });
 
-  for (const name of ["write", "edit", "bash"] as const) {
+  for (const name of ["write", "edit"] as const) {
     pi.registerTool({
       ...local[name],
       async execute(id: string, params: any, signal: any, onUpdate: any, ctx: ExtensionContext) {
-        if (onHostNow()) return onHost(name, id, params, signal, onUpdate);
+        if (disabled) return onHost(name, id, params, signal, onUpdate);
         const s = await need();
         const o = ops(s);
-        const tool: any = name === "write" ? createWriteTool(s.cwd, { operations: o.write })
-          : name === "edit" ? createEditTool(s.cwd, { operations: o.edit })
-          : createBashTool(s.cwd, { operations: o.bash });
+        const tool: any = name === "write" ? createWriteTool(s.cwd, { operations: o.write }) : createEditTool(s.cwd, { operations: o.edit });
         const r = await s.mutate(id, name, () => tool.execute(id, params, signal, onUpdate));
         return withNote(r.value, report(ctx, s, r));
       },
     } as any);
   }
 
+  // bash: on the Branch inside the sandbox; the main agent may run one command elevated (real folder).
+  const leadBashParams = {
+    ...(local.bash.parameters as any),
+    properties: {
+      ...(local.bash.parameters as any).properties,
+      elevated: { type: "boolean", description: ELEVATE_PARAM_DESCRIPTIONS.elevated },
+      reason: { type: "string", description: ELEVATE_PARAM_DESCRIPTIONS.reason },
+    },
+  };
+  const BLOCKED_HINT = "\n[minilfs] The sandbox blocked this. If the step must run on the real folder, retry with elevated: true and a reason.";
+
+  /** asks the user under the `ask` policy; true = run */
+  async function approveElevation(command: string, reason: string, ctx: ExtensionContext | undefined, s: LayerfsSession | null): Promise<string | null> {
+    if (policy === "never") return "Refused: elevated commands are disabled (/minilfs elevate never). Tell the user what needs to run on the real folder.";
+    if (policy === "auto" || elevateAllowed(command, process.env, allowedPrefixes)) return null;
+    if (!ctx?.hasUI) return "Refused: elevated commands need the user's approval (policy ask) and there is no UI.";
+    const pending = s && s.unapplied ? await applicableDiff(s).catch(() => []) : [];
+    const first = command.trim().split(/\s+/)[0] ?? command;
+    const choice = await ctx.ui.select(
+      `Run on your real folder (outside the minilfs sandbox)?\n\n$ ${command}\n\nReason: ${reason}${pending.length ? `\n\nFirst, these Branch changes are written to your folder:\n${pending.slice(0, 15).map((i) => `  ${i.kind} ${i.path.replace(/^\//, "")}`).join("\n")}` : ""}`,
+      ["Run", `Always allow "${first} …" this session`, "Deny"],
+    );
+    if (choice === "Run") return null;
+    if (choice?.startsWith("Always")) { allowedPrefixes.push(`${first} *`); return null; }
+    return "The user denied this elevated command. Continue on the Branch or ask the user.";
+  }
+
+  /** the shared elevated path (agent tool and the user's !cmd); returns the tool result */
+  async function runElevatedBash(id: string, params: any, signal: any, onUpdate: any, ctx: ExtensionContext | undefined) {
+    const s = await need().catch(() => null);
+    const hostTool = createBashTool(hostCwd);
+    const runIt = () => hostTool.execute(id, { command: params.command, timeout: params.timeout }, signal, onUpdate);
+    if (!s) return runIt(); // minilfs not running: nothing to converge; the command still runs
+    status(ctx, `minilfs elevated: ${String(params.command).slice(0, 40)}`);
+    try {
+      const r = await s.runElevated(runIt, { reason: params.reason || "user command" });
+      if (r.checkpoint) pi.appendEntry(CHECKPOINT_ENTRY, { ...r.checkpoint, project: s.project, branch: s.workBranch });
+      recordSession(s);
+      const notes = [
+        r.applied.length ? `[minilfs] Applied ${r.applied.length} Branch change(s) to your folder before running.` : "",
+        r.synced.length ? `[minilfs] Brought ${r.synced.length} changed file(s) from your folder back into the Branch.` : "",
+        r.note,
+      ].filter(Boolean).join("\n");
+      return withNote(r.value, notes ? `\n${notes}` : "");
+    } catch (e: any) {
+      if (e?.minilfsNote) e.message = `${e.message}${e.minilfsNote}`;
+      throw e;
+    } finally {
+      status(ctx, describe(s));
+    }
+  }
+
+  pi.registerTool({
+    ...local.bash,
+    ...(role.role === "lead" ? { parameters: leadBashParams } : {}),
+    async execute(id: string, params: any, signal: any, onUpdate: any, ctx: ExtensionContext) {
+      if (disabled) return onHost("bash", id, { command: params.command, timeout: params.timeout }, signal, onUpdate);
+      if (params.elevated) {
+        if (role.role !== "lead") throw new Error("Refused: sub-agents cannot run elevated commands. Write in your result which step must run on the real folder; the main agent will run it.");
+        const reason = String(params.reason ?? "").trim();
+        if (!reason) throw new Error("elevated: true needs a reason (one sentence on why this must run on the real folder).");
+        const s0 = await need().catch(() => null);
+        const refusal = await approveElevation(String(params.command ?? ""), reason, ctx, s0);
+        if (refusal) throw new Error(refusal);
+        return runElevatedBash(id, { ...params, reason }, signal, onUpdate, ctx);
+      }
+      const s = await need();
+      const tool: any = createBashTool(s.cwd, { operations: ops(s).bash });
+      const r = await s.mutate(id, "bash", () => tool.execute(id, { command: params.command, timeout: params.timeout }, signal, onUpdate));
+      const out = withNote(r.value, report(ctx, s, r));
+      const text = (out.content ?? []).map((c: any) => c.text ?? "").join("");
+      return role.role === "lead" && /Operation not permitted/.test(text) && policy !== "never" ? withNote(out, BLOCKED_HINT) : out;
+    },
+  } as any);
+
   pi.registerTool({
     ...local.ls,
     async execute(id, params, signal, onUpdate) {
-      if (onHostNow()) return onHost("ls", id, params, signal, onUpdate);
+      if (disabled) return onHost("ls", id, params, signal, onUpdate);
       const s = await need();
       return createLsTool(s.cwd, { operations: ops(s).ls }).execute(id, params, signal, onUpdate);
     },
@@ -165,7 +232,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
   pi.registerTool({
     ...local.find,
     async execute(id, params, signal, onUpdate) {
-      if (onHostNow()) return onHost("find", id, params, signal, onUpdate);
+      if (disabled) return onHost("find", id, params, signal, onUpdate);
       const s = await need();
       return createFindTool(s.cwd, { operations: ops(s).find }).execute(id, params, signal, onUpdate);
     },
@@ -174,7 +241,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
   pi.registerTool({
     ...local.grep,
     async execute(id, params: any, signal, onUpdate) {
-      if (onHostNow()) return onHost("grep", id, params, signal, onUpdate);
+      if (disabled) return onHost("grep", id, params, signal, onUpdate);
       const s = await need();
       const g = await s.grepWorkspace(params);
       if (g.matches === 0) return { content: [{ type: "text" as const, text: "No matches found" }], details: undefined };
@@ -185,61 +252,9 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     },
   });
 
-  // ------------------------------------------------------------- workspace mode (branch | host)
-
-  /** Switches mode for the agent tool and /minilfs mode; shows the result to the user. */
-  async function changeMode(target: "branch" | "host" | "status", reason: string | undefined, discard: boolean, ctx: ExtensionContext | undefined, byUser = false) {
-    if (target === "status") {
-      const where = mode === "host"
-        ? `host mode: tools act on ${hostCwd} directly.`
-        : `branch mode${session?.workBranch ? ` on ${session.workBranch}` : ""}: tools act on the isolated Branch.`;
-      return `${where} Host policy: ${policy}.`;
-    }
-    if (target === "host" && mode !== "host" && !byUser) {
-      if (policy === "never") return "Refused: the host policy is \"never\"; the agent cannot leave the Branch. The user can switch with /minilfs mode host or /minilfs policy.";
-      if (policy === "ask") {
-        const c = ctx ?? lastCtx;
-        if (!c?.hasUI) return "Refused: switching to host mode needs the user's approval and there is no UI. Start with --minilfs-host auto, or have the user run /minilfs mode host.";
-        const ok = await c.ui.confirm("Let the agent work on your real folder (host mode)?",
-          `${reason || "no reason given"}\n\nFile tools and bash will act directly on ${hostCwd}, without isolation, until the agent switches back.\nTo stop being asked: /minilfs policy auto`);
-        if (!ok) return "The user declined host mode. Stay on the Branch, or ask the user what to do.";
-      }
-    }
-    let s: LayerfsSession | null = null;
-    // To host: do not wait behind a start still in progress (e.g. a long first import); use the
-    // session only if it is already open. To branch: the Branch must exist, so wait for it.
-    if (target === "host") s = openSession;
-    else { try { s = await need(); } catch { s = null; } }
-    const r = await switchMode(s, mode, target, { reason, discard, startError: startError?.message ?? null });
-    if (r.ok && r.mode !== mode) {
-      mode = r.mode;
-      if (s) recordSession(s);
-      pi.appendEntry(MODE_ENTRY, { mode, policy, reason: reason ?? "", at: Date.now() });
-      const c = ctx ?? lastCtx;
-      status(c, s ? describe(s) : mode === "host" ? "minilfs HOST mode · edits go to your folder" : undefined);
-      if (c?.hasUI) c.ui.notify(`minilfs: ${r.message}`, mode === "host" ? "warning" : "info");
-    }
-    return r.message;
-  }
-
-  if (boot0().enabled) {
-    pi.registerTool({
-      name: MODE_TOOL_NAME,
-      label: "workspace mode",
-      description: MODE_TOOL_DESCRIPTION,
-      parameters: MODE_TOOL_SCHEMA as any,
-      async execute(_id: string, params: any, _signal: any, _onUpdate: any, ctx: ExtensionContext) {
-        if (disabled) return { content: [{ type: "text" as const, text: "minilfs is off for this run: tools already act on the user's folder." }], details: undefined };
-        const text = await changeMode(params.mode, params.reason, Boolean(params.discard), ctx, false);
-        return { content: [{ type: "text" as const, text }], details: undefined };
-      },
-    } as any);
-  }
-
-  // ------------------------------------------------------------- team mode (MINILFS_TEAM=1)
+  // ------------------------------------------------------------- branch control tools
   const boot = resolveConfig();
-  const isChild = process.env.PI_SUBAGENT_CHILD === "1";
-  if (boot.team && boot.enabled) {
+  if (boot.enabled) {
     const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: undefined });
     pi.registerTool({
       name: "minilfs",
@@ -257,7 +272,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       },
     } as any);
 
-    if (!isChild) {
+    if (role.role === "lead") {
       pi.registerTool({
         name: "minilfs_apply",
         label: "minilfs apply",
@@ -276,16 +291,41 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     }
   }
 
+  // the user's !cmd runs on the real folder (the user is the highest authority), with the same
+  // converge -> run -> sync-back steps as an elevated agent command, so the Branch stays in step
   pi.on("user_bash", async (_event, ctx) => {
-    if (onHostNow()) return undefined;
-    const s = await need();
+    if (disabled) return undefined;
+    const s = await need().catch(() => null);
+    if (!s) return undefined;
     return {
       operations: {
         exec: async (cmd: string, cwd: string, o: any) => {
-          const r = await s.mutate("user_bash", "user_bash", () => s.exec(cmd, cwd, o));
-          const note = report(ctx, s, r);
-          if (note) o.onData(Buffer.from(note));
-          return r.value;
+          const hostCwdOf = cwd && cwd.startsWith(s.cwd) ? cwd : hostCwd;
+          const { spawn } = await import("node:child_process");
+          const runIt = () => new Promise<{ exitCode: number | null }>((done, fail) => {
+            const child = spawn(process.env.SHELL || "/bin/bash", ["-c", cmd], { cwd: hostCwdOf, env: o.env ?? process.env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+            const kill = () => { try { process.kill(-child.pid!, "SIGKILL"); } catch { child.kill("SIGKILL"); } };
+            o.signal?.addEventListener("abort", kill, { once: true });
+            const timer = o.timeout ? setTimeout(kill, o.timeout * 1000) : undefined;
+            child.stdout.on("data", o.onData);
+            child.stderr.on("data", o.onData);
+            child.on("error", fail);
+            child.on("close", (code) => { if (timer) clearTimeout(timer); done({ exitCode: code }); });
+          });
+          try {
+            const r = await s.runElevated(runIt, { reason: "user command" });
+            if (r.checkpoint) pi.appendEntry(CHECKPOINT_ENTRY, { ...r.checkpoint, project: s.project, branch: s.workBranch });
+            recordSession(s);
+            const notes = [
+              r.applied.length ? `[minilfs] applied ${r.applied.length} Branch change(s) to your folder first` : "",
+              r.synced.length ? `[minilfs] brought ${r.synced.length} changed file(s) back into the Branch` : "",
+              r.note.trim(),
+            ].filter(Boolean);
+            if (notes.length) o.onData(Buffer.from(`\n${notes.join("\n")}\n`));
+            return r.value;
+          } finally {
+            status(ctx, describe(s));
+          }
         },
       },
     };
@@ -350,11 +390,10 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       status(ctx, describe(session));
       return;
     }
-    lastCtx = ctx;
     const branchEntries = ctx.sessionManager.getBranch();
-    const lastMode = [...branchEntries].reverse().find((e: any) => e.type === "custom" && e.customType === MODE_ENTRY) as any;
-    policy = lastMode?.data?.policy ?? hostPolicy(process.env, pi.getFlag("minilfs-host"));
-    mode = lastMode?.data?.mode === "host" || (!lastMode && policy === "bypass") ? "host" : initialMode();
+    role = resolveRole({ sessionFile: ctx.sessionManager.getSessionFile?.() });
+    const lastPolicy = [...branchEntries].reverse().find((e: any) => e.type === "custom" && e.customType === POLICY_ENTRY) as any;
+    policy = lastPolicy?.data?.policy ?? elevatePolicy(process.env, pi.getFlag("minilfs-elevate"));
     const branchInfo = inspectBranchEntries(branchEntries);
     const forkRef = event.reason === "fork" ? (pendingForkRef ?? branchInfo.headCommit ?? branchInfo.baseRef ?? null) : null;
     pendingForkRef = null;
@@ -369,9 +408,9 @@ export default function minilfsExtension(pi: ExtensionAPI) {
   function start(ctx: ExtensionContext, reason: any, branchInfo: ReturnType<typeof inspectBranchEntries>, forkRef: string | null) {
     const config = resolveConfig();
     const event = { reason };
+    if (role.role === "worker" && role.branchName && !config.branchName) config.branchName = role.branchName;
     const s = new LayerfsSession(ctx.cwd, ctx.sessionManager.getSessionId(), config);
     session = s;
-    openSession = null;
     startError = null;
     // Show the phase and elapsed seconds, so a long first import is visible instead of a frozen "starting…".
     const t0 = Date.now();
@@ -390,14 +429,13 @@ export default function minilfsExtension(pi: ExtensionAPI) {
         project: s.project, volume: s.volume, cwd: s.cwd,
         baseBranch: s.baseBranch, workBranch: s.workBranch, baseRef: s.baseRef, headCommit: s.headCommit,
       });
-      if (session === s) openSession = s;
       status(ctx, describe(s));
       if (s.resumeLost && ctx.hasUI) ctx.ui.notify(`minilfs: ${s.resumeLost}.`, "warning");
       return s;
     }, (e) => {
       startError = e;
       status(ctx, "minilfs FAILED · /minilfs retry");
-      if (ctx.hasUI) ctx.ui.notify(`minilfs failed to start: ${e.message}\nNothing is written to the host folder. Fix the cause, then /minilfs retry, or /minilfs mode host to work on the folder directly.`, "error");
+      if (ctx.hasUI) ctx.ui.notify(`minilfs failed to start: ${e.message}\nNothing is written to the host folder. Fix the cause, then /minilfs retry.`, "error");
       throw e;
     });
     ready.catch(() => {});
@@ -407,7 +445,6 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     if (event.reason === "reload") return;
     const s = session;
     session = null;
-    openSession = null;
     const r = ready;
     ready = null;
     if (!s) return;
@@ -427,23 +464,21 @@ export default function minilfsExtension(pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event) => {
     if (disabled) return undefined;
-    if (mode === "host") {
-      return { systemPrompt: `${event.systemPrompt}\n\nminilfs is in HOST mode: file tools and bash act directly on ${hostCwd}, without isolation; edits are immediate and not undoable. Switch back with workspace_mode mode=branch as soon as the host-only step is done.` };
-    }
+    const lead = role.role === "lead";
     const note = [
       "",
       "File tools and bash run on an isolated minilfs Branch of this project.",
-      policy === "never"
-        ? "You cannot leave the Branch (host policy: never). If a step cannot work here, tell the user."
-        : `If a step cannot work on the Branch (nested sandbox, mounts, setuid/privileged tools, git operations on the user's repo, a long-running dev server, testing minilfs itself), switch with workspace_mode mode=host, then back to mode=branch.${policy === "ask" ? " The user approves each switch to host." : ""}`,
-      `Paths under ${session?.cwd ?? "the working directory"} refer to that Branch; edits there do NOT reach the user's folder until the user runs /minilfs apply.`,
+      `Paths under ${session?.cwd ?? "the working directory"} refer to that Branch; edits there do NOT reach the user's folder until ${lead ? "minilfs_apply (or an elevated command, which applies first)" : "the main agent merges your branch"}.`,
       "Files outside the working directory are read-only. Secret files such as .env are not imported.",
-      "Each bash call runs in its own sandbox: background processes (`cmd &`, dev servers) end when that call ends. Start and use a server within one bash call.",
-      ...(resolveConfig().team ? [
-        isChild
-          ? "Team mode: you work on your own branch. Use the `minilfs` tool (status/diff/sync); report your branch name from `minilfs status` when you finish. You cannot write the user's folder."
-          : "Team mode: the `minilfs` tool merges other branches (e.g. sub-agents') into yours; `minilfs_apply` writes your branch into the user's folder and advances main, which new sub-agents start from.",
-      ] : []),
+      "Each sandboxed bash call runs on its own: background processes (`cmd &`, dev servers) end when that call ends.",
+      lead
+        ? (policy === "never"
+          ? "Elevated commands are disabled: if a step needs the real folder (git commit/push, Docker, mounts), tell the user."
+          : `If a step cannot run in the sandbox (Docker, mounts, setuid tools, long-running services, "Operation not permitted"), run that one bash command with elevated: true and a reason${policy === "ask" ? "; the user approves each one" : ""}. Git commands that must reach the user's repository (commit, push, checkout, branch, stash, reset) always need elevated: true; in the sandbox they only change the Branch's copy of .git. Keep other work on the Branch.`)
+        : "You are a sub-agent: work only on your branch. You cannot write the user's folder or run elevated commands; if a step needs the real machine, say so in your result for the main agent. Do not run git commit/checkout/reset.",
+      lead
+        ? "The `minilfs` tool merges sub-agent branches into yours (merge, diff, show, ls, branches); `minilfs_apply` writes your branch to the user's folder."
+        : "The `minilfs` tool: status, diff, sync (bring the latest trunk into your branch).",
     ].join("\n");
     return { systemPrompt: `${event.systemPrompt}\n${note}` };
   });
@@ -460,12 +495,11 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     ["merge", "把另一个分支（如子 agent 的分支）合并进本会话：merge <branch>"],
     ["retry", "checkpoint 失败被锁住后重试；启动失败（如目录太大）后重新启动"],
     ["clean", "清理本项目的 scratch 构建缓存目录"],
-    ["mode", "切换工作位置：mode branch（隔离分支，默认）| mode host（直接在你的目录）| mode（查看）"],
-    ["policy", "agent 能否自己切到 host：ask（默认，每次问你）| auto（自己切）| bypass（直接在 host 工作）| never"],
+    ["elevate", "主 agent 的单条提权：auto（默认，不问）| ask（每条确认）| never；不带参数查看"],
   ];
 
   pi.registerCommand("minilfs", {
-    description: "minilfs workspace: status | diff | history | apply | merge | retry | sync | branches | clean | mode | policy",
+    description: "minilfs workspace: status | diff | history | apply | merge | retry | sync | branches | clean | elevate",
     getArgumentCompletions: (prefix: string) => {
       const typed = prefix.trim();
       if (SUBCOMMANDS.some(([n]) => n === typed || typed.startsWith(`${n} `))) return null;
@@ -477,19 +511,13 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       const sub = argv[0] || "status";
       const say = (t: string, level: "info" | "warning" | "error" = "info") => (ctx.hasUI ? ctx.ui.notify(t, level) : console.log(t));
       if (disabled) return say("minilfs is off for this run.", "warning");
-      if (sub === "mode") {
-        const target = (argv[1] ?? "status") as any;
-        if (!["branch", "host", "status"].includes(target)) return say("用法：/minilfs mode [branch|host] [--discard]", "warning");
-        return say(await changeMode(target, "user command", argv.includes("--discard"), ctx, true));
-      }
-      if (sub === "policy") {
+      if (sub === "elevate") {
         const v = argv[1];
-        if (!v) return say(`Host policy: ${policy} (ask | auto | bypass | never).`);
-        if (!["ask", "auto", "bypass", "never"].includes(v)) return say("用法：/minilfs policy ask|auto|bypass|never", "warning");
-        policy = v as HostPolicy;
-        pi.appendEntry(MODE_ENTRY, { mode, policy, reason: "policy change", at: Date.now() });
-        if (policy === "bypass" && mode !== "host") return say(`Host policy: bypass. ${await changeMode("host", "bypass permissions", argv.includes("--discard"), ctx, true)}`);
-        return say(`Host policy: ${policy}.`);
+        if (!v) return say(`Elevated commands: ${policy} (auto | ask | never). Role: ${role.role} (${role.source}).`);
+        if (!["auto", "ask", "never"].includes(v)) return say("用法：/minilfs elevate auto|ask|never", "warning");
+        policy = v as ElevatePolicy;
+        pi.appendEntry(POLICY_ENTRY, { policy, at: Date.now() });
+        return say(`Elevated commands: ${policy}.`);
       }
       if (sub === "retry" && startError && restart) {
         say("Restarting minilfs…");
@@ -502,6 +530,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       if (sub === "status") {
         return say([
           describe(s),
+          `role ${role.role} (${role.source}) · elevated commands: ${role.role === "lead" ? policy : "not allowed"}`,
           `project ${s.project} · volume ${s.volume}`,
           `branch ${s.workBranch} (alias: ${s.logicalBranch}, base ${s.baseBranch} @ ${s.baseRef.slice(0, 12)}) · head ${(s.headCommit ?? "none").slice(0, 12)}`,
           s.blocked ? `blocked: ${s.blocked.reason}` : "",
