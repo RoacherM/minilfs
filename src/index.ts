@@ -277,30 +277,48 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     const branchInfo = inspectBranchEntries(ctx.sessionManager.getBranch());
     const forkRef = event.reason === "fork" ? (pendingForkRef ?? branchInfo.headCommit ?? branchInfo.baseRef ?? null) : null;
     pendingForkRef = null;
+    restart = () => start(ctx, event.reason, branchInfo, forkRef);
+    // a retry after a fork reuses the fork ref; the pending one was consumed above
+    start(ctx, event.reason, branchInfo, forkRef);
+  });
 
+  /** Re-runs a failed start (`/minilfs retry`), e.g. after ignoring large folders in .gitignore. */
+  let restart: (() => void) | null = null;
+
+  function start(ctx: ExtensionContext, reason: any, branchInfo: ReturnType<typeof inspectBranchEntries>, forkRef: string | null) {
+    const config = resolveConfig();
+    const event = { reason };
     const s = new LayerfsSession(ctx.cwd, ctx.sessionManager.getSessionId(), config);
     session = s;
     startError = null;
+    // Show the phase and elapsed seconds, so a long first import is visible instead of a frozen "starting…".
+    const t0 = Date.now();
+    let phase = "starting…";
+    const tick = () => { if (session === s) status(ctx, `minilfs ${phase} ${Math.round((Date.now() - t0) / 1000)}s`); };
     status(ctx, "minilfs starting…");
+    const ticker = setInterval(tick, 1000);
+    ticker.unref?.();
     ready = s.open({
       reason: event.reason,
       resumeBinding: branchInfo.project ? branchInfo : undefined,
       forkFromRef: forkRef,
-    }).then(() => {
+      onPhase: (p) => { phase = p; tick(); },
+    }).finally(() => clearInterval(ticker)).then(() => {
       pi.appendEntry(SESSION_ENTRY, {
         project: s.project, volume: s.volume, cwd: s.cwd,
         baseBranch: s.baseBranch, workBranch: s.workBranch, baseRef: s.baseRef, headCommit: s.headCommit,
       });
       status(ctx, describe(s));
+      if (s.resumeLost && ctx.hasUI) ctx.ui.notify(`minilfs: ${s.resumeLost}.`, "warning");
       return s;
     }, (e) => {
       startError = e;
-      status(ctx, "minilfs FAILED");
-      if (ctx.hasUI) ctx.ui.notify(`minilfs failed to start: ${e.message}\nFile tools are disabled; nothing is written to the host folder.`, "error");
+      status(ctx, "minilfs FAILED · /minilfs retry");
+      if (ctx.hasUI) ctx.ui.notify(`minilfs failed to start: ${e.message}\nFile tools are disabled; nothing is written to the host folder. Fix the cause, then /minilfs retry.`, "error");
       throw e;
     });
     ready.catch(() => {});
-  });
+  }
 
   pi.on("session_shutdown", async (event, ctx) => {
     if (event.reason === "reload") return;
@@ -309,7 +327,15 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     const r = ready;
     ready = null;
     if (!s) return;
-    await r?.catch(() => {});
+    // Do not hold /resume, /new or quit behind a long first import: if start has not finished in
+    // 2 s, mark the session closing (open stops at its next step) and close it when start settles.
+    const settled = await Promise.race([r?.then(() => true, () => true) ?? true, new Promise((res) => setTimeout(() => res(false), 2000))]);
+    if (!settled) {
+      s.abortOpen();
+      void r?.catch(() => {}).then(() => s.close()).catch(() => {});
+      status(ctx, undefined);
+      return;
+    }
     const out = await s.close().catch((e) => ({ kept: true, notes: [`close failed: ${e.message}`] }));
     status(ctx, undefined);
     if (out.notes.length && ctx.hasUI) ctx.ui.notify(`minilfs: ${out.notes.join("; ")}`, out.kept ? "warning" : "info");
@@ -342,7 +368,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     ["sync", "把你在外面的改动同步进 LayerFS main（--full 全量重新校验）"],
     ["branches", "列出项目里所有分支"],
     ["merge", "把另一个分支（如子 agent 的分支）合并进本会话：merge <branch>"],
-    ["retry", "checkpoint 失败被锁住后重试"],
+    ["retry", "checkpoint 失败被锁住后重试；启动失败（如目录太大）后重新启动"],
     ["clean", "清理本项目的 scratch 构建缓存目录"],
   ];
 
@@ -359,6 +385,12 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       const sub = argv[0] || "status";
       const say = (t: string, level: "info" | "warning" | "error" = "info") => (ctx.hasUI ? ctx.ui.notify(t, level) : console.log(t));
       if (disabled) return say("minilfs is off for this run.", "warning");
+      if (sub === "retry" && startError && restart) {
+        say("Restarting minilfs…");
+        restart();
+        try { await need(); } catch (e: any) { return say(e.message, "error"); }
+        return say("minilfs started.");
+      }
       let s: LayerfsSession;
       try { s = await need(); } catch (e: any) { return say(e.message, "error"); }
       if (sub === "status") {

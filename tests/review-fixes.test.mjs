@@ -200,7 +200,7 @@ try {
   await step("#8 excludes: nested, case-insensitive, directory patterns; same in import and sync", async () => {
     const E = config.excludes;
     for (const p of [".env", "a/b/.env", ".ENV", "app/.env.local", "deep/x.KEY", "secrets/a.txt", "x/secrets/a.txt"]) assert.equal(isExcludedPath(p, E), true, p);
-    for (const p of ["src/env.ts", "envs/a", "secrets.md"]) assert.equal(isExcludedPath(p, E), false, p);
+    for (const p of ["src/env.ts", "envs/a", "secrets.md", ".env.example", "a/.ENV.Sample", ".env.template"]) assert.equal(isExcludedPath(p, E), false, p);
     const cwd = project();
     mkdirSync(join(cwd, "secrets"));
     writeFileSync(join(cwd, "secrets/token.txt"), "t\n");
@@ -690,6 +690,50 @@ try {
       lead.lfs.project.list_branches = realListBranches;
       lead.lfs.branch.merge = realMerge;
     }
+  });
+
+  await step("ignore rules: git-ignored paths are not imported, synced or applied; tracked files and .env.example are", async () => {
+    const cwd = project();
+    const git = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    writeFileSync(join(cwd, ".gitignore"), "runs/\n*.log\n!keep.log\n");
+    writeFileSync(join(cwd, ".minilfsignore"), "data/\n");
+    mkdirSync(join(cwd, "runs/r1"), { recursive: true });
+    writeFileSync(join(cwd, "runs/r1/big.bin"), "x".repeat(1000));
+    mkdirSync(join(cwd, "data"));
+    writeFileSync(join(cwd, "data/set.csv"), "1\n");
+    writeFileSync(join(cwd, "debug.log"), "noise\n");
+    writeFileSync(join(cwd, "keep.log"), "kept\n");
+    writeFileSync(join(cwd, "forced.log"), "tracked\n");
+    writeFileSync(join(cwd, ".env.example"), "API_KEY=\n");
+    writeFileSync(join(cwd, ".env"), "API_KEY=secret\n");
+    git("init", "-q"); git("add", "-A"); git("add", "-f", "forced.log"); git("commit", "-qm", "i");
+    const s = await open(cwd, "ig");
+    for (const p of ["runs/r1/big.bin", "data/set.csv", "debug.log", ".env"]) assert.equal(await s.exists(join(cwd, p)), false, `${p} not imported`);
+    for (const p of ["keep.log", "forced.log", ".env.example", ".gitignore", "src/app.js"]) assert.equal(await s.exists(join(cwd, p)), true, `${p} imported`);
+    assert.equal((await s.readFile(join(cwd, ".env.example"))).toString(), "API_KEY=\n");
+    // an agent may create ignored output in its branch; apply never writes it, but writes the rest
+    const o = out();
+    await s.mutate("b", "bash", () => s.exec("mkdir -p runs/r2 && echo out > runs/r2/o.txt && echo trace > t.log && echo B=1 >> .env.example && cat .env.example", cwd, o));
+    assert.match(o.text(), /B=1/, ".env.example readable and writable in bash");
+    const r = await s.apply();
+    assert.deepEqual(r.applied, [".env.example"], "only the non-ignored change is applied");
+    assert.equal(existsSync(join(cwd, "runs/r2/o.txt")), false);
+    assert.equal(existsSync(join(cwd, "t.log")), false);
+    assert.equal(s.unapplied, false, "ignored changes do not count as unapplied");
+    // host-side ignored changes are not drift
+    writeFileSync(join(cwd, "runs/r1/new.bin"), "y\n");
+    writeFileSync(join(cwd, "debug.log"), "more noise\n");
+    assert.deepEqual((await s.syncHostDriftIntoMain()).synced, [], "ignored host edits are not synced");
+  });
+
+  await step("too-large first import is refused before copying, naming the largest folders", async () => {
+    const cwd = project();
+    mkdirSync(join(cwd, "big"));
+    for (let i = 0; i < 30; i++) writeFileSync(join(cwd, `big/f${i}.txt`), `${i}\n`);
+    const s = new LayerfsSession(cwd, `tl-${id}`, { ...config, maxImportFiles: 10 });
+    sessions.push(s);
+    await assert.rejects(s.open(), (e) => e.code === "TooLarge" && /big\/ \(30 files/.test(e.message) && /\.gitignore/.test(e.message));
+    assert.equal(readdirSync(join(config.root, "staging")).length, 0, "nothing staged");
   });
 
 } finally {

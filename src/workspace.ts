@@ -1,8 +1,9 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { constants as fsc, existsSync, mkdtempSync, promises as fsp, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { constants as fsc, createReadStream, existsSync, mkdtempSync, promises as fsp, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
+import { IgnoreRules } from "./ignore.ts";
 import { BindingStore, type HostEntry, type HostIndex, type ProjectRecord, type SessionBinding } from "./bindings.ts";
 import type { LayerfsConfig } from "./config.ts";
 import { createProjectClient, ensureNativeDirs, type NativeSpec } from "./core/client.ts";
@@ -24,6 +25,8 @@ export interface MergeResult {
   fallback?: boolean;
 }
 export interface OpenOptions {
+  /** reports the current start phase (shown in the status bar while starting) */
+  onPhase?: (phase: string) => void;
   reason?: "startup" | "reload" | "new" | "resume" | "fork";
   resumeBinding?: { project?: string; baseBranch?: string; workBranch?: string; baseRef?: string; headCommit?: string | null };
   forkFromRef?: string | null;
@@ -111,9 +114,9 @@ const sha = (b: Buffer | string) => createHash("sha256").update(b).digest("hex")
  */
 export class LayerfsSession {
   readonly cwd: string;
-  readonly sessionId: string;
-  readonly shortId: string;
-  readonly logicalBranch: string;
+  sessionId: string;
+  shortId: string;
+  logicalBranch: string;
   readonly touchPathsOnNextExec = new Set<string>();
   readonly mergedFileMtimes = new Map<string, number>();
   readonly config: LayerfsConfig;
@@ -147,6 +150,17 @@ export class LayerfsSession {
   private pendingUnmounts = new Set<Promise<unknown>>();
   private mutex: Promise<unknown> = Promise.resolve();
   private closed = false;
+  private openAborted = false;
+  /**
+   * Git ignore rules (+ `.minilfsignore`): ignored paths are not imported, not synced, never applied,
+   * like branch-only paths. Agents may still create them inside their branch.
+   */
+  readonly ignore: IgnoreRules;
+  /** set by open() when a resumed conversation's file state could not be restored */
+  resumeLost: string | null = null;
+
+  /** The host session is going away: `open()` stops at its next phase. A running native Init is not interruptible. */
+  abortOpen(): void { this.openAborted = true; }
 
   constructor(cwd: string, sessionId: string, config: LayerfsConfig, log: Log = () => {}, driver?: ExecutionDriver) {
     // canonical path: /tmp/x and /private/tmp/x (or a symlinked folder) are one project
@@ -155,6 +169,7 @@ export class LayerfsSession {
     this.shortId = createHash("sha256").update(`${sessionId}:${randomBytes(8).toString("hex")}`).digest("hex").slice(0, 10);
     this.logicalBranch = config.branchName || (config.team && process.env.PI_SUBAGENT_CHILD !== "1" ? "lead" : `s-${this.shortId}`);
     this.config = config;
+    this.ignore = new IgnoreRules(this.cwd);
     this.driver = driver ?? resolveExecutionDriver(config.driver ?? "native");
     this.log = log;
   }
@@ -183,10 +198,16 @@ export class LayerfsSession {
     await LayerfsSession.preflight(this.config);
     this.spec = ensureNativeDirs(this.config);
     this.bindings = new BindingStore(join(this.config.root, "state"));
+    await this.ignore.load();
 
+    const phase = (p: string) => {
+      if (this.openAborted) throw new LayerfsError("Aborted", "session closed while minilfs was starting");
+      options.onPhase?.(p);
+    };
     const existing = this.bindings.byFolder(this.cwd);
     const usable = existing && (await this.isProjectAlive(existing));
     if (!usable) {
+      phase("importing folder (first run)…");
       this.projectRecord = await this.initProjectForFolder();
     } else {
       this.projectRecord = existing!;
@@ -204,11 +225,14 @@ export class LayerfsSession {
             ),
         );
       if (options.reason !== "reload" && !(options.reason === "resume" && hasPriorSession) && !options.forkFromRef) {
+        phase("syncing host changes…");
         await this.syncHostDriftIntoMain();
       }
     }
 
+    phase("preparing branch…");
     await this.setupBranches(options);
+    phase("ready");
     this.persistSessionBinding();
     this.log(`ready in ${Date.now() - t0} ms (project=${this.project} base=${this.baseBranch} work=${this.workBranch})`);
   }
@@ -221,8 +245,10 @@ export class LayerfsSession {
   }
 
   private async initProjectForFolder(): Promise<ProjectRecord> {
-    return this.bindings.withProjectLock("_init", async () => {
-      const name = this.bindings.freeProjectName(this.cwd, this.spec.home);
+    // One lock per folder: importing a large folder must not block other projects from starting.
+    // Waiters for the same folder wait as long as the importer is alive (it heartbeats the lock).
+    const folderLock = `_init-${sha(this.cwd).slice(0, 16)}`;
+    return this.bindings.withProjectLock(folderLock, async () => {
       const again = this.bindings.byFolder(this.cwd);
       if (again && (await this.isProjectAlive(again))) {
         const client = await createProjectClient(this.spec, again);
@@ -231,18 +257,22 @@ export class LayerfsSession {
         this.LayerFSError = client.LayerFSError;
         return again;
       }
+      const reserved = this.bindings.reserveProjectName(this.cwd, this.spec.home);
+      const name = reserved.name;
       const created = Date.now();
       const volume = `${this.config.prefix}${name}-store-${created.toString(36)}`;
       const staged = join(this.config.root, "staging", `${name}-${created}`);
       await fsp.mkdir(staged, { recursive: true });
       try {
         const list = join(this.config.root, "staging", `${name}-${created}.files`);
-        await fsp.writeFile(list, (await listImportable(this.cwd, this.hostSkip)).join("\0"));
+        const importable = await listImportable(this.cwd, this.hostSkip);
+        await checkImportSize(this.cwd, importable, this.config);
+        await fsp.writeFile(list, importable.join("\0"));
         const rs = await runLocal("rsync", ["-a", "--no-implied-dirs", "--links", "--from0", `--files-from=${list}`, `${this.cwd}/`, `${staged}/`]);
         await fsp.rm(list, { force: true });
         if (rs.code !== 0) throw new LayerfsError("Failed", `staging copy failed: ${rs.stderr.slice(0, 400)}`);
 
-        const stagedScan = await scanHostDirectory(staged, this.hostSkip, {}, true);
+        const stagedScan = await scanHostDirectory(staged, this.hostSkip, {}, true, false);
         const hostIndex: HostIndex = {};
         for (const [rel, ent] of Object.entries(stagedScan.index)) {
           hostIndex[rel] = ent;
@@ -260,18 +290,25 @@ export class LayerfsSession {
         try {
           const initRes = await this.lfs.project.init(staged);
           record.mainRef = initRes.layer;
-        } catch (e) {
+        } catch (e: any) {
           await fsp.rm(join(this.spec.stores, volume), { recursive: true, force: true }).catch(() => {});
           await fsp.rm(join(this.spec.home, name), { recursive: true, force: true }).catch(() => {});
+          if (/Deadline/.test(String(e?.message ?? e))) {
+            const mb = Math.round(Object.values(hostIndex).reduce((s, x) => s + (x.size ?? 0), 0) / 1024 / 1024);
+            throw new LayerfsError("InitDeadline",
+              `importing ${Object.keys(hostIndex).length} files (${mb} MB) took longer than LayerFS's fixed 60 s Init limit; nothing was kept. ` +
+              `Ignore large folders agents need not edit (data, build output) in .gitignore or ${join(this.cwd, ".minilfsignore")}, then run /minilfs retry.`, e);
+          }
           throw e;
         }
         this.bindings.writeHostIndex(name, hostIndex);
         this.bindings.addProject(this.cwd, record);
         return record;
       } finally {
+        reserved.release();
         await fsp.rm(staged, { recursive: true, force: true }).catch(() => {});
       }
-    });
+    }, INIT_LOCK_WAIT_MS);
   }
 
   /**
@@ -279,6 +316,7 @@ export class LayerfsSession {
    */
   async syncHostDriftIntoMain(options: { full?: boolean } = {}): Promise<{ synced: string[] }> {
     return this.bindings.withProjectLock(this.projectRecord.name, async (guard) => {
+      await this.ignore.load(); // .gitignore / tracked files may have changed since the last session
       const full = options.full || Boolean(this.bindings.byName(this.projectRecord.name)?.mainStale);
       const prev = full ? await this.mainIndex() : this.bindings.readHostIndex(this.projectRecord.name);
       const scanned = await scanHostDirectory(this.cwd, this.hostSkip, full ? {} : prev, true);
@@ -289,7 +327,10 @@ export class LayerfsSession {
         const old = prev[rel];
         if (!old || !sameSig(old, ent)) changed.push(rel);
       }
-      for (const rel of Object.keys(prev)) if (!curr[rel]) removed.push(rel);
+      // a path that is now ignored is branch-only: sync leaves it in main (projects imported before
+      // ignore rules applied keep their node_modules etc. instead of a mass delete)
+      const skip = this.hostSkip;
+      for (const rel of Object.keys(prev)) if (!curr[rel] && !skip(rel, false)) removed.push(rel);
       if (!changed.length && !removed.length) {
         this.bindings.writeHostIndex(this.projectRecord.name, curr);
         if (full) this.bindings.setMainStale(this.projectRecord.name, false);
@@ -350,12 +391,14 @@ export class LayerfsSession {
     const tmp = `r-${this.shortId}-${(++this.seq)}`;
     await this.lfs.branch.fork(tmp, "main");
     return this.withMountedBranch(tmp, false, "main index", async (wsPath) => {
-      return (await scanHostDirectory(wsPath, this.hostSkip, {}, true)).index;
+      return (await scanHostDirectory(wsPath, this.hostSkip, {}, true, false)).index;
     });
   }
 
-  private get hostSkip(): string[] {
-    return [...this.config.excludes, ...this.config.branchOnly];
+  /** Host paths never imported or synced: secrets, branch-only patterns, git-ignored paths. */
+  private get hostSkip(): Skip {
+    const patterns = [...this.config.excludes, ...this.config.branchOnly];
+    return (rel, isDir) => isExcludedPath(rel, patterns) || (isDir && isExcludedPath(`${rel}/x`, patterns)) || this.ignore.isIgnored(rel, isDir);
   }
 
   private async setupBranches(options: OpenOptions): Promise<void> {
@@ -401,6 +444,10 @@ export class LayerfsSession {
         this.headCommit = wb.head;
         this.unapplied = await this.hasApplicable();
         return;
+      }
+      if (targetRef && !bb) {
+        // the conversation's file state lived in a Store that no longer has it (Store recreated)
+        this.resumeLost = `the saved file state (${saved.workBranch} @ ${String(targetRef).slice(0, 12)}) is not in this project's Store any more; starting a fresh branch from main`;
       }
       if (targetRef && bb) {
         this.seq++;
@@ -1329,7 +1376,9 @@ export class LayerfsSession {
   private async reapHolders(wsPath: string): Promise<void> {
     const spellings = bothSpellings(wsPath);
     for (const p of spellings) {
-      const r = await run("lsof", ["-t", "+D", p], { timeoutMs: 5000 }).catch(() => null);
+      // `lsof <mount point>` lists every process using that file system without walking it;
+      // `+D` walked the whole tree over NFS before every unmount (1 s per 20k files).
+      const r = await run("lsof", ["-t", p], { timeoutMs: 5000 }).catch(() => null);
       if (r?.stdout && r.stdout.length > 0) {
         const pids = r.stdout.toString().split(/\s+/).filter(Boolean);
         for (const pid of pids) {
@@ -1366,8 +1415,11 @@ export class LayerfsSession {
       await fsp.appendFile(excludePath, (existing.length && !existing.endsWith("\n") ? "\n" : "") + "/.lww\n").catch(() => {});
     }
     if (this.config.excludes.length > 0) {
-      const excludesFlat = this.config.excludes.flatMap(expandBraces).filter(Boolean);
-      const excludeArgs = excludesFlat.flatMap((pat) => [`:(glob,icase)${pat}`, `:(glob,icase)**/${pat}`]);
+      const excludesFlat = this.config.excludes.flatMap(expandBraces).map((p) => p.trim()).filter(Boolean);
+      // `!pattern` re-includes become git exclude pathspecs, so templates are not marked skip-worktree
+      const excludeArgs = excludesFlat.flatMap((pat) => pat.startsWith("!")
+        ? [`:(exclude,glob,icase)${pat.slice(1)}`, `:(exclude,glob,icase)**/${pat.slice(1)}`]
+        : [`:(glob,icase)${pat}`, `:(glob,icase)**/${pat}`]);
       const gitEnv = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
       const ls = await run("git", ["-C", wsReal, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.quotePath=false", "ls-files", "-v", "--", ...excludeArgs], { env: gitEnv, timeoutMs: 10_000 }).catch(() => null);
       if (ls?.code === 0 && ls.stdout.length > 0) {
@@ -1574,14 +1626,14 @@ export class LayerfsSession {
       for (let pos = 0; ; ) {
         const page = await this.lfs.branch.diff_branches(this.baseBranch, snapBranch, 1000, pos, { hunks: false });
         for (const it of page.items ?? []) {
-          if (it.type !== "dir" && !(this.config.branchOnly.length && isExcludedPath(it.path.replace(/^\/+/, ""), this.config.branchOnly))) {
+          if (it.type !== "dir" && !this.isBranchOnly(it.path)) {
             items.push({ path: it.path, kind: it.kind, type: it.type });
           }
         }
         if (!page.hasMore || !(page.items ?? []).length) break;
         pos = page.nextPagePos ?? (pos + page.items.length);
       }
-      if (!items.length && !this.config.branchOnly.length) {
+      if (!items.length && !this.config.branchOnly.length && !this.ignore.active) {
         this.unapplied = false;
         this.persistSessionBinding();
         return result;
@@ -1593,7 +1645,7 @@ export class LayerfsSession {
       await this.withMountedBranch(snapBranch, false, "apply read", async (wsPath) => {
         for (const it of items) {
           const rel = it.path.replace(/^\/+/, "");
-          if (rel === ".lww" || rel === ".git" || rel.startsWith(".git/") || isExcludedPath(rel, this.hostSkip)) {
+          if (rel === ".lww" || rel === ".git" || rel.startsWith(".git/") || this.hostSkip(rel, false)) {
             result.skipped.push(rel);
             continue;
           }
@@ -1745,10 +1797,18 @@ export class LayerfsSession {
     }
   }
 
+  /** Paths that apply writes to the host and diff/history show: not secret, not branch-only, not git-ignored. */
   isApplicable(path: string): boolean {
     const p = String(path ?? "").replace(/^\/+/, "");
-    if (this.config.branchOnly.length && isExcludedPath(p, this.config.branchOnly)) return false;
+    if (this.isBranchOnly(p)) return false;
     return !isExcludedPath(p, this.config.excludes);
+  }
+
+  /** Lives only in branches (MINILFS_BRANCH_ONLY or git-ignored): never applied, never synced. */
+  isBranchOnly(path: string): boolean {
+    const p = String(path ?? "").replace(/^\/+/, "");
+    if (!p || p === ".lww") return false;
+    return (this.config.branchOnly.length > 0 && isExcludedPath(p, this.config.branchOnly)) || this.ignore.isIgnored(p);
   }
 
   private async hasApplicable(): Promise<boolean> {
@@ -1862,60 +1922,76 @@ export function isOutsideSecret(abs: string, excludes: string[]): boolean {
   return false;
 }
 
-export function isExcludedPath(relPath: string, patterns: string[]): boolean {
-  const rel = relPath.replace(/^\/+/, "").toLowerCase();
-  if (!rel) return false;
-  const parts = rel.split("/");
+interface CompiledPattern { pat: string; dirOnly: boolean; anchored: boolean; negate: boolean; hits: Map<string, boolean> }
+const compiledPatterns = new Map<string, CompiledPattern[]>();
+function compilePatterns(patterns: string[]): CompiledPattern[] {
+  const key = patterns.join("\0");
+  let out = compiledPatterns.get(key);
+  if (out) return out;
+  out = [];
   for (const raw of patterns.flatMap(expandBraces)) {
     let pat = raw.trim().toLowerCase();
+    const negate = pat.startsWith("!");
+    if (negate) pat = pat.slice(1);
     if (!pat) continue;
     const dirOnly = pat.endsWith("/");
     if (dirOnly) pat = pat.slice(0, -1);
     const anchored = pat.startsWith("/") || pat.includes("/");
-    pat = pat.replace(/^\/+/, "");
-    if (!anchored) {
-      const comps = dirOnly ? parts.slice(0, -1) : parts;
-      if (comps.some((c) => posix.matchesGlob(c, pat))) return true;
-      continue;
-    }
-    for (let i = 1; i <= parts.length; i++) {
-      const prefix = parts.slice(0, i).join("/");
-      if (dirOnly && i === parts.length) break;
-      if (posix.matchesGlob(prefix, pat)) return true;
-    }
+    out.push({ pat: pat.replace(/^\/+/, ""), dirOnly, anchored, negate, hits: new Map() });
+  }
+  if (compiledPatterns.size > 64) compiledPatterns.clear();
+  compiledPatterns.set(key, out);
+  return out;
+}
+
+/** Path components repeat (index.js, src, node_modules): remember each match result. */
+function componentMatches(c: string, p: CompiledPattern): boolean {
+  let hit = p.hits.get(c);
+  if (hit === undefined) {
+    hit = posix.matchesGlob(c, p.pat);
+    if (p.hits.size > 100_000) p.hits.clear();
+    p.hits.set(c, hit);
+  }
+  return hit;
+}
+
+function patternMatches(cp: CompiledPattern, parts: string[]): boolean {
+  if (!cp.anchored) return (cp.dirOnly ? parts.slice(0, -1) : parts).some((c) => componentMatches(c, cp));
+  for (let i = 1; i <= parts.length; i++) {
+    if (cp.dirOnly && i === parts.length) break;
+    if (posix.matchesGlob(parts.slice(0, i).join("/"), cp.pat)) return true;
   }
   return false;
 }
 
-async function listImportable(root: string, excludes: string[]): Promise<string[]> {
-  const out: string[] = [];
-  const walk = async (dir: string) => {
-    let entries;
-    try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch (e: any) {
-      if (e?.code === "ENOENT") return;
-      throw new LayerfsError("ScanFailed", `cannot read ${relative(root, dir) || "."}: ${e?.code ?? e}`);
+/**
+ * Case-insensitive gitignore-like match. A `!pattern` re-includes a path matched by an earlier
+ * pattern (last match wins), e.g. `.env.*` then `!.env.example`.
+ */
+export function isExcludedPath(relPath: string, patterns: string[]): boolean {
+  const rel = relPath.replace(/^\/+/, "").toLowerCase();
+  if (!rel) return false;
+  const parts = rel.split("/");
+  let excluded = false;
+  for (const cp of compilePatterns(patterns)) {
+    if (cp.negate ? excluded : !excluded) {
+      if (patternMatches(cp, parts)) excluded = !cp.negate;
     }
-    for (const ent of entries) {
-      const abs = join(dir, ent.name);
-      const rel = relative(root, abs).split("\\").join("/");
-      if (!rel.startsWith(".git/") && rel !== ".git" && (isExcludedPath(rel, excludes) || (ent.isDirectory() && isExcludedPath(`${rel}/x`, excludes)))) continue;
-      if (ent.isDirectory()) await walk(abs);
-      else out.push(rel);
-    }
-  };
-  await walk(root);
-  return out;
+  }
+  return excluded;
 }
 
 export function rsyncExcludeArgs(patterns: string[]): string[] {
   const ci = (p: string) => p.replace(/\[[^\]]*\]|[a-z]/gi, (m) => (m.length > 1 ? m : `[${m.toLowerCase()}${m.toUpperCase()}]`));
   return patterns.flatMap(expandBraces).map((p) => p.trim()).filter(Boolean).map((p) => {
+    const include = p.startsWith("!");
+    if (include) p = p.slice(1);
     const dirOnly = p.endsWith("/");
     const body = dirOnly ? p.slice(0, -1) : p;
     const anchored = body.startsWith("/") || body.includes("/");
     const rule = `${anchored ? `/${body.replace(/^\/+/, "")}` : body}${dirOnly ? "/" : ""}`;
-    return `--exclude=${ci(rule)}`;
-  });
+    return `--${include ? "include" : "exclude"}=${ci(rule)}`;
+  }).sort((a, b) => Number(b.startsWith("--include")) - Number(a.startsWith("--include"))); // rsync: first match wins
 }
 
 export function expandBraces(pattern: string): string[] {
@@ -1926,45 +2002,141 @@ export function expandBraces(pattern: string): string[] {
   return m[1].split(",").flatMap((part) => expandBraces(`${prefix}${part}${suffix}`));
 }
 
+/** Refuses an import that would hit LayerFS's fixed 60 s Init deadline; names the biggest folders. */
+async function checkImportSize(root: string, files: string[], config: LayerfsConfig): Promise<void> {
+  let bytes = 0;
+  const perTop = new Map<string, { files: number; bytes: number }>();
+  for (let i = 0; i < files.length; i += SCAN_CONCURRENCY) {
+    const sizes = await Promise.all(files.slice(i, i + SCAN_CONCURRENCY).map((rel) => fsp.lstat(join(root, rel)).then((s) => s.size, () => 0)));
+    sizes.forEach((size, k) => {
+      const rel = files[i + k];
+      bytes += size;
+      const top = rel.includes("/") ? `${rel.split("/")[0]}/` : rel;
+      const t = perTop.get(top) ?? { files: 0, bytes: 0 };
+      t.files++; t.bytes += size;
+      perTop.set(top, t);
+    });
+  }
+  if (files.length <= config.maxImportFiles && bytes <= config.maxImportBytes) return;
+  const mb = (b: number) => `${Math.round(b / 1024 / 1024)} MB`;
+  const biggest = [...perTop.entries()].sort((a, b) => b[1].bytes - a[1].bytes).slice(0, 5)
+    .map(([p, t]) => `${p} (${t.files} files, ${mb(t.bytes)})`).join(", ");
+  throw new LayerfsError("TooLarge",
+    `folder too large to import (${files.length} files, ${mb(bytes)}; limit ${config.maxImportFiles} files / ${mb(config.maxImportBytes)}). ` +
+    `Largest (not ignored): ${biggest}. Ignore folders agents need not edit (data, build output) in .gitignore, ` +
+    `or in ${join(root, ".minilfsignore")} to keep them out of minilfs only (one pattern per line, e.g. "runs/"); then /minilfs retry. ` +
+    `Or raise MINILFS_MAX_IMPORT_FILES / MINILFS_MAX_IMPORT_MB.`);
+}
+
+/** true for a host path that is never imported or synced (`isDir`: the path is a directory) */
+export type Skip = (rel: string, isDir: boolean) => boolean;
+
+async function listImportable(root: string, skip: Skip): Promise<string[]> {
+  const out: string[] = [];
+  const walk = async (dir: string) => {
+    let entries;
+    try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch (e: any) {
+      if (e?.code === "ENOENT") return;
+      throw new LayerfsError("ScanFailed", `cannot read ${relative(root, dir) || "."}: ${e?.code ?? e}`);
+    }
+    for (const ent of entries) {
+      const abs = join(dir, ent.name);
+      const rel = relative(root, abs).split("\\").join("/");
+      if (!rel.startsWith(".git/") && rel !== ".git" && skip(rel, ent.isDirectory())) continue;
+      if (ent.isDirectory()) await walk(abs);
+      else out.push(rel);
+    }
+  };
+  await walk(root);
+  return out;
+}
+
 export function matchesToolGlob(rel: string, pattern: string): boolean {
   if (pattern.includes("/")) return posix.matchesGlob(rel, pattern) || posix.matchesGlob(rel, `**/${pattern}`);
   return posix.matchesGlob(posix.basename(rel), pattern);
 }
 
-async function scanHostDirectory(root: string, excludes: string[], cache: HostIndex = {}, strict = false): Promise<{ index: HostIndex; bytes: Map<string, Buffer> }> {
+/** Same-folder starters wait for a live importer; a large first import can take minutes. */
+const INIT_LOCK_WAIT_MS = 30 * 60_000;
+
+const STREAM_HASH_BYTES = 8 * 1024 * 1024;
+async function streamSha(abs: string): Promise<string> {
+  const h = createHash("sha256");
+  for await (const chunk of createReadStream(abs, { highWaterMark: 1024 * 1024 })) h.update(chunk as Buffer);
+  return h.digest("hex");
+}
+
+/** Parallel directory reads/stats: a sequential walk of a 160k-file folder takes seconds. */
+const SCAN_CONCURRENCY = 32;
+
+/**
+ * Signatures of every file under `root`. Files whose mtime/size/mode match `cache` reuse the
+ * cached entry without reading. With `keepBytes`, bytes are kept only for files whose signature
+ * differs from `cache` (the ones a sync must write); never for the whole tree, which can be GBs.
+ */
+async function scanHostDirectory(root: string, skip: Skip, cache: HostIndex = {}, strict = false, keepBytes = true): Promise<{ index: HostIndex; bytes: Map<string, Buffer> }> {
   const index: HostIndex = {};
   const bytes = new Map<string, Buffer>();
-  const walk = async (dir: string) => {
-    let entries;
-    try {
-      entries = await fsp.readdir(dir, { withFileTypes: true });
-    } catch (e: any) {
-      if (e?.code === "ENOENT" || !strict) return;
-      throw new LayerfsError("ScanFailed", `cannot read ${relative(root, dir) || "."}: ${e?.code ?? e}`);
+  const visit = async (abs: string, rel: string) => {
+    const st = await fsp.lstat(abs).catch((e: any) => (e?.code === "ENOENT" ? null : Promise.reject(e)));
+    if (!st) return;
+    const prev = cache[rel];
+    if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size && (prev.mode === undefined || prev.mode === (st.mode & 0o7777))) {
+      index[rel] = prev;
+      return;
     }
-    for (const ent of entries) {
-      if (ent.name === ".git" || ent.name === ".lww" || ent.name.includes(".minilfs-")) continue;
-      const abs = join(dir, ent.name);
-      const rel = relative(root, abs).split("\\").join("/");
-      if (isExcludedPath(rel, excludes)) continue;
-      if (ent.isDirectory()) { await walk(abs); continue; }
-      const st = await fsp.lstat(abs).catch((e: any) => (e?.code === "ENOENT" ? null : Promise.reject(e)));
-      if (!st) continue;
-      const prev = cache[rel];
-      if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size && (prev.mode === undefined || prev.mode === (st.mode & 0o7777))) {
-        index[rel] = prev;
-        continue;
+    if (st.isSymbolicLink()) {
+      index[rel] = { ...linkSig(await fsp.readlink(abs)), mtimeMs: st.mtimeMs, size: st.size };
+    } else if (st.isFile()) {
+      if (st.size > STREAM_HASH_BYTES) {
+        // hash big files as a stream; a sync that needs the bytes re-reads them
+        index[rel] = { kind: "file", sig: await streamSha(abs), mode: st.mode & 0o7777, mtimeMs: st.mtimeMs, size: st.size };
+        return;
       }
-      if (st.isSymbolicLink()) {
-        index[rel] = { ...linkSig(await fsp.readlink(abs)), mtimeMs: st.mtimeMs, size: st.size };
-      } else if (st.isFile()) {
-        const data = await fsp.readFile(abs);
-        bytes.set(rel, data);
-        index[rel] = { ...fileSig(data, st.mode), mtimeMs: st.mtimeMs, size: st.size };
-      }
+      const data = await fsp.readFile(abs);
+      const entry: HostEntry = { ...fileSig(data, st.mode), mtimeMs: st.mtimeMs, size: st.size };
+      index[rel] = entry;
+      if (keepBytes && !sameSig(prev, entry)) bytes.set(rel, data);
     }
   };
-  await walk(root);
+  // read one directory: queue its sub-directories, stat its files
+  const readDir = async (dir: string, dirRel: string) => {
+      let entries;
+      try {
+        entries = await fsp.readdir(dir, { withFileTypes: true });
+      } catch (e: any) {
+        if (e?.code === "ENOENT" || !strict) return;
+        throw new LayerfsError("ScanFailed", `cannot read ${dirRel || "."}: ${e?.code ?? e}`);
+      }
+      const files: Array<[string, string]> = [];
+      for (const ent of entries) {
+        if (ent.name === ".git" || ent.name === ".lww" || ent.name.includes(".minilfs-")) continue;
+        const rel = dirRel ? `${dirRel}/${ent.name}` : ent.name;
+        // an ignored directory is skipped whole, without reading it
+        if (skip(rel, ent.isDirectory())) continue;
+        const abs = join(dir, ent.name);
+        if (ent.isDirectory()) pending.push([abs, rel]);
+        else files.push([abs, rel]);
+      }
+      for (let i = 0; i < files.length; i += SCAN_CONCURRENCY) {
+        await Promise.all(files.slice(i, i + SCAN_CONCURRENCY).map(([a, r]) => visit(a, r)));
+      }
+  };
+  const pending: Array<[string, string]> = [[root, ""]];
+  let active = 0;
+  let failure: unknown = null;
+  await new Promise<void>((done) => {
+    const pump = () => {
+      while (!failure && active < SCAN_CONCURRENCY && pending.length) {
+        const [abs, rel] = pending.pop()!;
+        active++;
+        readDir(abs, rel).catch((e) => { failure ??= e; }).finally(() => { active--; pump(); });
+      }
+      if (!active && (failure || !pending.length)) done();
+    };
+    pump();
+  });
+  if (failure) throw failure;
   return { index, bytes };
 }
 

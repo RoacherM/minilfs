@@ -1,6 +1,6 @@
 // Project & session bindings (adapted from dsh/packages/host/src/binding.js),
 // plus per-project file locks and host-index manifests for P0-1 / P0-6 / P1-6.
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { acquireLock, acquireLockSync } from "./lock.ts";
 import { basename, join } from "node:path";
 
@@ -123,12 +123,22 @@ export class BindingStore {
     }
   }
 
-  freeProjectName(folder: string, homeDir: string): string {
+  /**
+   * Picks a free project name and reserves it across processes (atomic mkdir), so two
+   * folders with the same basename can import at the same time without sharing a name.
+   * A reservation left by a crashed process only costs a numeric suffix.
+   */
+  reserveProjectName(folder: string, homeDir: string): { name: string; release: () => void } {
+    const dir = join(this.stateDir, "reserved");
+    mkdirSync(dir, { recursive: true });
     const base = nameFromFolder(folder);
     const taken = new Set(Object.keys(this.data.projects));
     for (let i = 0; ; i++) {
       const candidate = i === 0 ? base : `${base.slice(0, 55)}-${i}`;
-      if (!taken.has(candidate) && !existsSync(join(homeDir, candidate))) return candidate;
+      if (taken.has(candidate) || existsSync(join(homeDir, candidate))) continue;
+      const slot = join(dir, candidate);
+      try { mkdirSync(slot); } catch (e: any) { if (e?.code === "EEXIST") continue; throw e; }
+      return { name: candidate, release: () => rmSync(slot, { recursive: true, force: true }) };
     }
   }
 

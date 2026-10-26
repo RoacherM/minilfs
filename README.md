@@ -163,10 +163,20 @@ await session.open();
 | `MINILFS_ROOT` | `~/.cache/minilfs` (home, APFS Stores, local mounts, bindings) |
 | `MINILFS_PREFIX` | `minilfs-` |
 | `MINILFS_NETWORK` | `allow` \| `localhost` \| `deny` (`offline`) — Seatbelt outbound network policy inside `bash` |
-| `MINILFS_EXCLUDES` | `.env,.env.*,*.pem,*.key,id_rsa*,id_ed25519*,.npmrc,.netrc,.pypirc` |
+| `MINILFS_EXCLUDES` | `.env,.env.*,!.env.example,!.env.sample,!.env.template,!.env.dist,!.env.defaults,*.pem,*.key,id_rsa*,id_ed25519*,.npmrc,.netrc,.pypirc` — secrets: never imported, read or written; `!pattern` re-includes |
 | `MINILFS_BRANCH_ONLY` | comma-separated build-output patterns (e.g. `target/,.cargo-home/`) |
 | `MINILFS_TEAM` | `1` enables multi-agent `minilfs` / `minilfs_apply` tools |
 | `MINILFS_BRANCH_NAME` | logical branch alias for this session (defaults to `lead` or `s-<shortId>`) |
+| `MINILFS_MAX_IMPORT_FILES` | `100000` — first import is refused above this (LayerFS Init has a fixed 60 s deadline) |
+| `MINILFS_MAX_IMPORT_MB` | `4096` — same, by total size |
+
+**What is imported: the files git sees.** A session's Branch holds the project as `git status` sees it: tracked files plus untracked files that are not ignored, and `.git/` itself. Git-ignored paths (`.gitignore` in every directory, `.git/info/exclude`, `core.excludesFile`) are not imported, not synced from the host and never applied back; agents can still create them inside their Branch (build output, `node_modules/` after an install). A tracked file is always imported, even if a pattern matches it. There is no switch for this.
+
+`<project>/.minilfsignore` adds patterns for minilfs only (gitignore syntax, `!` re-includes), for folders you keep out of git's ignore list but agents need not edit. Secrets (`MINILFS_EXCLUDES`) are excluded on top of both.
+
+A first import is refused before copying when the files to import exceed `MINILFS_MAX_IMPORT_FILES` / `MINILFS_MAX_IMPORT_MB` (LayerFS Init has a fixed 60 s limit); the error lists the largest folders to ignore. After fixing, `/minilfs retry` starts again without restarting.
+
+**Isolation is for writes, not reads.** `bash` runs under a "wide read, narrow write" Seatbelt profile (like Claude Code's srt): it can read host files outside the Branch except the secret patterns (`.env`, `*.pem`, `~/.ssh`, the Store, …). Do not treat minilfs as a confidentiality boundary.
 
 ## 7. Architecture & Design Decisions
 

@@ -34,12 +34,20 @@ export interface LayerfsConfig {
   driver: string;
   /** logical branch name alias (e.g. lead, or from MINILFS_BRANCH_NAME) */
   branchName?: string;
+  /**
+   * First-import limits. LayerFS `project.init` has a fixed 60 s deadline (layerfs.node), so a
+   * folder above these limits is refused before the copy instead of failing after minutes.
+   */
+  maxImportFiles: number;
+  maxImportBytes: number;
 }
 
 export type MinilfsConfig = LayerfsConfig;
 
+/** Secret files: never imported, read or written. `!pattern` re-includes (env templates hold no secrets). */
 export const DEFAULT_EXCLUDES = [
-  ".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*", ".npmrc", ".netrc", ".pypirc",
+  ".env", ".env.*", "!.env.example", "!.env.sample", "!.env.template", "!.env.dist", "!.env.defaults",
+  "*.pem", "*.key", "id_rsa*", "id_ed25519*", ".npmrc", ".netrc", ".pypirc",
 ];
 
 export function resolveConfig(env: NodeJS.ProcessEnv = process.env): LayerfsConfig {
@@ -67,5 +75,7 @@ export function resolveConfig(env: NodeJS.ProcessEnv = process.env): LayerfsConf
     branchOnly: list(env.MINILFS_BRANCH_ONLY, []),
     team: env.MINILFS_TEAM === "1",
     branchName: env.MINILFS_BRANCH_NAME || undefined,
+    maxImportFiles: Number(env.MINILFS_MAX_IMPORT_FILES ?? 100_000),
+    maxImportBytes: Number(env.MINILFS_MAX_IMPORT_MB ?? 4096) * 1024 * 1024,
   };
 }

@@ -568,6 +568,21 @@ try {
     assert.ok(elapsed < 4000, `timeout 1 sleep 10 took ${elapsed} ms`);
   });
 
+  await step("7.1b ps works inside the sandbox (setuid /bin/ps cannot): ps -o rss= -p <pid> of a child", async () => {
+    const chunks = [];
+    const r = await sA.exec(
+      `sleep 3 & P=$!; sleep 0.2; command -v ps; ps -o rss= -p $P; echo "rc=$?"; /bin/ps -o rss= -p $P >/dev/null 2>&1; echo "setuid_rc=$?"; kill $P`,
+      cwd,
+      { onData: (d) => chunks.push(d.toString()) },
+    );
+    const out = chunks.join("");
+    assert.equal(r.exitCode, 0, out);
+    assert.match(out, /scratch\/bin\/ps/, "shim is first on PATH");
+    assert.match(out, /^\s*\d+\s*$/m, `numeric RSS (KiB): ${out}`);
+    assert.match(out, /rc=0/);
+    assert.doesNotMatch(out, /setuid_rc=0/, "real /bin/ps still refused by Seatbelt (documents why the shim exists)");
+  });
+
   await step("7.2 persistent mergedFileMtimes across multiple bash calls & cleanScratch", async () => {
     await sWorker.mutate("m-w1", "write", () => sWorker.writeFile(join(cwd, "persisted-mtime.rs"), "fn a() {}\n"));
     await new Promise((r) => setTimeout(r, 1100));

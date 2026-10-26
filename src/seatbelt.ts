@@ -247,7 +247,11 @@ export function buildSeatbeltProfile(options: SeatbeltOptions): string {
   );
 
   // 9b. Excludes inside wsPath: deny writing or unlinking
-  const flatExcludes = excludes.flatMap(expandBraces).filter(Boolean);
+  // `!pattern` re-includes (e.g. `!.env.example`): denies use the plain patterns, then the
+  // re-includes are allowed again after them (Seatbelt: the last matching rule wins).
+  const allPatterns = excludes.flatMap(expandBraces).map((p) => p.trim()).filter(Boolean);
+  const flatExcludes = allPatterns.filter((p) => !p.startsWith("!"));
+  const reincludes = allPatterns.filter((p) => p.startsWith("!")).map((p) => p.slice(1)).filter(Boolean);
   const wsExcludeRegexes: string[] = [];
   const wsUnlinkRegexes: string[] = [];
   for (const w of wsSpellings) {
@@ -341,6 +345,27 @@ export function buildSeatbeltProfile(options: SeatbeltOptions): string {
       `(deny file-write-unlink\n${allReadDenies.join("\n")}\n)`,
     );
   }
+
+  // 10b. Re-included names (`!pattern`): readable everywhere they were denied; writable and
+  // removable only inside the Workspace (the host folder stays write-protected by rule 6).
+  const reRead: string[] = [];
+  const reWrite: string[] = [];
+  for (const rawPat of reincludes) {
+    const pat = rawPat.replace(/\/+$/, "");
+    const rx = globToSbplRegex(pat);
+    if (!rx) continue;
+    const anchored = pat.startsWith("/") || pat.includes("/");
+    // outside the project: still never inside minilfs state (other projects' Workspaces) or home secrets
+    const guard = [...configSpellings, ...homeSecretDenies.length ? homeSpellings.flatMap((h) => outsideSecrets.map((sec) => join(h, sec))) : []]
+      .map((d) => `(require-not (subpath "${escapeLiteral(d)}"))`).join(" ");
+    if (!anchored) reRead.push(guard ? `  (require-all (regex #"^/(.*/)?${rx}$") ${guard})` : `  (regex #"^/(.*/)?${rx}$")`);
+    for (const base of [...new Set([...hostSpellings, ...wsSpellings])]) {
+      reRead.push(`  (regex #"^${esc(base)}/${anchored ? "" : "(.*/)?"}${rx}$")`);
+    }
+    for (const w of wsSpellings) reWrite.push(`  (regex #"^${esc(w)}/${anchored ? "" : "(.*/)?"}${rx}$")`);
+  }
+  if (reRead.length > 0) lines.push(`(allow file-read-data\n${reRead.join("\n")}\n)`);
+  if (reWrite.length > 0) lines.push(`(allow file-write* file-write-unlink\n${reWrite.join("\n")}\n)`);
 
   // Allow directory traversal so realpath() / pwd / opendir always work
   lines.push(

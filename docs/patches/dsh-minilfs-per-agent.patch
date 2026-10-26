@@ -1,0 +1,235 @@
+diff --git a/minilfs-plugin/index.js b/minilfs-plugin/index.js
+--- a/minilfs-plugin/index.js	2026-10-26 07:34:59
++++ b/minilfs-plugin/index.js	2026-10-26 07:35:25
+@@ -13,8 +13,9 @@
+  * changes back to the branch. The host folder is written only by
+  * `minilfs_apply`, which is three-way checked.
+  *
+- * The plugin keeps no global state: one instance exists per Agent, so a
+- * subagent gets its own branch and cannot see another Agent's uncommitted work.
++ * DSH mounts the plugin once and shares it with every subagent, so all state is kept per Agent
++ * (keyed on `exec.agent.id`): each subagent opens its own branch and cannot see another Agent's
++ * uncommitted work.
+  *
+  * @module @local/dsh-minilfs
+  */
+@@ -118,7 +119,23 @@
+     )
+   }
+ 
+-  const state = { session: null, opening: null, summary: '' }
++  /**
++   * One LayerFS session per Agent. DSH mounts this plugin once per preset revision and every
++   * subagent joins that same mount (agent-preset-registry `composeFrom`), so closure state is
++   * shared by the lead and all its children. Key everything on `exec.agent.id`: it is unique per
++   * child and stable across resume (it is the child's session id).
++   * @type {Map<string, { session: any, opening: Promise<any> | null, summary: string }>}
++   */
++  const agents = new Map()
++  const keyOf = exec => String(exec?.agent?.id ?? exec?.agent?.session?.id ?? `dsh-${process.pid}`)
++  const slot = (key) => {
++    let entry = agents.get(key)
++    if (entry === undefined) {
++      entry = { session: null, opening: null, summary: '' }
++      agents.set(key, entry)
++    }
++    return entry
++  }
+ 
+   /** The Agent's working directory; the session project is fixed from it. */
+   const cwdFor = async (exec) => {
+@@ -131,48 +148,57 @@
+   }
+ 
+   /**
+-   * Detect whether this execution belongs to a child subagent in DSH.
+-   * When true, we avoid assigning the default `lead` alias so child subagents get
+-   * unique `s-<shortId>` aliases instead of overwriting the lead session's alias.
++   * A subagent, from DSH's durable session lineage (`SessionHeader.origin`, `parentSession`,
++   * `delegationDepth`). DSH sets no environment variable for in-process children.
+    */
+   const isChildAgent = (exec) => {
+-    const agent = exec?.agent
+-    if (!agent) return process.env.PI_SUBAGENT_CHILD === '1'
+-    if (agent.parentId || agent.parent || agent.isSubagent) return true
+-    const header = agent.session?.header
+-    if (header?.parentSessionId || header?.parentId || header?.kind === 'subagent') return true
++    const header = exec?.agent?.session?.header
++    if (header?.origin === 'subagent' || header?.parentSession !== undefined || (header?.delegationDepth ?? 0) > 0) return true
+     return process.env.PI_SUBAGENT_CHILD === '1'
+   }
+ 
+   /**
+-   * Open the Agent's branch on first use. Concurrent first calls share one open.
++   * Open the calling Agent's branch on first use. Concurrent first calls of one Agent share one
++   * open; different Agents open different branches. A child gets its own `sub-<id>` branch forked
++   * from main; the configured `branch` alias belongs to the top-level Agent only.
+    * @param exec - the tool execution asking for the workspace.
+-   * @returns the live LayerfsSession.
++   * @returns the live LayerfsSession of `exec.agent`.
+    */
+   const ensureSession = async (exec) => {
+-    if (state.session !== null) return state.session
+-    if (state.opening !== null) return state.opening
+-    state.opening = (async () => {
++    const key = keyOf(exec)
++    const entry = slot(key)
++    if (entry.session !== null) return entry.session
++    if (entry.opening !== null) return entry.opening
++    entry.opening = (async () => {
+       const cwd = await cwdFor(exec)
+-      const sessionId = exec?.agent?.id ?? exec?.agent?.session?.id ?? `dsh-${process.pid}`
+       const resolvedConfig = core.resolveConfig(env)
+-      if (!resolvedConfig.branchName && isChildAgent(exec)) {
+-        resolvedConfig.branchName = `sub-${String(sessionId).slice(0, 8)}`
+-      }
+-      const session = new core.LayerfsSession(cwd, sessionId, resolvedConfig)
++      const child = isChildAgent(exec)
++      if (child) resolvedConfig.branchName = `sub-${key.replace(/[^A-Za-z0-9]/gu, '').slice(0, 8)}`
++      const session = new core.LayerfsSession(cwd, key, resolvedConfig)
+       await session.open({ reason: 'resume' })
+-      state.session = session
+-      state.summary = describeSession(session)
++      session.isChildAgent = child
++      entry.session = session
++      entry.summary = describeSession(session)
+       return session
+-    })().finally(() => { state.opening = null })
+-    return state.opening
++    })().finally(() => { entry.opening = null })
++    return entry.opening
+   }
+ 
+-  /** Refresh the model-facing facts after a call that changed the branch. */
+-  const touch = () => {
+-    state.summary = describeSession(state.session)
++  /** Refresh the model-facing facts of the calling Agent after a call that changed its branch. */
++  const touch = (exec) => {
++    const entry = agents.get(keyOf(exec))
++    if (entry?.session) entry.summary = describeSession(entry.session)
+   }
+ 
++  /** Close one Agent's session (child finished) and forget it. */
++  const closeAgent = (key) => {
++    const entry = agents.get(key)
++    agents.delete(key)
++    const session = entry?.session
++    if (!session) return undefined
++    return session.close({}).then(() => undefined, () => undefined)
++  }
++
+   const definitions = createTools({ core, ensureSession, cwdFor, touch })
+   for (const definition of definitions) {
+     try {
+@@ -193,22 +219,22 @@
+     interpolate: false,
+   })
+ 
+-  // Live branch facts, right after the working directory. Empty until the
+-  // branch exists, so a session that never touches a file tools pays nothing.
++  // Live branch facts of the Agent the prompt is built for (`AssembleContext.agent`), right after
++  // the working directory. Empty until that Agent's branch exists.
+   ctx.systemPrompt.context({
+     name: 'minilfs:workspace',
+     order: 105,
+-    text: () => state.summary,
++    text: (context) => {
++      const id = context?.agent?.id
++      return id === undefined ? '' : (agents.get(String(id))?.summary ?? '')
++    },
+     interpolate: false,
+   })
+ 
+-  ctx.effect(() => () => {
+-    const session = state.session
+-    state.session = null
+-    state.summary = ''
+-    if (session === null) return undefined
+-    return session.close({}).then(() => undefined, () => undefined)
+-  }, 'dsh-minilfs.session')
++  // A finished subagent releases its session; its branch stays in the Store for the lead to merge.
++  ctx.on?.('agent/disposed', ({ agent }) => { void closeAgent(String(agent?.id)) })
++
++  ctx.effect(() => () => Promise.all([...agents.keys()].map(closeAgent)).then(() => undefined), 'dsh-minilfs.session')
+ 
+   ctx.logger?.info?.(`minilfs: core ${coreEntry}; team=${config.team ? 'on' : 'off'}, network=${config.network}`)
+ }
+diff --git a/minilfs-plugin/src/tools.js b/minilfs-plugin/src/tools.js
+--- a/minilfs-plugin/src/tools.js	2026-10-26 07:34:59
++++ b/minilfs-plugin/src/tools.js	2026-10-26 07:34:59
+@@ -168,7 +168,7 @@
+       const outcome = await session.mutate(String(exec?.callId ?? label), label, body)
+       return outcome.value
+     } finally {
+-      touch()
++      touch(exec)
+     }
+   }
+ 
+@@ -439,7 +439,7 @@
+         try {
+           return { text: await core.executeLayerfsAction(session, args) }
+         } finally {
+-          touch()
++          touch(exec)
+         }
+       },
+     },
+@@ -458,10 +458,14 @@
+       },
+       async execute(_args, exec) {
+         const session = await ensureSession(exec)
++        // DSH shares one tool set with subagents, so the "lead only" rule is enforced here.
++        if (session.isChildAgent) {
++          return { text: `Refused: you are a subagent (branch ${session.workBranch}). Only the lead writes the user's folder; report your branch and let the lead merge it.` }
++        }
+         try {
+           return { text: await core.executeLayerfsApply(session) }
+         } finally {
+-          touch()
++          touch(exec)
+         }
+       },
+     },
+diff --git a/minilfs-plugin/test/plugin.test.mjs b/minilfs-plugin/test/plugin.test.mjs
+--- a/minilfs-plugin/test/plugin.test.mjs	2026-10-26 07:34:59
++++ b/minilfs-plugin/test/plugin.test.mjs	2026-10-26 07:34:59
+@@ -188,6 +188,38 @@
+     assert.equal((await readFile(join(project, 'made.txt'), 'utf8')).trim(), 'made-in-branch')
+   })
+ 
++  it('gives every subagent its own branch on the shared plugin mount; only the lead applies', async () => {
++    // DSH mounts the plugin once and every subagent shares it (agent-preset-registry composeFrom):
++    // per-agent state must come from exec.agent, never from the mount.
++    const { tools, project, exec: lead } = await setup()
++    const child = (id) => ({
++      agent: { id, session: { header: { origin: 'subagent', parentSession: lead.agent.id, delegationDepth: 1 } } },
++      signal: new AbortController().signal,
++    })
++    const w1 = child(`w1-${Date.now()}`)
++    const w2 = child(`w2-${Date.now()}`)
++    const status = async e => (await tools.get('minilfs').execute({ action: 'status' }, e)).text
++    const branchOf = text => /branch: (\S+)/u.exec(text)?.[1]
++
++    const [sl, s1, s2] = await Promise.all([status(lead), status(w1), status(w2)])
++    assert.equal(new Set([branchOf(sl), branchOf(s1), branchOf(s2)]).size, 3, `three branches:\n${sl}\n${s1}\n${s2}`)
++    assert.match(s1, /alias: sub-/u)
++
++    await tools.get('write').execute({ file_path: join(project, 'w1.txt'), content: 'from w1\n' }, w1)
++    const seen = await tools.get('bash').execute({ command: 'cat w1.txt 2>/dev/null || echo absent' }, w2)
++    assert.equal(seen.output.trim(), 'absent', 'w2 does not see w1 uncommitted work')
++
++    const refused = await tools.get('minilfs_apply').execute({}, w1)
++    assert.match(refused.text, /^Refused: you are a subagent/u)
++    assert.equal(existsSync(join(project, 'w1.txt')), false)
++
++    const merged = await tools.get('minilfs').execute({ action: 'merge', branch: branchOf(s1) }, lead)
++    assert.match(merged.text, /Merged/iu, merged.text)
++    const applied = await tools.get('minilfs_apply').execute({}, lead)
++    assert.match(applied.text, /Applied 1 file\(s\)/u, applied.text)
++    assert.equal(await readFile(join(project, 'w1.txt'), 'utf8'), 'from w1\n')
++  })
++
+   it('reports a sandbox denial instead of writing outside the workspace', async () => {
+     const { tools, exec } = await setup()
+     // /private/tmp is writable by design (build caches); the home folder root is not.

@@ -15,6 +15,7 @@ import type { LayerfsConfig } from "../config.ts";
 import { bothSpellings, buildSeatbeltProfile } from "../seatbelt.ts";
 import type { Workspace } from "../workspace.ts";
 import { run } from "./exec-helper.ts";
+import { ensurePsShim } from "./ps-shim.ts";
 
 export interface DriverExecOptions {
   onData: (chunk: Buffer) => void;
@@ -168,9 +169,12 @@ export class LocalNativeDriver implements ExecutionDriver {
       network: config.network,
     });
 
+    // first on PATH: a `ps` that works inside the sandbox (/bin/ps is setuid and cannot run here)
+    const shimDir = await ensurePsShim(scratchDir).catch(() => null);
+    const basePath = process.env.PATH || "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
     const childEnv: NodeJS.ProcessEnv = {
       HOME: homedir(),
-      PATH: process.env.PATH || "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+      PATH: shimDir ? `${shimDir}:${basePath}` : basePath,
       TMPDIR: "/private/tmp",
       USER: process.env.USER || "user",
       LOGNAME: process.env.LOGNAME || "user",
@@ -281,7 +285,9 @@ export class LocalNativeDriver implements ExecutionDriver {
   async reapWorkspaceHolders(wsReal: string): Promise<void> {
     const spellings = bothSpellings(wsReal);
     for (const p of spellings) {
-      const r = await run("lsof", ["-t", "+D", p], { timeoutMs: 5000 }).catch(() => null);
+      // `lsof <mount point>` lists every process using that file system without walking it;
+      // `+D` walked the whole tree over NFS before every unmount (1 s per 20k files).
+      const r = await run("lsof", ["-t", p], { timeoutMs: 5000 }).catch(() => null);
       if (r?.stdout && r.stdout.length > 0) {
         const pids = r.stdout.toString().split(/\s+/).filter(Boolean);
         for (const pid of pids) {
