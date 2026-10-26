@@ -1,6 +1,6 @@
 # minilfs (`RoacherM/minilfs`)
 
-> **One-sentence summary:** `minilfs` is a copy-on-write worktree and OS sandbox for coding agents: every agent edits and runs commands on its own isolated LayerFS branch (with per-step checkpoints and multi-agent branch `merge`), while the real project folder stays untouched until `apply` writes changes back with a three-way check.
+> **One-sentence summary:** While upstream LayerFS is the underlying copy-on-write storage engine (originally Docker/FUSE-based), **`minilfs` is its zero-Docker macOS-native Agent Runtime and multi-agent harness adapter**: it runs file tools in-process (`0` mounts) and `bash` in on-demand NFSv3 + Seatbelt sandboxes (`0` containers), adds multi-agent branch coordination (`merge` with 3-way fallback, `sync`, `diff`, stable branch aliases) plus single-command host elevation (`elevated: true`), and keeps your real folder untouched until `apply` writes back with a 3-way check.
 
 **minilfs** (`@roacherm/minilfs`) is a **100% Native, Zero-Docker** [LayerFS](https://github.com/Ephemeral-AI-Lab/layerfs) workspace runtime, [Pi](https://pi.dev) / [Epi](https://github.com/RoacherM/epi) extension, universal CLI / MCP server, and pluggable distributed execution engine.
 
