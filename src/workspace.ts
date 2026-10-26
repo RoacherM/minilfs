@@ -94,7 +94,7 @@ export class LayerfsError extends Error {
 }
 
 type Log = (msg: string) => void;
-const LWW_DEFAULT = "%include .gitignore\n.git/\n";
+const LWW_DEFAULT = "%include .gitignore\n";
 const HOMES = [...new Set([homedir(), (() => { try { return realpathSync(homedir()); } catch { return homedir(); } })()])];
 /** Extra secrets never readable outside the project, on top of config.excludes. */
 const OUTSIDE_SECRET_PATTERNS = [
@@ -353,7 +353,9 @@ export class LayerfsSession {
           throw new LayerfsError("TooLarge", `${changed.length} changed file(s), ${Math.round(bytes / 1048576)} MB in your folder exceed the import limit; ignore large output folders in .gitignore or .minilfsignore`);
         }
       }
-      if (!changed.length && !removed.length) {
+      // projects imported by older versions hold a frozen copy of .git in main: drop it once
+      const legacyGit = Boolean(await this.lfs.fs.stat("main", "/.git").catch(() => null));
+      if (!changed.length && !removed.length && !legacyGit) {
         this.bindings.writeHostIndex(this.projectRecord.name, curr);
         if (full) this.bindings.setMainStale(this.projectRecord.name, false);
         return { synced: [] };
@@ -363,6 +365,7 @@ export class LayerfsSession {
       await this.lfs.branch.fork(syncBranch, "main");
       const storeOps: any[] = [];
       const mountJobs: Array<{ rel: string; entry: HostEntry }> = [];
+      if (legacyGit) storeOps.push({ op: "rm", path: "/.git", recursive: true });
       for (const rel of removed) storeOps.push({ op: "rm", path: `/${rel}` });
       for (const rel of changed) {
         const ent = curr[rel];
@@ -1055,8 +1058,7 @@ export class LayerfsSession {
     if (!sp) throw new Error(`${hostPath} is outside the LayerFS workspace (${this.cwd}); writes there are refused`);
     const rel = sp.replace(/^\/+/, "");
     const relNorm = rel.toLowerCase();
-    if (relNorm === ".lww" || relNorm === ".git/config" || relNorm === ".git/hooks" || relNorm.startsWith(".git/hooks/")
-      || relNorm === ".git/head" || relNorm === ".git/commondir" || relNorm === ".git/minilfs-host-index") {
+    if (relNorm === ".lww" || relNorm === ".git" || relNorm.startsWith(".git/")) {
       const err = new Error(`writes to ${rel} are refused for security`);
       (err as any).code = "EACCES";
       throw err;
@@ -1524,7 +1526,7 @@ export class LayerfsSession {
     let execErr: unknown = null;
     try {
       await this.restoreMergedMtimes(wsReal);
-      await this.prepareNativeGit(wsReal);
+      const gitAdmin = await this.attachHostGit(wsReal).catch((e) => { this.log(`attaching the folder's git failed: ${e?.message ?? e}`); return null; });
 
       const scratchDir = join(this.config.root, "scratch");
       const branchScratchDir = join(scratchDir, this.projectRecord.name, "branches", this.logicalBranch);
@@ -1550,11 +1552,13 @@ export class LayerfsSession {
           lwwContent,
           command,
           options,
+          gitAdmin: gitAdmin ?? undefined,
         });
         code = res.exitCode;
       } catch (e) {
         execErr = e;
       }
+      await this.detachHostGit(wsReal).catch(() => {});
 
       const msg = `pi bash (exit ${code ?? "sig"}) [${this.pendingOrigins.join(",") || "bash"}]`.slice(0, 4000);
       try {
@@ -1625,74 +1629,82 @@ export class LayerfsSession {
     }
   }
 
-  /**
-   * Points the Branch's `.git` at the folder's real repository, so sandboxed git sees the current
-   * commits, branches and staged state instead of the copy frozen at import:
-   * - `.git/commondir` = the folder's `.git`: objects, refs, packed-refs and config are read from there.
-   *   The sandbox may not write the folder, so commit, reset, branch switches, stash and add fail there
-   *   and nothing reaches the repository (no phantom commits); they run with elevated.
-   * - `.git/HEAD` and `.git/index` (per work tree) are copied from the folder. The index is copied only
-   *   when the folder's index changed, so stat data git refreshed in the Branch is kept between calls.
-   */
-  private async linkHostGit(wsGit: string): Promise<void> {
-    const hostGit = join(this.cwd, ".git");
-    const st = await fsp.lstat(hostGit).catch(() => null);
-    if (!st || !st.isDirectory()) return; // no repository, or a linked work tree: keep the Branch copy
-    const headBytes = await fsp.readFile(join(hostGit, "HEAD")).catch(() => null);
-    if (!headBytes) return;
-    const writeIfChanged = async (p: string, data: Buffer | string) => {
-      const cur = await fsp.readFile(p).catch(() => null);
-      if (cur && cur.equals(Buffer.from(data))) return;
-      const lst = await fsp.lstat(p).catch(() => null);
-      if (lst?.isSymbolicLink()) await fsp.rm(p, { force: true });
-      await fsp.writeFile(p, data);
-    };
-    // info/ is shared too: git now reads the folder's info/exclude, which must hide the Branch's .lww.
-    // A local, never-committed ignore line; .lww itself never exists in the folder.
-    const hostExclude = join(hostGit, "info", "exclude");
-    const exSt = await fsp.lstat(hostExclude).catch(() => null);
-    if (!exSt || exSt.isFile()) {
-      const cur = exSt ? await fsp.readFile(hostExclude, "utf8") : "";
-      if (!cur.split("\n").includes("/.lww")) {
-        await fsp.mkdir(dirname(hostExclude), { recursive: true });
-        await fsp.appendFile(hostExclude, `${cur.length && !cur.endsWith("\n") ? "\n" : ""}/.lww\n`);
-      }
-    }
-    await writeIfChanged(join(wsGit, "commondir"), `${hostGit}\n`);
-    await writeIfChanged(join(wsGit, "HEAD"), headBytes);
-    const marker = join(wsGit, "minilfs-host-index");
-    const ist = await fsp.stat(join(hostGit, "index")).catch(() => null);
-    const sig = ist ? `${ist.ino}:${ist.size}:${ist.mtimeMs}` : "none";
-    if ((await fsp.readFile(marker, "utf8").catch(() => "")) === sig) return;
-    if (ist) await fsp.copyFile(join(hostGit, "index"), join(wsGit, "index"));
-    else await fsp.rm(join(wsGit, "index"), { force: true });
-    await fsp.writeFile(marker, sig);
+  /** The folder's git directories: `gitDir` (HEAD, index) and `commonDir` (objects, refs, config). */
+  private async hostGitDirs(): Promise<{ gitDir: string; commonDir: string } | null> {
+    const dotGit = join(this.cwd, ".git");
+    const st = await fsp.lstat(dotGit).catch(() => null);
+    if (!st) return null;
+    let gitDir = dotGit;
+    if (st.isFile()) { // the folder is itself a linked work tree
+      const m = /^gitdir:\s*(.+?)\s*$/m.exec(await fsp.readFile(dotGit, "utf8").catch(() => ""));
+      if (!m) return null;
+      gitDir = resolve(this.cwd, m[1]);
+    } else if (!st.isDirectory()) return null;
+    const common = (await fsp.readFile(join(gitDir, "commondir"), "utf8").catch(() => "")).trim();
+    return { gitDir, commonDir: common ? resolve(gitDir, common) : gitDir };
   }
 
-  private async prepareNativeGit(wsReal: string): Promise<void> {
-    const gitDir = join(wsReal, ".git");
-    const gitStat = await fsp.lstat(gitDir).catch(() => null);
-    if (!gitStat || !gitStat.isDirectory() || gitStat.isSymbolicLink()) return;
-    const allowed = bothSpellings(wsReal);
-    const isInside = (target: string) => allowed.some((w) => target === w || target.startsWith(`${w}/`));
-    const realGit = await fsp.realpath(gitDir).catch(() => null);
-    if (!realGit || !isInside(realGit)) return;
-    await this.linkHostGit(gitDir).catch((e) => this.log(`linking the folder's .git failed: ${e?.message ?? e}`));
-
-    const infoDir = join(gitDir, "info");
-    const infoStat = await fsp.lstat(infoDir).catch(() => null);
-    if (infoStat && (!infoStat.isDirectory() || infoStat.isSymbolicLink())) return;
-    await fsp.mkdir(infoDir, { recursive: true });
-    const realInfo = await fsp.realpath(infoDir).catch(() => null);
-    if (!realInfo || !isInside(realInfo)) return;
-
-    const excludePath = join(infoDir, "exclude");
-    const exStat = await fsp.lstat(excludePath).catch(() => null);
-    if (exStat && exStat.isSymbolicLink()) return;
-    const existing = await fsp.readFile(excludePath, "utf8").catch(() => "");
-    if (!existing.split("\n").includes("/.lww")) {
-      await fsp.appendFile(excludePath, (existing.length && !existing.endsWith("\n") ? "\n" : "") + "/.lww\n").catch(() => {});
+  /**
+   * Makes the Workspace a git work tree of the folder's repository, in git's own linked-worktree
+   * layout. `.git` is never imported or stored; for one command the Workspace gets a `.git` file
+   * (`gitdir: <admin>`), and the admin directory, outside the Workspace, holds:
+   * - `commondir`: the folder's repository. Objects, refs and config are read live, so log, status and
+   *   diff are current. The sandbox cannot write there, so add, commit, reset, checkout, stash, merge
+   *   and rebase fail and nothing reaches the repository; they run with elevated.
+   * - `HEAD` (read-only in the sandbox) and `index` (writable, so git can refresh its stat cache),
+   *   copied from the folder; the index only when the folder's index changed.
+   * Returns the admin directory, or null when the folder is not a git repository.
+   */
+  private async attachHostGit(wsReal: string): Promise<string | null> {
+    const wsGit = join(wsReal, ".git");
+    const cur = await fsp.lstat(wsGit).catch(() => null);
+    // a copy imported by older versions: drop it from the Branch (this command's Commit records that)
+    if (cur) await fsp.rm(wsGit, { recursive: true, force: true });
+    const host = await this.hostGitDirs();
+    if (!host) return null;
+    const head = await fsp.readFile(join(host.gitDir, "HEAD")).catch(() => null);
+    if (!head) return null;
+    const admin = join(this.config.root, "scratch", this.projectRecord.name, "branches", this.logicalBranch, "git");
+    await fsp.mkdir(admin, { recursive: true });
+    const writeIfChanged = async (p: string, data: Buffer | string) => {
+      const now = await fsp.readFile(p).catch(() => null);
+      if (!now || !now.equals(Buffer.from(data))) await fsp.writeFile(p, data);
+    };
+    await writeIfChanged(join(admin, "commondir"), `${host.commonDir}\n`);
+    await writeIfChanged(join(admin, "HEAD"), head);
+    const ist = await fsp.stat(join(host.gitDir, "index")).catch(() => null);
+    const sig = ist ? `${ist.ino}:${ist.size}:${ist.mtimeMs}` : "none";
+    const marker = join(admin, "minilfs-host-index");
+    if ((await fsp.readFile(marker, "utf8").catch(() => "")) !== sig) {
+      if (ist) await fsp.copyFile(join(host.gitDir, "index"), join(admin, "index"));
+      else await fsp.rm(join(admin, "index"), { force: true });
+      await fsp.writeFile(marker, sig);
     }
+    // info/exclude lives in the common directory: hide the Workspace's .lww (LayerFS merge rules).
+    // One local, never-committed line; .lww itself never exists in the folder.
+    const exclude = join(host.commonDir, "info", "exclude");
+    const exSt = await fsp.lstat(exclude).catch(() => null);
+    if (!exSt || exSt.isFile()) {
+      const text = exSt ? await fsp.readFile(exclude, "utf8") : "";
+      if (!text.split("\n").includes("/.lww")) {
+        await fsp.mkdir(dirname(exclude), { recursive: true });
+        await fsp.appendFile(exclude, `${text.length && !text.endsWith("\n") ? "\n" : ""}/.lww\n`);
+      }
+    }
+    await fsp.writeFile(wsGit, `gitdir: ${admin}\n`);
+    await this.markSkippedSecrets(wsReal);
+    return admin;
+  }
+
+  /** Removes the Workspace's `.git` pointer before the Commit: `.git` never enters the Store. */
+  private async detachHostGit(wsReal: string): Promise<void> {
+    const wsGit = join(wsReal, ".git");
+    const st = await fsp.lstat(wsGit).catch(() => null);
+    if (st && !st.isDirectory()) await fsp.rm(wsGit, { force: true });
+  }
+
+  /** Tracked secret files (never imported) are marked skip-worktree, so status does not list them deleted. */
+  private async markSkippedSecrets(wsReal: string): Promise<void> {
     if (this.config.excludes.length > 0) {
       const excludesFlat = this.config.excludes.flatMap(expandBraces).map((p) => p.trim()).filter(Boolean);
       // `!pattern` re-includes become git exclude pathspecs, so templates are not marked skip-worktree
@@ -2389,7 +2401,7 @@ async function listImportable(root: string, skip: Skip): Promise<string[]> {
     for (const ent of entries) {
       const abs = join(dir, ent.name);
       const rel = relative(root, abs).split("\\").join("/");
-      if (!rel.startsWith(".git/") && rel !== ".git" && skip(rel, ent.isDirectory())) continue;
+      if (ent.name === ".git" || skip(rel, ent.isDirectory())) continue; // .git stays the folder's (see attachHostGit)
       if (ent.isDirectory()) await walk(abs);
       else out.push(rel);
     }

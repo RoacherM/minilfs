@@ -11,6 +11,8 @@ export interface SeatbeltOptions {
   outsideSecrets: string[];
   network: "allow" | "localhost" | "deny";
   logTag?: string;
+  /** git admin directory of the Workspace's work tree (see LayerfsSession.attachHostGit): only its index is writable */
+  gitAdmin?: string;
 }
 
 /**
@@ -116,7 +118,7 @@ function escapeLiteral(s: string): string {
  * 3. Network isolation: deny all or allow localhost/unix-socket only.
  * 4. Filesystem write lockdown: deny all file-write*, allow only wsPath, scratchDir, /tmp,
  *    /var/folders, /dev null/zero/tty/urandom/random; then mandatory write denies for hostCwd,
- *    wsPath/.lww, wsPath/.git/hooks, and wsPath excludes.
+ *    wsPath/.lww, wsPath/.git (the folder's repository; only the work tree's index is writable), and wsPath excludes.
  * 5. Filesystem read denies & move-blocking: deny file-read-data and file-write-unlink on
  *    outside secrets under $HOME and excludes under hostCwd and wsPath, while keeping
  *    directory metadata traversal allowed.
@@ -222,28 +224,21 @@ export function buildSeatbeltProfile(options: SeatbeltOptions): string {
   for (const s of scratchSpellings) wsScratchAllows.push(`  (subpath "${escapeLiteral(s)}")`);
   lines.push(`(allow file-write*\n${wsScratchAllows.join("\n")}\n)`);
 
-  // 9. Mandatory write denies inside wsPath: .lww, .git/hooks, .git/config, excludes, plus file-write-unlink on .git!
+  // 9. Mandatory write denies inside wsPath: .lww, .git (the folder's repository), excludes
   lines.push(";; 9. Mandatory write denies inside wsPath");
   const hookLwwDenies: string[] = [];
   const hookLwwUnlinkDenies: string[] = [];
   for (const w of wsSpellings) {
     hookLwwDenies.push(
       `  (literal "${escapeLiteral(join(w, ".lww"))}")`,
-      `  (subpath "${escapeLiteral(join(w, ".git", "hooks"))}")`,
-      `  (literal "${escapeLiteral(join(w, ".git", "config"))}")`,
-      // the link to the folder's repository (see LayerfsSession.linkHostGit): branch switches and
-      // relinking run only with elevated
-      `  (literal "${escapeLiteral(join(w, ".git", "HEAD"))}")`,
-      `  (literal "${escapeLiteral(join(w, ".git", "HEAD.lock"))}")`,
-      `  (literal "${escapeLiteral(join(w, ".git", "commondir"))}")`,
-      `  (literal "${escapeLiteral(join(w, ".git", "minilfs-host-index"))}")`,
+      // .git is the folder's repository, never Branch data: the sandbox cannot create, change or
+      // repoint it (git writes run with elevated; see LayerfsSession.attachHostGit)
+      `  (literal "${escapeLiteral(join(w, ".git"))}")`,
+      `  (subpath "${escapeLiteral(join(w, ".git"))}")`,
     );
     hookLwwUnlinkDenies.push(
       `  (literal "${escapeLiteral(join(w, ".git"))}")`,
-      `  (literal "${escapeLiteral(join(w, ".git", "hooks"))}")`,
-      `  (literal "${escapeLiteral(join(w, ".git", "config"))}")`,
-      `  (literal "${escapeLiteral(join(w, ".git", "info"))}")`,
-      `  (literal "${escapeLiteral(join(w, ".git", "info", "exclude"))}")`,
+      `  (subpath "${escapeLiteral(join(w, ".git"))}")`,
       `  (literal "${escapeLiteral(join(w, ".lww"))}")`,
     );
   }
@@ -251,6 +246,15 @@ export function buildSeatbeltProfile(options: SeatbeltOptions): string {
     `(deny file-write*\n${hookLwwDenies.join("\n")}\n)`,
     `(deny file-write-unlink\n${hookLwwUnlinkDenies.join("\n")}\n)`,
   );
+  if (options.gitAdmin) {
+    // the work tree's admin directory: HEAD and the link to the repository are fixed; git may only
+    // refresh the index (stat cache), which never reaches the folder
+    const admins = bothSpellings(options.gitAdmin);
+    lines.push(
+      `(deny file-write*\n${admins.map((a) => `  (subpath "${escapeLiteral(a)}")`).join("\n")}\n)`,
+      `(allow file-write*\n${admins.flatMap((a) => [`  (literal "${escapeLiteral(join(a, "index"))}")`, `  (literal "${escapeLiteral(join(a, "index.lock"))}")`]).join("\n")}\n)`,
+    );
+  }
 
   // 9b. Excludes inside wsPath: deny writing or unlinking
   // `!pattern` re-includes (e.g. `!.env.example`): denies use the plain patterns, then the

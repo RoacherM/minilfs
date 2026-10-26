@@ -31,7 +31,7 @@ try {
     const s = new LayerfsSession(cwd, `setup-${id}`, config);
     await s.open();
     try {
-      s.prepareNativeGit = async () => { throw new Error("injected setup failure"); };
+      s.restoreMergedMtimes = async () => { throw new Error("injected setup failure"); };
       await assert.rejects(s.exec("true", cwd, { onData: () => {} }), /injected setup failure/);
       await new Promise((r) => setTimeout(r, 500)); // error path unmounts in the background
       assert.deepEqual(mountsUnderBase(), []);

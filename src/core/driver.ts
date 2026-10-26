@@ -37,6 +37,8 @@ export interface DriverExecContext {
   logicalBranch: string;
   outsideSecrets: string[];
   lwwContent: string;
+  /** git admin directory of the Workspace's work tree, when the folder is a git repository */
+  gitAdmin?: string;
   command: string;
   options: DriverExecOptions;
 }
@@ -167,6 +169,7 @@ export class LocalNativeDriver implements ExecutionDriver {
       excludes: config.excludes,
       outsideSecrets,
       network: config.network,
+      gitAdmin: ctx.gitAdmin,
     });
 
     // first on PATH: a `ps` that works inside the sandbox (/bin/ps is setuid and cannot run here)

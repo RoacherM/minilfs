@@ -212,10 +212,11 @@ try {
 
     const chunks2 = [];
     const r2 = await sA.mutate("sec3", "bash", () =>
-      sA.exec("mkdir -p .git/hooks && echo pwn > .git/hooks/pre-commit", cwd, { onData: (d) => chunks2.push(d.toString()) })
+      sA.exec("rm -f .git; mkdir -p .git/hooks && echo pwn > .git/hooks/pre-commit", cwd, { onData: (d) => chunks2.push(d.toString()) })
     );
     assert.notEqual(r2.value.exitCode, 0);
     assert.match(chunks2.join(""), /Operation not permitted/);
+    assert.equal(existsSync(join(cwd, ".git/hooks/pre-commit")), false, "the folder's hooks are untouched");
   });
 
   await step("3.3 kernel-level secret read protection (denyRead): reading .env, app/.ENV, secrets/api.key fails with EPERM", async () => {
@@ -292,8 +293,9 @@ try {
       (e) => e.code === "EACCES" && /refused for security/.test(e.message)
     );
 
-    // Even if injected directly into Store .git/config, prepareNativeGit runs git with -c core.fsmonitor=false -c core.hooksPath=/dev/null and GIT_CONFIG_*=/dev/null
+    // Even if a .git/config is injected into the Store, the Workspace drops stored .git before a command and git reads the folders repository
     await sA.lfs.fs.apply(sA.workBranch, [
+      { op: "mkdir", path: "/.git" },
       { op: "write", path: "/.git/config", bytes: Buffer.from(`[core]\n\tfsmonitor = "touch ${pwnedPath}"\n`) }
     ], "inject malicious git config");
 
@@ -302,7 +304,8 @@ try {
     assert.equal(existsSync(pwnedPath), false, "malicious fsmonitor must never be executed");
 
     // Clean up injected git config
-    await sA.lfs.fs.apply(sA.workBranch, [{ op: "rm", path: "/.git/config" }], "cleanup git config");
+    // the Workspace drops any stored .git before a command (git state is the folder's): nothing to clean
+    assert.equal(await sA.lfs.fs.stat(sA.workBranch, "/.git").catch(() => null), null, "stored .git was dropped");
   });
 
   await step("3.6 P0-2: symlinked paths must not read secrets or write outside workspace", async () => {
