@@ -173,6 +173,8 @@ await session.open();
 
 **What is imported: the files git sees.** A session's Branch holds the project as `git status` sees it: tracked files plus untracked files that are not ignored, and `.git/` itself. Git-ignored paths (`.gitignore` in every directory, `.git/info/exclude`, `core.excludesFile`) are not imported, not synced from the host and never applied back; agents can still create them inside their Branch (build output, `node_modules/` after an install). A tracked file is always imported, even if a pattern matches it. There is no switch for this.
 
+**Git in the sandbox reads the real repository.** Sandboxed `git log`, `status`, `diff`, `show` and `branch` read the folder's own `.git` (commits, branches, staged state), so they are current after every elevated commit or host-side change; `status` shows exactly what apply would change. The sandbox cannot write that repository: `git add`, `commit`, `reset`, `checkout`/`switch`, `stash`, `merge`, `rebase`, `pull` and `push` fail there with a hint and run with `elevated: true`. Nothing a sandboxed git command does can reach the repository, and `.git` is never applied. minilfs adds one local line, `/.lww`, to the folder's `.git/info/exclude` (never committed).
+
 `<project>/.minilfsignore` adds patterns for minilfs only (gitignore syntax, `!` re-includes), for folders you keep out of git's ignore list but agents need not edit. Secrets (`MINILFS_EXCLUDES`) are excluded on top of both.
 
 A first import is refused before copying when the files to import exceed `MINILFS_MAX_IMPORT_FILES` / `MINILFS_MAX_IMPORT_MB` (LayerFS Init has a fixed 60 s limit); the error lists the largest folders to ignore. After fixing, `/minilfs retry` starts again without restarting.

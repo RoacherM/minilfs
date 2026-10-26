@@ -155,6 +155,9 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     },
   };
   const BLOCKED_HINT = "\n[minilfs] The sandbox blocked this. If the step must run on the real folder, retry with elevated: true and a reason.";
+  // sandboxed git reads the folder's repository but may not write it (see LayerfsSession.linkHostGit)
+  const GIT_WRITE = /unable to index file|cannot lock ref|Cannot save the current index state|insufficient permission for adding an object|\.git\/[^\s']*': Operation not permitted|unable to create temporary file: Operation not permitted/;
+  const GIT_HINT = "\n[minilfs] In the sandbox git reads your folder's real repository but cannot change it: run git add, commit, reset, checkout/switch, stash, merge, rebase, pull and push with elevated: true. Apply (or the elevated command itself) writes the Branch's files first.";
 
   /** asks the user under the `ask` policy; true = run */
   async function approveElevation(command: string, reason: string, ctx: ExtensionContext | undefined, s: LayerfsSession | null): Promise<string | null> {
@@ -216,7 +219,9 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       const r = await s.mutate(id, "bash", () => tool.execute(id, { command: params.command, timeout: params.timeout }, signal, onUpdate));
       const out = withNote(r.value, report(ctx, s, r));
       const text = (out.content ?? []).map((c: any) => c.text ?? "").join("");
-      return role.role === "lead" && /Operation not permitted/.test(text) && policy !== "never" ? withNote(out, BLOCKED_HINT) : out;
+      if (role.role !== "lead" || policy === "never") return out;
+      if (GIT_WRITE.test(text)) return withNote(out, GIT_HINT);
+      return /Operation not permitted/.test(text) ? withNote(out, BLOCKED_HINT) : out;
     },
   } as any);
 
@@ -478,7 +483,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       lead
         ? (policy === "never"
           ? "Elevated commands are disabled: if a step needs the real folder (git commit/push, Docker, mounts), tell the user."
-          : `If a step cannot run in the sandbox (Docker, mounts, setuid tools, long-running services, "Operation not permitted"), run that one bash command with elevated: true and a reason${policy === "ask" ? "; the user approves each one" : ""}. Git commands that must reach the user's repository (commit, push, checkout, branch, stash, reset) always need elevated: true; in the sandbox they only change the Branch's copy of .git. Keep other work on the Branch.`)
+          : `If a step cannot run in the sandbox (Docker, mounts, setuid tools, long-running services, "Operation not permitted"), run that one bash command with elevated: true and a reason${policy === "ask" ? "; the user approves each one" : ""}. In the sandbox, git reads the user's real repository (log, status, diff, show are current) but cannot change it: git add, commit, push, pull, checkout/switch, branch, stash, reset, merge and rebase need elevated: true. Keep other work on the Branch.`)
         : "You are a sub-agent: work only on your branch. You cannot write the user's folder or run elevated commands; if a step needs the real machine, say so in your result for the main agent. Do not run git commit/checkout/reset.",
       lead
         ? "The `minilfs` tool merges sub-agent branches into yours (merge, diff, show, ls, branches); `minilfs_apply` writes your branch to the user's folder."

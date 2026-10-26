@@ -881,6 +881,37 @@ try {
     await assert.rejects(s.apply(), (e) => e.code === "WouldRevert" && /action=sync/.test(e.message));
   });
 
+  await step("sandboxed git reads the folder's live repository and cannot write it (no frozen .git, no phantom commits)", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+    const s = await open(cwd, "git-live");
+    // the folder moves on after the Branch was made: a new commit and a new branch
+    writeFileSync(join(cwd, "a.txt"), "host 2\n"); g("commit", "-qam", "c2"); g("branch", "feat");
+    await s.syncHostDriftIntoMain(); await s.adoptMain();
+    await s.mutate("1", "write", () => s.writeFile(join(cwd, "src/app.js"), "export const x = 2;\n"));
+    const o = out();
+    await s.mutate("2", "bash", () => s.exec("git log -1 --format=%s; git branch --list feat; git status --short", cwd, o));
+    const lines = o.text().trim().split("\n");
+    assert.equal(lines[0], "c2", `log sees the folder's new commit: ${o.text()}`);
+    assert.match(lines[1], /feat/, "branches are the folder's");
+    assert.deepEqual(lines.slice(2), [" M src/app.js"], `status shows only the Branch's own edit: ${o.text()}`);
+    const o2 = out();
+    const r = await s.mutate("3", "bash", () => s.exec("git add -A; git commit -qm phantom; git checkout -q feat; git stash; git log -1 --format=%s", cwd, o2));
+    assert.equal(r.value.exitCode, 0, o2.text());
+    assert.match(o2.text(), /c2\s*$/, `no phantom commit, HEAD unchanged: ${o2.text()}`);
+    assert.equal(g("log", "-1", "--format=%s").stdout.trim(), "c2", "the folder's repository is untouched");
+    assert.equal(g("status", "--short").stdout.trim(), "", "nothing staged or changed in the folder");
+    assert.equal(g("rev-parse", "--abbrev-ref", "HEAD").stdout.trim(), "main");
+    // .git state is never applied, and git commit with elevated still works
+    const ap = await s.apply();
+    assert.deepEqual(ap.applied, ["src/app.js"]);
+    await s.runElevated(async () => g("commit", "-qam", "c3"), { reason: "commit" });
+    const o3 = out();
+    await s.mutate("4", "bash", () => s.exec("git log -1 --format=%s; git status --short", cwd, o3));
+    assert.equal(o3.text().trim(), "c3", `sandbox sees the elevated commit with a clean status: ${o3.text()}`);
+  });
+
   await step("too-large first import is refused before copying, naming the largest folders", async () => {
     const cwd = project();
     mkdirSync(join(cwd, "big"));

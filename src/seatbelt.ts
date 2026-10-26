@@ -231,6 +231,12 @@ export function buildSeatbeltProfile(options: SeatbeltOptions): string {
       `  (literal "${escapeLiteral(join(w, ".lww"))}")`,
       `  (subpath "${escapeLiteral(join(w, ".git", "hooks"))}")`,
       `  (literal "${escapeLiteral(join(w, ".git", "config"))}")`,
+      // the link to the folder's repository (see LayerfsSession.linkHostGit): branch switches and
+      // relinking run only with elevated
+      `  (literal "${escapeLiteral(join(w, ".git", "HEAD"))}")`,
+      `  (literal "${escapeLiteral(join(w, ".git", "HEAD.lock"))}")`,
+      `  (literal "${escapeLiteral(join(w, ".git", "commondir"))}")`,
+      `  (literal "${escapeLiteral(join(w, ".git", "minilfs-host-index"))}")`,
     );
     hookLwwUnlinkDenies.push(
       `  (literal "${escapeLiteral(join(w, ".git"))}")`,

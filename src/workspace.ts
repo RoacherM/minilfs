@@ -1055,7 +1055,8 @@ export class LayerfsSession {
     if (!sp) throw new Error(`${hostPath} is outside the LayerFS workspace (${this.cwd}); writes there are refused`);
     const rel = sp.replace(/^\/+/, "");
     const relNorm = rel.toLowerCase();
-    if (relNorm === ".lww" || relNorm === ".git/config" || relNorm === ".git/hooks" || relNorm.startsWith(".git/hooks/")) {
+    if (relNorm === ".lww" || relNorm === ".git/config" || relNorm === ".git/hooks" || relNorm.startsWith(".git/hooks/")
+      || relNorm === ".git/head" || relNorm === ".git/commondir" || relNorm === ".git/minilfs-host-index") {
       const err = new Error(`writes to ${rel} are refused for security`);
       (err as any).code = "EACCES";
       throw err;
@@ -1624,6 +1625,50 @@ export class LayerfsSession {
     }
   }
 
+  /**
+   * Points the Branch's `.git` at the folder's real repository, so sandboxed git sees the current
+   * commits, branches and staged state instead of the copy frozen at import:
+   * - `.git/commondir` = the folder's `.git`: objects, refs, packed-refs and config are read from there.
+   *   The sandbox may not write the folder, so commit, reset, branch switches, stash and add fail there
+   *   and nothing reaches the repository (no phantom commits); they run with elevated.
+   * - `.git/HEAD` and `.git/index` (per work tree) are copied from the folder. The index is copied only
+   *   when the folder's index changed, so stat data git refreshed in the Branch is kept between calls.
+   */
+  private async linkHostGit(wsGit: string): Promise<void> {
+    const hostGit = join(this.cwd, ".git");
+    const st = await fsp.lstat(hostGit).catch(() => null);
+    if (!st || !st.isDirectory()) return; // no repository, or a linked work tree: keep the Branch copy
+    const headBytes = await fsp.readFile(join(hostGit, "HEAD")).catch(() => null);
+    if (!headBytes) return;
+    const writeIfChanged = async (p: string, data: Buffer | string) => {
+      const cur = await fsp.readFile(p).catch(() => null);
+      if (cur && cur.equals(Buffer.from(data))) return;
+      const lst = await fsp.lstat(p).catch(() => null);
+      if (lst?.isSymbolicLink()) await fsp.rm(p, { force: true });
+      await fsp.writeFile(p, data);
+    };
+    // info/ is shared too: git now reads the folder's info/exclude, which must hide the Branch's .lww.
+    // A local, never-committed ignore line; .lww itself never exists in the folder.
+    const hostExclude = join(hostGit, "info", "exclude");
+    const exSt = await fsp.lstat(hostExclude).catch(() => null);
+    if (!exSt || exSt.isFile()) {
+      const cur = exSt ? await fsp.readFile(hostExclude, "utf8") : "";
+      if (!cur.split("\n").includes("/.lww")) {
+        await fsp.mkdir(dirname(hostExclude), { recursive: true });
+        await fsp.appendFile(hostExclude, `${cur.length && !cur.endsWith("\n") ? "\n" : ""}/.lww\n`);
+      }
+    }
+    await writeIfChanged(join(wsGit, "commondir"), `${hostGit}\n`);
+    await writeIfChanged(join(wsGit, "HEAD"), headBytes);
+    const marker = join(wsGit, "minilfs-host-index");
+    const ist = await fsp.stat(join(hostGit, "index")).catch(() => null);
+    const sig = ist ? `${ist.ino}:${ist.size}:${ist.mtimeMs}` : "none";
+    if ((await fsp.readFile(marker, "utf8").catch(() => "")) === sig) return;
+    if (ist) await fsp.copyFile(join(hostGit, "index"), join(wsGit, "index"));
+    else await fsp.rm(join(wsGit, "index"), { force: true });
+    await fsp.writeFile(marker, sig);
+  }
+
   private async prepareNativeGit(wsReal: string): Promise<void> {
     const gitDir = join(wsReal, ".git");
     const gitStat = await fsp.lstat(gitDir).catch(() => null);
@@ -1632,6 +1677,7 @@ export class LayerfsSession {
     const isInside = (target: string) => allowed.some((w) => target === w || target.startsWith(`${w}/`));
     const realGit = await fsp.realpath(gitDir).catch(() => null);
     if (!realGit || !isInside(realGit)) return;
+    await this.linkHostGit(gitDir).catch((e) => this.log(`linking the folder's .git failed: ${e?.message ?? e}`));
 
     const infoDir = join(gitDir, "info");
     const infoStat = await fsp.lstat(infoDir).catch(() => null);
@@ -2058,6 +2104,7 @@ export class LayerfsSession {
   /** Paths that apply writes to the host and diff/history show: not secret, not branch-only, not git-ignored. */
   isApplicable(path: string): boolean {
     const p = String(path ?? "").replace(/^\/+/, "");
+    if (p === ".git" || p.startsWith(".git/")) return false; // git state comes from the folder, never applied
     if (this.isBranchOnly(p)) return false;
     return !isExcludedPath(p, this.config.excludes);
   }
