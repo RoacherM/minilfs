@@ -27,6 +27,8 @@ export interface SessionBinding {
   seq: number;
   updatedAt: number;
   logicalBranch?: string;
+  /** see LayerfsSession.alignedRef */
+  alignedRef?: string | null;
 }
 
 export interface HostEntry {

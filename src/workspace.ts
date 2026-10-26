@@ -29,7 +29,7 @@ export interface OpenOptions {
   /** reports the current start phase (shown in the status bar while starting) */
   onPhase?: (phase: string) => void;
   reason?: "startup" | "reload" | "new" | "resume" | "fork";
-  resumeBinding?: { project?: string; baseBranch?: string; workBranch?: string; baseRef?: string; headCommit?: string | null };
+  resumeBinding?: { project?: string; baseBranch?: string; workBranch?: string; baseRef?: string; headCommit?: string | null; seq?: number; alignedRef?: string | null };
   forkFromRef?: string | null;
 }
 
@@ -143,6 +143,12 @@ export class LayerfsSession {
   seq = 0;
 
   blocked: { reason: string; heldWs?: Workspace } | null = null;
+  /**
+   * A Commit of the work branch that holds everything in the base (set when the base moves: apply,
+   * elevated, merging main). While the work branch still descends from it, the base..branch diff is the
+   * Branch's own work, so apply cannot revert anything: no guessing. null: unknown, apply guesses.
+   */
+  alignedRef: string | null = null;
   pendingOrigins: string[] = [];
   checkpoints: Checkpoint[] = [];
   unapplied = false;
@@ -450,6 +456,10 @@ export class LayerfsSession {
         this.logicalBranch = saved.logicalBranch;
       }
       const branches = await this.listAllBranches();
+      // The saved seq can lag: a session entry in the conversation log has no seq, and apply/elevated
+      // advance seq without renaming the work branch. Never reuse a name this session already made.
+      this.seq = Math.max(this.seq, highestSeq(branches, this.shortId));
+      this.alignedRef = saved.alignedRef ?? null;
       const wb = branches.find((b) => b.name === saved!.workBranch);
       const bb = saved.baseBranch ? branches.find((b) => b.name === saved!.baseBranch) : null;
       const targetRef = saved.headCommit ?? saved.baseRef;
@@ -487,6 +497,7 @@ export class LayerfsSession {
     }
 
     const fromRef = options.forkFromRef || "main";
+    this.alignedRef = null;
     this.seq++;
     this.baseBranch = `b-${this.shortId}-${this.seq}`;
     this.workBranch = `s-${this.shortId}-${this.seq}`;
@@ -532,28 +543,65 @@ export class LayerfsSession {
       let note = "";
       try {
         synced = (await this.syncHostDriftIntoMain({ limitToImport: true })).synced;
-        // merge first, against the old base (base..main = what the command changed); then move the base
-        if (synced.length) {
-          const m = await this.mergeBranchLocked("main", { strategy: "theirs" });
-          if (!m.merged) throw new LayerfsError("Conflict", `merging the folder's changes into the Branch conflicts on ${m.conflicts.map((c) => c.path).join(", ")}`);
-          if (m.head) {
-            checkpoint = { origins: [`host: ${options.reason}`.slice(0, 200)], label: "host", commit: m.head, branch: m.branch, changed: true, at: Date.now() };
-            this.checkpoints.push(checkpoint);
-          }
+        // Also when this command changed nothing but main moved (another session applied): the base moves
+        // to main, so the Branch must take main's changes first or the next apply would revert them.
+        const force = synced.length > 0;
+        const m = await this.adoptMainLocked(force);
+        if (m?.head) {
+          checkpoint = { origins: [`host: ${options.reason}`.slice(0, 200)], label: "host", commit: m.head, branch: m.branch, changed: true, at: Date.now() };
+          this.checkpoints.push(checkpoint);
         }
-        this.seq++;
-        const nextBase = `b-${this.shortId}-${this.seq}`;
-        const fb = await this.lfs.branch.fork(nextBase, "main");
-        this.baseBranch = nextBase;
-        this.baseRef = fb.head ?? fb.base;
-        this.unapplied = await this.hasApplicable();
-        this.persistSessionBinding();
       } catch (e: any) {
         this.bindings.setMainStale(this.projectRecord.name, true);
         note = `\n[minilfs] The command ran in your folder, but bringing its changes back into the Branch failed (${e?.code ?? "Error"}: ${String(e?.message ?? e).slice(0, 200)}). The Branch does not have them yet; the next start resyncs main from your folder.`;
       }
       if (runError) throw Object.assign(runError as object, { minilfsNote: note });
       return { value: value as T, applied, synced, checkpoint, note };
+    });
+    this.mutex = job.catch(() => {});
+    return job;
+  }
+
+  /**
+   * Merges main (the folder's state, after a host sync) into the work branch, then moves the base to main.
+   * Afterwards base..branch is exactly this Branch's own work. Merges when `force`, or when main differs
+   * from the base. Throws Conflict (nothing moved) when the merge conflicts. Caller holds the mutex.
+   */
+  private async adoptMainLocked(force: boolean, strategy: "ours" | "theirs" = "theirs"): Promise<MergeResult | null> {
+    let m: MergeResult | null = null;
+    if (force || (await this.mainDiffersFromBase())) {
+      m = await this.mergeBranchLocked("main", { strategy });
+      if (!m.merged) throw new LayerfsError("Conflict", `merging the folder's changes into the Branch conflicts on ${m.conflicts.map((c) => c.path).join(", ")}`);
+    }
+    this.seq++;
+    const nextBase = `b-${this.shortId}-${this.seq}`;
+    const fb = await this.lfs.branch.fork(nextBase, "main");
+    this.baseBranch = nextBase;
+    this.baseRef = fb.head ?? fb.base;
+    // after a merge the Branch holds main, which is now the base; with no merge main equals the old
+    // base, so what held the old base still holds the new one
+    if (m?.head) this.alignedRef = m.head;
+    this.unapplied = await this.hasApplicable();
+    this.persistSessionBinding();
+    return m;
+  }
+
+  /** true when main has content the base does not (another session applied, or the folder was synced) */
+  private async mainDiffersFromBase(): Promise<boolean> {
+    const d = await this.lfs.branch.diff_branches(this.baseBranch, "main", 50, 0, { hunks: false });
+    if (d.from?.root && d.from.root === d.to?.root) return false;
+    return (d.items ?? []).some((it: any) => it.path !== "/.lww" && it.type !== "dir");
+  }
+
+  /**
+   * The `sync` action from main (after syncHostDriftIntoMain): merge main into the Branch and move the
+   * base to main. Always merges, so a Branch whose base already equals main but lacks main's content
+   * (left by older versions) recovers. Conflicting paths are decided by `strategy` (default theirs).
+   */
+  async adoptMain(strategy: "ours" | "theirs" = "theirs"): Promise<MergeResult> {
+    const job = this.mutex.then(async () => {
+      if (this.blocked) throw new Error(`cannot merge while a checkpoint is pending (${this.blocked.reason}); run /minilfs retry`);
+      return (await this.adoptMainLocked(true, strategy))!;
     });
     this.mutex = job.catch(() => {});
     return job;
@@ -607,20 +655,25 @@ export class LayerfsSession {
         if (!branches.some((b) => b.name === resolvedOther)) throw new LayerfsError("NoSuchBranch", `no LayerFS branch named ${other} (see /minilfs branches)`);
       }
 
-      if (options?.strategy || options?.resolve) {
-        return await this.fallbackMergeBranch(resolvedOther, options);
-      }
-
+      // Native merge first, also with a strategy: it records both parents, so later merges and apply
+      // know what this Branch already holds. The path-wise fallback (no lineage) runs only on conflict.
       this.seq++;
       const target = `s-${this.shortId}-${this.seq}`;
       const priorWork = this.workBranch;
       try {
         const m = await this.lfs.branch.merge(this.workBranch, resolvedOther, target, `merge ${resolvedOther} into ${this.workBranch}`);
         this.workBranch = target;
-        this.headCommit = m.head ?? this.headCommit;
+        // A fast-forward onto a branch with no Commit (a snapshot of main) answers no head: the branch is
+        // then that Layer. Never keep the old head here: apply would snapshot it and revert the merge.
+        let head: string | null = m.head ?? null;
+        if (!head) {
+          const b = (await this.listAllBranches()).find((x) => x.name === target);
+          head = b?.head ?? b?.base ?? null;
+        }
+        this.headCommit = head;
         this.unapplied = await this.hasApplicable();
         this.persistSessionBinding();
-        if (m.head) this.checkpoints.push({ origins: [`merge:${resolvedOther}`], label: "merge", commit: m.head, branch: target, changed: true, at: Date.now() });
+        if (head) this.checkpoints.push({ origins: [`merge:${resolvedOther}`], label: "merge", commit: head, branch: target, changed: true, at: Date.now() });
 
         const diffItems: any[] = [];
         for (let pos = 0; ; ) {
@@ -646,7 +699,7 @@ export class LayerfsSession {
           }
         }
 
-        return { merged: true, branch: target, head: m.head ?? null, conflicts: [], lww: (m.lww ?? []).length, lwwPaths };
+        return { merged: true, branch: target, head, conflicts: [], lww: (m.lww ?? []).length, lwwPaths };
       } catch (e: any) {
         if (e?.code === "Conflict") {
           if (options?.strategy || options?.resolve) {
@@ -722,6 +775,33 @@ export class LayerfsSession {
         continue;
       }
 
+      // both sides changed the path: merge three-way; a strategy decides only real conflicts
+      let conflictKind: string;
+      if (ourItem.kind === "Removed" && theirItem.kind === "Removed") continue;
+      if (ourItem.kind === "Removed" || theirItem.kind === "Removed") {
+        conflictKind = "DeleteEditConflict";
+      } else {
+        const ourBytes = await readRefBytes(this, this.workBranch, p);
+        const theirBytes = await readRefBytes(this, resolvedOther, p);
+        const baseBytes = await readRefBytes(this, this.baseBranch, p);
+        if (ourBytes && theirBytes && ourBytes.equals(theirBytes)) continue;
+        if (!ourBytes || !theirBytes || isBinary(ourBytes) || isBinary(theirBytes) || (baseBytes && isBinary(baseBytes))) {
+          conflictKind = "BinaryConflict";
+        } else {
+          const mergeRes = threeWayMerge(ourBytes, baseBytes, theirBytes);
+          if ("merged" in mergeRes) {
+            const dir = posix.dirname(p);
+            if (dir !== "/") ops.push({ op: "mkdir", path: dir });
+            ops.push({ op: "write", path: p, bytes: mergeRes.merged });
+            const theirSig = await this.readSigAtBranch(resolvedOther, rel);
+            if (theirSig && (((theirSig.mode ?? 0o644) & 0o111) !== 0 || (theirSig.mode !== undefined && (theirSig.mode & 0o7777) !== 0o644))) {
+              mountJobs.push({ rel, entry: theirSig, bytes: mergeRes.merged });
+            }
+            continue;
+          }
+          conflictKind = "ContentConflict";
+        }
+      }
       if (fileResolution === "ours") continue;
       if (fileResolution === "theirs") {
         if (theirItem.kind === "Removed") {
@@ -744,36 +824,7 @@ export class LayerfsSession {
         }
         continue;
       }
-
-      if (ourItem.kind === "Removed" && theirItem.kind === "Removed") continue;
-      if (ourItem.kind === "Removed" || theirItem.kind === "Removed") {
-        conflicts.push({ path: rel, kind: "DeleteEditConflict" });
-        continue;
-      }
-
-      const ourBytes = await readRefBytes(this, this.workBranch, p);
-      const theirBytes = await readRefBytes(this, resolvedOther, p);
-      const baseBytes = await readRefBytes(this, this.baseBranch, p);
-
-      if (ourBytes && theirBytes && ourBytes.equals(theirBytes)) continue;
-
-      if (!ourBytes || !theirBytes || isBinary(ourBytes) || isBinary(theirBytes) || (baseBytes && isBinary(baseBytes))) {
-        conflicts.push({ path: rel, kind: "BinaryConflict" });
-        continue;
-      }
-
-      const mergeRes = threeWayMerge(ourBytes, baseBytes, theirBytes);
-      if ("merged" in mergeRes) {
-        const dir = posix.dirname(p);
-        if (dir !== "/") ops.push({ op: "mkdir", path: dir });
-        ops.push({ op: "write", path: p, bytes: mergeRes.merged });
-        const theirSig = await this.readSigAtBranch(resolvedOther, rel);
-        if (theirSig && (((theirSig.mode ?? 0o644) & 0o111) !== 0 || (theirSig.mode !== undefined && (theirSig.mode & 0o7777) !== 0o644))) {
-          mountJobs.push({ rel, entry: theirSig, bytes: mergeRes.merged });
-        }
-      } else {
-        conflicts.push({ path: rel, kind: "ContentConflict" });
-      }
+      conflicts.push({ path: rel, kind: conflictKind });
     }
 
     if (conflicts.length > 0) {
@@ -851,6 +902,7 @@ export class LayerfsSession {
       seq: this.seq,
       updatedAt: Date.now(),
       logicalBranch: this.logicalBranch,
+      alignedRef: this.alignedRef,
     });
   }
 
@@ -1800,8 +1852,12 @@ export class LayerfsSession {
       await this.lfs.branch.fork(snapBranch, snapRef);
 
       if (!options.allowRevert && !(await this.snapshotContainsBase(snapBranch))) {
-        throw new LayerfsError("WouldRevert", "this branch no longer contains what was already applied to your folder (you went back with /tree, maybe edited since); applying would revert files on disk. Use /minilfs apply --revert to do that on purpose.");
+        throw new LayerfsError("WouldRevert", "this Branch may lack files that are already in your folder (it went back with /tree or /fork, or the folder moved on); applying could revert them, so nothing was written. Run the minilfs tool with action=sync (it merges the folder's state into the Branch and keeps your edits), then apply again. To revert the folder on purpose: /minilfs apply --revert.");
       }
+      // name the next base now: a taken name must fail before the folder is touched, not after
+      this.seq++;
+      const nextBase = `b-${this.shortId}-${this.seq}`;
+      const fb = await this.lfs.branch.fork(nextBase, snapRef);
 
       const items: Array<{ path: string; kind: string; type: string }> = [];
       for (let pos = 0; ; ) {
@@ -1911,25 +1967,27 @@ export class LayerfsSession {
         guard();
         const mainVsBase = await this.lfs.branch.diff_branches("main", this.baseBranch, 1, 0, { hunks: false });
         const mainUnchanged = Boolean(mainVsBase.from?.root) && mainVsBase.from?.root === mainVsBase.to?.root;
-        let toPublish = snapBranch;
+        let toPublish: string | null = snapBranch;
         if (!mainUnchanged) {
           const merged = `m-${this.shortId}-${(++this.seq)}`;
           const m = await this.lfs.branch.merge("main", snapBranch, merged, "merge applied session");
           if (m?.kind && m.kind !== "Merged" && m.kind !== "FastForward" && m.kind !== "UpToDate") throw new Error(`merge answered ${m.kind}`);
-          toPublish = merged;
+          // UpToDate: main already holds the snapshot; the merge branch has no Commit to publish
+          toPublish = m?.kind === "UpToDate" ? null : merged;
         }
-        const pub = await this.lfs.branch.publish(toPublish);
-        if (pub?.layer) this.bindings.updateProjectMain(this.projectRecord.name, pub.layer);
+        if (toPublish) {
+          const pub = await this.lfs.branch.publish(toPublish);
+          if (pub?.layer) this.bindings.updateProjectMain(this.projectRecord.name, pub.layer);
+        }
       } catch (e: any) {
         this.bindings.setMainStale(this.projectRecord.name, true);
         result.warnings.push(`your folder is updated, but LayerFS main could not be updated (${e?.code ?? "Error"}: ${String(e?.message ?? e).slice(0, 160)}); the next session will resync main from your folder`);
       }
 
-      this.seq++;
-      const nextBase = `b-${this.shortId}-${this.seq}`;
-      const fb = await this.lfs.branch.fork(nextBase, snapRef);
       this.baseBranch = nextBase;
       this.baseRef = fb.head ?? fb.base;
+      // the folder now matches snapRef (the work branch's head, pinned under the mutex)
+      if (this.headCommit) this.alignedRef = this.headCommit;
       this.unapplied = this.headCommit !== snapRef;
       this.persistSessionBinding();
       return result;
@@ -1937,6 +1995,8 @@ export class LayerfsSession {
   }
 
   private async snapshotContainsBase(snapBranch: string): Promise<boolean> {
+    // exact answer first: the snapshot descends from a Commit that held the whole base
+    if (this.alignedRef && (await this.branchHasCommit(snapBranch, this.alignedRef))) return true;
     try {
       const baseIsCommit = await this.baseIsCommit();
       const cleanedBaseRef = cleanRef(this.baseRef);
@@ -1955,6 +2015,23 @@ export class LayerfsSession {
       }
       if (!baseIsCommit) return true;
       return await this.mergeAddsNothing(snapBranch, this.baseBranch);
+    } catch {
+      return false;
+    }
+  }
+
+  /** `commit` is a Commit of `branch`, or the Layer `branch` starts from (a fast-forward onto a main snapshot) */
+  private async branchHasCommit(branch: string, commit: string): Promise<boolean> {
+    const want = cleanRef(commit);
+    try {
+      const b = (await this.listAllBranches()).find((x) => x.name === branch);
+      if (b && (b.base === commit || cleanRef(b.base) === want)) return true;
+      for (let pos = 0; ; ) {
+        const page = await this.lfs.branch.list_commits(branch, 500, pos);
+        for (const c of page.items ?? []) if (c.id === commit || cleanRef(c.id) === want) return true;
+        if (!page.hasMore || !(page.items ?? []).length) return false;
+        pos = page.nextPagePos ?? (pos + page.items.length);
+      }
     } catch {
       return false;
     }
@@ -2240,6 +2317,19 @@ async function checkImportSize(root: string, files: string[], config: LayerfsCon
 
 /** true for a host path that is never imported or synced (`isDir`: the path is a directory) */
 export type Skip = (rel: string, isDir: boolean) => boolean;
+
+/** Highest `<kind>-<shortId>-<n>` number among `branches` (0 when none): the floor for a resumed seq. */
+export function highestSeq(branches: Array<{ name: string }>, shortId: string): number {
+  let max = 0;
+  const tail = `-${shortId}-`;
+  for (const b of branches) {
+    const i = b.name.lastIndexOf(tail);
+    if (i <= 0) continue;
+    const n = Number(b.name.slice(i + tail.length));
+    if (Number.isInteger(n) && n > max) max = n;
+  }
+  return max;
+}
 
 async function listImportable(root: string, skip: Skip): Promise<string[]> {
   const out: string[] = [];

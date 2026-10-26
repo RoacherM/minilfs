@@ -782,6 +782,105 @@ try {
     await elevated;
   });
 
+  // ---- issue #2 and the storyforge / epi session failures (2026-10-26) ----
+
+  await step("resume from a log entry without seq: apply after apply does not reuse a branch name (NameTaken)", async () => {
+    const cwd = project();
+    const s = await open(cwd, "rs");
+    await s.mutate("1", "write", () => s.writeFile(join(cwd, "r1.txt"), "1\n"));
+    await s.apply();
+    await s.mutate("2", "write", () => s.writeFile(join(cwd, "r2.txt"), "2\n"));
+    await s.apply(); // seq is now well past the number in the work branch name
+    const saved = { project: s.project, baseBranch: s.baseBranch, workBranch: s.workBranch, baseRef: s.baseRef, headCommit: s.headCommit };
+    await s.close();
+    const s2 = new LayerfsSession(cwd, `rs2-${id}`, config); sessions.push(s2);
+    await s2.open({ reason: "resume", resumeBinding: saved }); // a conversation-log entry: no seq
+    assert.equal(s2.workBranch, saved.workBranch);
+    await s2.mutate("3", "write", () => s2.writeFile(join(cwd, "r3.txt"), "3\n"));
+    assert.deepEqual((await s2.apply()).applied, ["r3.txt"]);
+    await s2.mutate("4", "write", () => s2.writeFile(join(cwd, "r4.txt"), "4\n"));
+    const r = await s2.runElevated(async () => writeFileSync(join(cwd, "h.txt"), "h\n"), { reason: "t" });
+    assert.deepEqual(r.applied, ["r4.txt"]);
+    assert.equal(r.note, "", r.note);
+  });
+
+  await step("apply with nothing new for main (UpToDate) publishes nothing and warns nothing (NoCommit)", async () => {
+    const cwd = project();
+    const a = await open(cwd, "ut-a");
+    const b = await open(cwd, "ut-b");
+    await a.mutate("1", "write", () => a.writeFile(join(cwd, "same.txt"), "s\n"));
+    await b.mutate("2", "write", () => b.writeFile(join(cwd, "same.txt"), "s\n"));
+    await a.apply();
+    const r = await b.apply(); // same bytes already on disk and in main
+    assert.deepEqual(r.warnings, [], r.warnings.join("; "));
+  });
+
+  await step("forward delete and rename after an elevated sync do not trip WouldRevert", async () => {
+    const cwd = project();
+    const s = await open(cwd, "fd");
+    await s.mutate("1", "write", () => s.writeFile(join(cwd, "x.txt"), "x\n"));
+    await s.mutate("1b", "write", () => s.writeFile(join(cwd, "tools/t.sh"), "t\n"));
+    await s.apply();
+    await s.runElevated(async () => writeFileSync(join(cwd, "host.txt"), "h\n"), { reason: "host edit" });
+    await s.mutate("2", "bash", () => s.exec("rm x.txt && mv tools scripts", cwd, out()));
+    const r = await s.apply();
+    assert.deepEqual(r.applied.sort(), ["scripts/t.sh", "tools/t.sh", "x.txt"]);
+    assert.equal(existsSync(join(cwd, "x.txt")), false);
+    assert.equal(readFileSync(join(cwd, "host.txt"), "utf8"), "h\n");
+  });
+
+  await step("another session applies; this session's elevated command then apply keep the peer's files (no WouldRevert)", async () => {
+    const cwd = project();
+    const me = await open(cwd, "pe-me");
+    const peer = await open(cwd, "pe-peer");
+    await peer.mutate("1", "write", () => peer.writeFile(join(cwd, "peer.txt"), "p\n"));
+    await peer.apply();
+    await me.runElevated(async () => {}, { reason: "read-only command" }); // syncs nothing of its own
+    await me.mutate("2", "write", () => me.writeFile(join(cwd, "mine.txt"), "m\n"));
+    const r = await me.apply();
+    assert.deepEqual(r.applied, ["mine.txt"]);
+    assert.equal(readFileSync(join(cwd, "peer.txt"), "utf8"), "p\n");
+  });
+
+  await step("merge with strategy merges non-conflicting files three-way and keeps lineage", async () => {
+    const cwd = project();
+    writeFileSync(join(cwd, "multi.txt"), "1\n2\n3\n4\n5\n6\n7\n");
+    const lead = await open(cwd, "ms-lead");
+    const w = await open(cwd, "ms-w");
+    await lead.mutate("1", "write", () => lead.writeFile(join(cwd, "multi.txt"), "1L\n2\n3\n4\n5\n6\n7\n"));
+    await w.mutate("2", "write", () => w.writeFile(join(cwd, "multi.txt"), "1\n2\n3\n4\n5\n6\n7W\n"));
+    const r = await lead.mergeBranch(w.workBranch, { strategy: "theirs" });
+    assert.ok(r.merged);
+    assert.equal(r.fallback, undefined, "native merge, not the path-wise fallback");
+    assert.equal((await lead.readFile(join(cwd, "multi.txt"))).toString(), "1L\n2\n3\n4\n5\n6\n7W\n");
+  });
+
+  await step("sync from main recovers a Branch that lacks the folder's state, keeping its own edits", async () => {
+    const cwd = project();
+    const me = await open(cwd, "sy-me");
+    const peer = await open(cwd, "sy-peer");
+    await peer.mutate("1", "write", () => peer.writeFile(join(cwd, "peer.txt"), "p\n"));
+    await peer.apply();
+    await me.mutate("2", "write", () => me.writeFile(join(cwd, "mine.txt"), "m\n"));
+    await me.syncHostDriftIntoMain();
+    await me.adoptMain("theirs");
+    assert.equal((await me.readFile(join(cwd, "peer.txt"))).toString(), "p\n");
+    const r = await me.apply();
+    assert.deepEqual(r.applied, ["mine.txt"]);
+    assert.equal(readFileSync(join(cwd, "peer.txt"), "utf8"), "p\n");
+  });
+
+  await step("/tree back before an apply still refuses to revert (WouldRevert kept for real rewinds)", async () => {
+    const cwd = project();
+    const s = await open(cwd, "tw");
+    const before = s.effectiveRef;
+    await s.mutate("1", "write", () => s.writeFile(join(cwd, "t.txt"), "t\n"));
+    await s.apply();
+    await s.switchToRef(before);
+    await s.mutate("2", "write", () => s.writeFile(join(cwd, "u.txt"), "u\n"));
+    await assert.rejects(s.apply(), (e) => e.code === "WouldRevert" && /action=sync/.test(e.message));
+  });
+
   await step("too-large first import is refused before copying, naming the largest folders", async () => {
     const cwd = project();
     mkdirSync(join(cwd, "big"));

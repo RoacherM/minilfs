@@ -334,7 +334,10 @@ export async function executeLayerfsAction(
     if (strategy && strategy !== "ours" && strategy !== "theirs") {
       throw new Error(`invalid strategy "${strategy}": expected "ours" or "theirs"`);
     }
-    const r = await s.mergeBranch(other, strategy ? { strategy } : undefined);
+    // sync from main also moves the base to main, so apply afterwards sees only this Branch's own work
+    const r = action === "sync" && target === "main"
+      ? await s.adoptMain(strategy || "theirs")
+      : await s.mergeBranch(other, strategy ? { strategy } : undefined);
     hooks?.onStatusChange?.();
     if (!r.merged) {
       return [

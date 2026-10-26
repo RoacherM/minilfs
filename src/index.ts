@@ -108,7 +108,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
   }
 
   const recordSession = (s: LayerfsSession) =>
-    pi.appendEntry(SESSION_ENTRY, { project: s.project, volume: s.volume, cwd: s.cwd, baseBranch: s.baseBranch, workBranch: s.workBranch, baseRef: s.baseRef, headCommit: s.headCommit });
+    pi.appendEntry(SESSION_ENTRY, { project: s.project, volume: s.volume, cwd: s.cwd, baseBranch: s.baseBranch, workBranch: s.workBranch, baseRef: s.baseRef, headCommit: s.headCommit, seq: s.seq, alignedRef: s.alignedRef });
   const recordMerge = (s: LayerfsSession, other: string, r: { head: string | null; branch: string }) => {
     if (r.head) pi.appendEntry(CHECKPOINT_ENTRY, { origins: [`merge:${other}`], label: "merge", commit: r.head, branch: r.branch, changed: true, at: Date.now(), project: s.project });
     recordSession(s);
@@ -339,6 +339,8 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     let workBranch: string | undefined;
     let project: string | undefined;
     let headCommit: string | null = null;
+    let seq: number | undefined;
+    let alignedRef: string | null | undefined;
     for (const e of entries) {
       if (stopAtEntryId && e.id === stopAtEntryId && !inclusive) break;
       if (e.type === "custom" && e.customType === SESSION_ENTRY && e.data) {
@@ -346,6 +348,8 @@ export default function minilfsExtension(pi: ExtensionAPI) {
         baseBranch = e.data.baseBranch ?? baseBranch;
         workBranch = e.data.workBranch ?? workBranch;
         baseRef = e.data.baseRef ?? baseRef;
+        if (typeof e.data.seq === "number") seq = Math.max(seq ?? 0, e.data.seq);
+        if (e.data.alignedRef !== undefined) alignedRef = e.data.alignedRef;
       }
       if (e.type === "custom" && e.customType === CHECKPOINT_ENTRY && e.data?.commit) {
         headCommit = e.data.commit;
@@ -353,7 +357,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       }
       if (stopAtEntryId && e.id === stopAtEntryId && inclusive) break;
     }
-    return { project, baseBranch, workBranch, baseRef, headCommit };
+    return { project, baseBranch, workBranch, baseRef, headCommit, seq, alignedRef };
   }
 
   pi.on("session_before_fork", async (event, ctx) => {
@@ -372,7 +376,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     const switched = await s.switchToRef(targetRef);
     pi.appendEntry(SESSION_ENTRY, {
       project: s.project, volume: s.volume, cwd: s.cwd,
-      baseBranch: s.baseBranch, workBranch: switched.branch, baseRef: s.baseRef, headCommit: s.headCommit,
+      baseBranch: s.baseBranch, workBranch: switched.branch, baseRef: s.baseRef, headCommit: s.headCommit, seq: s.seq, alignedRef: s.alignedRef,
     });
     status(ctx, describe(s));
   });
@@ -427,7 +431,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     }).finally(() => clearInterval(ticker)).then(() => {
       pi.appendEntry(SESSION_ENTRY, {
         project: s.project, volume: s.volume, cwd: s.cwd,
-        baseBranch: s.baseBranch, workBranch: s.workBranch, baseRef: s.baseRef, headCommit: s.headCommit,
+        baseBranch: s.baseBranch, workBranch: s.workBranch, baseRef: s.baseRef, headCommit: s.headCommit, seq: s.seq, alignedRef: s.alignedRef,
       });
       status(ctx, describe(s));
       if (s.resumeLost && ctx.hasUI) ctx.ui.notify(`minilfs: ${s.resumeLost}.`, "warning");
