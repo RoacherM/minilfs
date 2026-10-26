@@ -87,6 +87,20 @@ try {
     assert.match(await mode(e3, ctx3, { mode: "branch" }), /^Cannot switch to branch mode: minilfs is not running \(folder too large\)/);
     failOpen = false;
   });
+  await step("paths in any macOS spelling of the project root map into the Branch (/var vs /private/var, /tmp)", async () => {
+    const { LayerfsSession, resolveConfig } = await import("../src/core/index.ts");
+    const real = "/private/var/folders/ct/xx/T/dsh-minilfs-test-c86npk/project";
+    const s = new LayerfsSession(real, "spell", resolveConfig({}));
+    assert.equal(s.toStorePath("/var/folders/ct/xx/T/dsh-minilfs-test-c86npk/project/w1.txt"), "/w1.txt");
+    assert.equal(s.toStorePath(`${real}/w1.txt`), "/w1.txt");
+    assert.equal(s.toStorePath("sub/a.ts"), "/sub/a.ts");
+    assert.equal(s.toStorePath("/var/folders/ct/xx/T/dsh-minilfs-test-c86npk/other/w1.txt"), null, "sibling stays outside");
+    assert.equal(s.toStorePath(`${real}-evil/x`), null, "prefix-sibling stays outside");
+    const t = new LayerfsSession("/tmp/minilfs-spell", "spell", resolveConfig({}));
+    assert.equal(t.toStorePath("/private/tmp/minilfs-spell/a"), "/a");
+    assert.equal(t.toStorePath("/tmp/minilfs-spell/a"), "/a");
+  });
+
   await step("HostWorkspace (for DSH/MCP): secrets refused, files/grep/exec on the folder", async () => {
     const { HostWorkspace, resolveConfig } = await import("../src/core/index.ts");
     const h = new HostWorkspace(dir, resolveConfig({}));

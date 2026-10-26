@@ -114,6 +114,8 @@ const sha = (b: Buffer | string) => createHash("sha256").update(b).digest("hex")
  */
 export class LayerfsSession {
   readonly cwd: string;
+  /** the folder as the harness named it (may be a symlinked spelling of `cwd`) */
+  readonly originalCwd: string;
   sessionId: string;
   shortId: string;
   logicalBranch: string;
@@ -164,6 +166,7 @@ export class LayerfsSession {
 
   constructor(cwd: string, sessionId: string, config: LayerfsConfig, log: Log = () => {}, driver?: ExecutionDriver) {
     // canonical path: /tmp/x and /private/tmp/x (or a symlinked folder) are one project
+    this.originalCwd = resolve(cwd);
     this.cwd = (() => { try { return realpathSync(resolve(cwd)); } catch { return resolve(cwd); } })();
     this.sessionId = sessionId;
     this.shortId = createHash("sha256").update(`${sessionId}:${randomBytes(8).toString("hex")}`).digest("hex").slice(0, 10);
@@ -904,11 +907,26 @@ export class LayerfsSession {
     const trimmed = String(hostPath ?? "").trim();
     if (!trimmed || trimmed === "." || trimmed === "./") return "";
     const abs = resolve(this.cwd, trimmed);
-    const rel = relative(this.cwd, abs);
-    if (rel === "") return "";
-    if (rel.startsWith("..") || isAbsolute(rel)) return null;
-    return rel.split("\\").join("/");
+    // this.cwd is the real path (/private/var/..., /private/tmp/...); agents and harnesses often
+    // pass the symlinked spelling (/var/..., /tmp/..., a symlinked project folder). Accept every
+    // spelling of the project root, then compute the path relative to it.
+    for (const root of this.cwdSpellings) {
+      const rel = relative(root, abs);
+      if (rel === "") return "";
+      if (!rel.startsWith("..") && !isAbsolute(rel)) return rel.split("\\").join("/");
+    }
+    return null;
   }
+
+  /** The project root under every macOS spelling (real path first), computed once. */
+  private get cwdSpellings(): string[] {
+    if (!this._cwdSpellings) {
+      const extra = this.originalCwd && this.originalCwd !== this.cwd ? [this.originalCwd] : [];
+      this._cwdSpellings = [...new Set([this.cwd, ...bothSpellings(this.cwd), ...extra])];
+    }
+    return this._cwdSpellings;
+  }
+  private _cwdSpellings: string[] | null = null;
 
   toStorePath(hostPath: string): string | null {
     const rel = this.toRel(hostPath);
