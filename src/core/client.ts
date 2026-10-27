@@ -192,7 +192,7 @@ export async function createProjectClient(spec: NativeSpec, project: { name: str
   // Busy: in-process mode, or a Store another minilfs version holds in-process; a worker that just
   // died answers Failed before the call is sent, and the next open starts a new one
   // open makes no change: always safe to send again
-  const lfs = await retryBusy(open, async () => undefined, (e) => isBusyRefusal(e) || isWorkerGone(e) || LOST_AFTER_SEND.test(String(e?.message)))
+  const lfs = await retryBusy(open, async () => ({ landed: false }), (e) => isBusyRefusal(e) || isWorkerGone(e) || LOST_AFTER_SEND.test(String(e?.message)))
     .catch((e) => (e?.code === "Unknown" ? open() : Promise.reject(e)));
   return { lfs: withContentionRetry(lfs, spec.storeWorker ? () => workerEndpoint(spec).then(() => {}) : undefined), LayerFSError: sdk.LayerFSError };
 }
@@ -213,7 +213,8 @@ export function isWorkerGone(e: any): boolean {
 //   had taken effect, so a jittered retry is safe; an uncertain one is checked before resending.
 // - The worker went away (crash, idle stop, restart): the SDK answers `Failed: the LayerFS worker ...`
 //   for a call it did not send. `revive` starts a worker again; the call is then resent. A call lost
-//   after it was sent answers `Unknown` and is checked like an uncertain write.
+//   after it was sent answers `Unknown`: `revive` first (the check needs a worker), then it is
+//   checked like an uncertain write, and resent only when the check says it did not land.
 
 const BUSY_RX = /\bBusy\b|busy before effect/i;
 /** true for a refusal caused by another process holding the Store (any code: Busy, Failed, Unknown) */
@@ -229,14 +230,17 @@ export const retryStats = { busy: 0, workerGone: 0, uncertain: 0 };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const backoff = (attempt: number) => Math.min(2_000, 25 * 2 ** attempt) * (0.5 + Math.random());
 
+/** What a check of an uncertain call found: it took effect (with the answer to return), or it did not. */
+export type Landed<T> = { landed: true; value: T } | { landed: false };
+
 /**
- * Runs `call` again while `retryable(error)`, within RETRY_BUDGET_MS. Before resending an uncertain
- * outcome, `onUncertain` looks whether it took effect (its answer is returned instead). `revive` runs
- * before a resend after the worker went away.
+ * Runs `call` again while `retryable(error)`, within RETRY_BUDGET_MS. After the worker went away,
+ * `revive` runs first. An uncertain outcome is resent only when `verify` says it did not land; a
+ * check that fails is retried (revive, back off), never taken as "not landed". No `verify`: thrown.
  */
 export async function retryBusy<T>(
   call: () => Promise<T>,
-  onUncertain?: () => Promise<T | undefined>,
+  verify?: () => Promise<Landed<T>>,
   retryable: (e: any) => boolean = isBusyRefusal,
   revive?: () => Promise<void>,
 ): Promise<T> {
@@ -246,16 +250,27 @@ export async function retryBusy<T>(
       return await call();
     } catch (e: any) {
       if (!retryable(e) || Date.now() - t0 > RETRY_BUDGET_MS) throw e;
-      if (isUncertain(e)) {
-        if (!onUncertain) throw e; // a read is safe to resend; a write without a check is not
-        retryStats.uncertain++;
-        const landed = await onUncertain().catch(() => undefined);
-        if (landed !== undefined) return landed;
-      }
-      if (isWorkerGone(e) || /connection to the LayerFS worker was lost/.test(String(e?.message))) {
+      const gone = isWorkerGone(e) || LOST_AFTER_SEND.test(String(e?.message));
+      if (gone) {
         retryStats.workerGone++;
         await revive?.().catch(() => {});
-      } else if (!isUncertain(e)) retryStats.busy++;
+      }
+      if (isUncertain(e)) {
+        if (!verify) throw e; // a read is safe to resend; a write without a check is not
+        retryStats.uncertain++;
+        for (let v = 0; ; v++) {
+          try {
+            const r = await verify();
+            if (r.landed) return r.value;
+            break;
+          } catch {
+            // the check itself failed (the worker may still be restarting): look again, never resend blind
+            if (Date.now() - t0 > RETRY_BUDGET_MS) throw e;
+            await revive?.().catch(() => {});
+            await sleep(backoff(v));
+          }
+        }
+      } else if (!gone) retryStats.busy++;
       await sleep(backoff(attempt));
     }
   }
@@ -285,26 +300,30 @@ export function withContentionRetry(lfs: any, revive?: () => Promise<void>): any
     for (const [name, fn] of Object.entries(raw[ns as keyof typeof raw] ?? {})) {
       const f = fn as (...a: any[]) => Promise<any>;
       out[name] = async (...args: any[]) => {
-        if (READ_ONLY.has(name)) return retryBusy(() => f(...args), async () => undefined as any, any, revive).catch(async (e) => {
+        if (READ_ONLY.has(name)) return retryBusy(() => f(...args), async () => ({ landed: false as const }), any, revive).catch(async (e) => {
           // a lost read: just read again
           if (e?.code === "Unknown") return retryBusy(() => f(...args), undefined, notRun, revive);
           throw e;
         });
         if (ns === "fs") {
           const branch = args[0];
-          const before = await retryBusy(() => headOf(raw, branch), undefined, notRun, revive).catch(() => undefined);
+          // the head before the write is what tells an uncertain write landed: no write without it
+          const before = await retryBusy(() => headOf(raw, branch), async () => ({ landed: false as const }), any, revive);
           return retryBusy(() => f(...args), async () => {
-            if (before === undefined) return undefined;
             const now = await headOf(raw, branch);
-            return now && now !== before ? { kind: "Committed", head: now, commit: { id: now }, recovered: true } : undefined;
+            return now && now !== before ? { landed: true as const, value: { kind: "Committed", head: now, commit: { id: now }, recovered: true } } : { landed: false as const };
           }, any, revive);
         }
         if (ns === "branch" && (name === "fork" || name === "merge")) {
           const target = name === "fork" ? args[0] : args[2];
           const exists = async () => {
-            const page = await raw.project.list_branches(1000, 0);
-            const b = (page.items ?? []).find((x: any) => x.name === target);
-            return b ? { kind: name === "fork" ? "Forked" : "Merged", branch: target, base: b.base, head: b.head ?? null, recovered: true } : undefined;
+            for (let pos = 0; ; ) {
+              const page = await raw.project.list_branches(1000, pos);
+              const b = (page.items ?? []).find((x: any) => x.name === target);
+              if (b) return { landed: true as const, value: { kind: name === "fork" ? "Forked" : "Merged", branch: target, base: b.base, head: b.head ?? null, recovered: true } };
+              if (!page.hasMore || !(page.items ?? []).length) return { landed: false as const };
+              pos = page.nextPagePos ?? (pos + page.items.length);
+            }
           };
           return retryBusy(() => f(...args), exists, any, revive);
         }

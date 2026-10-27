@@ -9,6 +9,7 @@
 //   2. the worker dies (SIGKILL) under load: the next calls start a new one and finish
 //   3. idle: the worker exits after its idle time and removes its endpoint
 //   4. in-process mode (MINILFS_STORE_WORKER=0): the same load finishes through the Busy retry
+//   5. R2: a write's reply lost after it landed, and the first check fails: it lands exactly once
 // Run: node tests/store-contention.test.mjs
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -161,6 +162,67 @@ try {
     assert.equal(workerPids(root).length, 0, "no worker in in-process mode");
     await lead.close();
     return `retries per agent: ${out.map((o) => o.retries).join(",")}`;
+  });
+  await step("R2 reply lost after a write landed (fs.edit x -> xy) and the first verification read fails: exactly 1 Commit, recovered", async () => {
+    const { root, spec, lead } = await newProject(true);
+    roots.push(root);
+    await lead.branch.fork("lost", "main");
+    await lead.fs.write("lost", "/once.txt", "x");
+    const [b] = readdirSync(join(root, "worker"));
+    const real = JSON.parse(readFileSync(join(root, "worker", b, "endpoint.json"), "utf8"));
+    // a proxy in front of the worker: drops the connection instead of forwarding fs.edit's reply
+    // (the write has landed), then drops the first branch.list_commits (the check) once
+    const net = await import("node:net");
+    const { pathToFileURL } = await import("node:url");
+    const { frame, readFrames } = await import(pathToFileURL(join(bundle, "api/agent/sdk/src/internal.js")).href);
+    let phase = "pass";
+    const proxy = net.createServer((client) => {
+      const up = net.connect(real.port, "127.0.0.1");
+      const drop = () => { client.destroy(); up.destroy(); };
+      client.on("error", () => {}); up.on("error", () => {});
+      client.on("close", drop); up.on("close", drop);
+      let applyId = null;
+      readFrames(client, (req) => {
+        if (phase === "fail-check" && req.op === "branch.list_commits") { phase = "pass"; return drop(); }
+        if (phase === "arm" && req.op === "fs.edit") { applyId = req.id; phase = "wait-reply"; }
+        up.write(frame(req));
+      }, drop);
+      readFrames(up, (msg) => {
+        if (applyId !== null && msg.id === applyId) { phase = "fail-check"; return drop(); }
+        client.write(frame(msg));
+      }, drop);
+    });
+    await new Promise((r) => proxy.listen(0, "127.0.0.1", r));
+    const proxyFile = join(root, "proxy-endpoint.json");
+    writeFileSync(proxyFile, JSON.stringify({ ...real, port: proxy.address().port }), { mode: 0o600 });
+    const { loadSdk, layerfsEnv, withContentionRetry } = await import("../src/core/client.ts");
+    const sdk = await loadSdk(bundle);
+    const vars = { ...layerfsEnv(spec, proj), LAYERFS_WORKER_ENDPOINT: proxyFile };
+    const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+    Object.assign(process.env, vars);
+    let raw;
+    try { raw = await sdk.LayerFS.open(proj.name); } finally {
+      for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    }
+    let revives = 0;
+    const lfs = withContentionRetry(raw, async () => { revives++; });
+    const count = async () => (await lead.branch.list_commits("lost", 100, 0)).items.length;
+    const before = await count();
+    try {
+      phase = "arm";
+      // not idempotent: sent twice it makes a second Commit "xyy"
+      const r = await lfs.fs.edit("lost", "/once.txt", "x", "xy", "once");
+      assert.equal(phase, "pass", "the reply was dropped and the first check failed");
+      assert.equal(r.recovered, true, `recovered result: ${JSON.stringify(r)}`);
+      assert.equal(await count(), before + 1, "exactly one Commit");
+      assert.equal((await lead.fs.read("lost", "/once.txt", 1)).text, "xy");
+      assert.ok(revives >= 1, "revived before checking");
+    } finally {
+      proxy.close();
+      await raw.close().catch(() => {});
+      await lead.close();
+    }
+    return `revives ${revives}`;
   });
 } finally {
   for (const r of roots) stopWorkers(r);
