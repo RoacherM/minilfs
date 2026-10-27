@@ -10,7 +10,7 @@ import { createProjectClient, ensureNativeDirs, initProjectClient, type NativeSp
 import { resolveExecutionDriver, type ExecutionDriver } from "./core/driver.ts";
 import { run } from "./core/exec-helper.ts";
 import { bothSpellings, buildSeatbeltProfile } from "./seatbelt.ts";
-import { decideGitPath, GIT_JOIN_HINT, gitChangeSummary, gitDirOf, gitPathKind, gitSig, indexEntries, isProtectedPath, isSafeRefName, MERGE_UNITS, type GitPathKind } from "./gitpaths.ts";
+import { decideGitPath, GIT_APPLY_ORDER, GIT_JOIN_HINT, gitChangeSummary, gitDirOf, gitPathKind, gitSig, indexEntries, isProtectedPath, isSafeRefName, MERGE_UNITS, type GitPathKind } from "./gitpaths.ts";
 import { isOrphan, MountLeases } from "./mount-leases.ts";
 import { GIT_JOIN_SCRIPT, parseJoin, symbolicHead, type JoinResult } from "./gitjoin.ts";
 import { stopWorkers } from "./core/worker.ts";
@@ -2035,6 +2035,9 @@ export class LayerfsSession {
         for (const it of page.items ?? []) {
           if (it.type !== "dir" && !this.isBranchOnly(it.path)) {
             items.push({ path: it.path, kind: it.kind, type: it.type });
+          } else if (it.before && it.before.type !== "dir" && !this.isBranchOnly(it.path)) {
+            // a file that became a folder (refs/heads/foo -> refs/heads/foo/bar): the file is removed
+            items.push({ path: it.path, kind: "Removed", type: it.before.type });
           }
         }
         if (!page.hasMore || !(page.items ?? []).length) break;
@@ -2080,7 +2083,10 @@ export class LayerfsSession {
             else if (lst.isFile()) next = { kind: "file", data: await fsp.readFile(p), mode: lst.mode & 0o7777 };
             else continue;
           }
-          const hostRaw = await readRawEntry(join(this.cwd, rel));
+          let hostRaw = await readRawEntry(join(this.cwd, rel));
+          // a folder where the Branch has a ref (or its log) is a ref namespace the Branch replaced
+          // (refs/heads/foo/ -> refs/heads/foo): no ref there; writeGitLocked empties it or refuses
+          if (hostRaw === "other" && (git === "ref" || git === "soft") && (await fsp.lstat(join(this.cwd, rel))).isDirectory()) hostRaw = null;
           if (hostRaw === "other") { result.conflicts.push(rel); continue; }
           const host = hostRaw ? ("target" in hostRaw ? linkSig(hostRaw.target) : fileSig(hostRaw.data, hostRaw.mode)) : null;
           found.push({ rel, kind: it.kind, next, host, hostRaw, git });
@@ -2147,8 +2153,11 @@ export class LayerfsSession {
         await assertNotProtectedTarget(this.cwd, target, false);
         return target;
       };
+      /** set before the folder is first changed: a stop after it leaves main behind the folder */
+      let hostTouched = false;
       const put = async (rel: string, next: Next) => {
         const target = join(this.cwd, rel);
+        hostTouched = true;
         if (!next) {
           await fsp.rm(target, { force: true });
           delete hostIndex[rel];
@@ -2194,6 +2203,7 @@ export class LayerfsSession {
           for (const g of gitMeta) await checkTarget(g.rel);
           const missing = await gitObjectsMissing(this.cwd, gitMeta);
           const locked = gitMeta.filter((g) => g.git !== "soft");
+          if (!missing) hostTouched = true;
           const moved = missing ? null : await writeGitLocked(this.cwd, locked);
           if (missing) dropMeta(`the Branch's git names objects your folder does not have (${missing})`);
           else if (moved) dropMeta(`your folder's git moved while applying (${moved})`);
@@ -2208,7 +2218,9 @@ export class LayerfsSession {
             }
             this.bindings.writeHostIndex(this.projectRecord.name, hostIndex);
             // logs and messages: only where the folder still has the base version
-            for (const g of gitMeta.filter((x) => x.git === "soft")) {
+            // deletions first, deepest first, so a log namespace change (logs/refs/heads/foo -> foo/bar) works
+            const soft = gitMeta.filter((x) => x.git === "soft");
+            for (const g of [...soft.filter((x) => !x.next).sort((a, b) => depth(b.rel) - depth(a.rel)), ...soft.filter((x) => x.next)]) {
               const now = await hostState(join(this.cwd, g.rel));
               if (now !== "other" && sameSig(now, g.host)) await put(g.rel, g.next);
               else result.skipped.push(g.rel);
@@ -2220,7 +2232,7 @@ export class LayerfsSession {
       } catch (e: any) {
         for (const t of tmps) await fsp.rm(t, { force: true }).catch(() => {});
         this.bindings.writeHostIndex(this.projectRecord.name, hostIndex);
-        if (result.applied.length) this.bindings.setMainStale(this.projectRecord.name, true);
+        if (result.applied.length || hostTouched) this.bindings.setMainStale(this.projectRecord.name, true);
         const err = new LayerfsError(e?.code ?? "PartialApply", `apply stopped after ${result.applied.length} file(s): ${e?.message ?? e}`);
         (err as any).result = result;
         throw err;
@@ -2582,47 +2594,128 @@ async function gitObjectsMissing(cwd: string, meta: GitWrite[]): Promise<string 
 /**
  * Writes refs, HEAD and the index the way git does, so a git command running in the folder at the
  * same time is never overwritten: `<path>.lock` taken exclusively for every path first (sorted),
- * the folder's version checked again under the lock, the new bytes written into the lock file, then
- * each lock renamed over its path (a deletion unlinks the path, then the lock). Returns why nothing
- * was written (a lock git holds, a path that moved), or null when all were written.
+ * the folder's version checked again under the lock, the new bytes written into the lock file; then
+ * deletions (deepest first), then each lock renamed over its path (refs, then the index, then HEAD).
+ * A ref namespace change works both ways: a ref below a deleted ref (`foo` -> `foo/bar`) takes its
+ * lock after the deletion; a ref over a folder of deleted refs (`foo/bar` -> `foo`) is renamed once
+ * the folder is empty. Anything that fails after the first change puts every touched path back to
+ * the bytes it had (all or nothing). Returns why nothing was written (a lock git holds, a path that
+ * moved), or null when all were written; an I/O error is thrown after the rollback.
  */
 async function writeGitLocked(cwd: string, items: GitWrite[]): Promise<string | null> {
-  const sorted = [...items].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
-  const held: string[] = [];
-  try {
-    for (const it of sorted) {
-      const target = join(cwd, it.rel);
-      const lock = `${target}.lock`;
-      await fsp.mkdir(dirname(target), { recursive: true });
-      const mode = it.next?.kind === "file" ? it.next.mode & 0o7777 : 0o644;
-      const fh = await fsp.open(lock, "wx", mode).catch((e: any) => (e?.code === "EEXIST" ? null : Promise.reject(e)));
-      if (!fh) return `${it.rel}.lock exists: git is running there`;
-      held.push(lock);
-      try {
-        const now = await hostState(target);
-        if (now === "other" || !sameSig(now, it.host)) return `${it.rel} changed`;
-        if (it.next?.kind === "file") {
-          await fh.writeFile(it.next.data);
-          await fh.chmod(mode);
-        }
-      } finally {
-        await fh.close();
+  const depth = (r: string) => r.split("/").length;
+  const below = (a: string, b: string) => a.startsWith(`${b}/`);
+  const deletes = items.filter((i) => !i.next).sort((a, b) => depth(b.rel) - depth(a.rel));
+  const writes = items.filter((i) => i.next).sort((a, b) =>
+    GIT_APPLY_ORDER[a.git] - GIT_APPLY_ORDER[b.git] || depth(a.rel) - depth(b.rel) || (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+  // locked only once the ref file in their way is deleted
+  const deferred = new Set(writes.filter((w) => deletes.some((d) => below(w.rel, d.rel))));
+  // renamed over a folder the deletions empty
+  const overDir = new Set(writes.filter((w) => deletes.some((d) => below(d.rel, w.rel))));
+  const held = new Set<string>();
+  /** what each path held before (null: absent), for the rollback */
+  const prev = new Map<string, { data: Buffer; mode: number } | null>();
+  const touched: string[] = [];
+  const lockOf = (rel: string) => `${join(cwd, rel)}.lock`;
+  /** takes `it`'s lock and checks the folder still has `it.host`; null when taken, else why not */
+  const take = async (it: GitWrite): Promise<string | null> => {
+    const target = join(cwd, it.rel);
+    await fsp.mkdir(dirname(target), { recursive: true });
+    const mode = it.next?.kind === "file" ? it.next.mode & 0o7777 : 0o644;
+    const fh = await fsp.open(`${target}.lock`, "wx", mode).catch((e: any) => (e?.code === "EEXIST" ? null : Promise.reject(e)));
+    if (!fh) return `${it.rel}.lock exists: git is running there`;
+    held.add(`${target}.lock`);
+    try {
+      const raw = await readRawEntry(target);
+      const emptied = overDir.has(it) && raw === "other" && (await fsp.lstat(target)).isDirectory();
+      const now = raw === "other" ? "other" : raw ? ("target" in raw ? linkSig(raw.target) : fileSig(raw.data, raw.mode)) : null;
+      if (!emptied && (now === "other" || !sameSig(now, it.host))) return `${it.rel} changed`;
+      prev.set(it.rel, raw && raw !== "other" && "data" in raw ? raw : null);
+      if (it.next?.kind === "file") {
+        await fh.writeFile(it.next.data);
+        await fh.chmod(mode);
       }
-    }
-    for (const it of sorted) {
-      const target = join(cwd, it.rel);
-      if (it.next) await fsp.rename(`${target}.lock`, target);
-      else {
-        await fsp.rm(target, { force: true });
-        await fsp.rm(`${target}.lock`, { force: true });
-      }
-      held.splice(held.indexOf(`${target}.lock`), 1);
+    } finally {
+      await fh.close();
     }
     return null;
+  };
+  const unlock = async (rel: string) => {
+    if (held.delete(lockOf(rel))) await fsp.rm(lockOf(rel), { force: true });
+  };
+  const rollback = async () => {
+    for (const l of held) await fsp.rm(l, { force: true }).catch(() => {});
+    held.clear();
+    for (const rel of touched.reverse()) {
+      const target = join(cwd, rel);
+      const old = prev.get(rel);
+      try {
+        if ((await fsp.lstat(target).catch(() => null))?.isDirectory()) await fsp.rmdir(target);
+        else await fsp.rm(target, { force: true });
+        if (!old) { await removeEmptyGitRefParents(cwd, rel); continue; }
+        await fsp.mkdir(dirname(target), { recursive: true });
+        const tmp = join(dirname(target), `.${basename(rel)}.minilfs-${randomBytes(4).toString("hex")}`);
+        await fsp.writeFile(tmp, old.data, { mode: old.mode });
+        await fsp.chmod(tmp, old.mode);
+        await fsp.rename(tmp, target);
+      } catch {} // best effort; the caller marks main stale
+    }
+  };
+  try {
+    // 1. every lock that can be taken now, sorted; nothing in the folder changes yet
+    for (const it of [...items].filter((i) => !deferred.has(i)).sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0))) {
+      const why = await take(it);
+      if (why) return why;
+    }
+    // 2. deletions, deepest first; a folder a ref replaces is emptied (its locks go first)
+    for (const d of deletes) {
+      await fsp.rm(join(cwd, d.rel), { force: true });
+      touched.push(d.rel);
+      const over = [...overDir].find((w) => below(d.rel, w.rel));
+      if (!over) continue;
+      await unlock(d.rel);
+      for (let dir = posix.dirname(d.rel); below(dir, over.rel) || dir === over.rel; dir = posix.dirname(dir)) {
+        if (!(await fsp.rmdir(join(cwd, dir)).then(() => true, () => false))) break;
+      }
+    }
+    // 3. the locks that had to wait for a deletion; the emptied folders must be gone
+    for (const w of deferred) {
+      const why = await take(w);
+      if (why) { await rollback(); return why; }
+    }
+    for (const w of overDir) {
+      if ((await readRawEntry(join(cwd, w.rel))) !== null) { await rollback(); return `${w.rel} changed`; }
+    }
+    // 4. the new versions, in git's order; then the deletions' locks
+    for (const w of writes) {
+      await fsp.rename(lockOf(w.rel), join(cwd, w.rel));
+      held.delete(lockOf(w.rel));
+      touched.push(w.rel);
+    }
+    for (const d of deletes) {
+      await unlock(d.rel);
+      await removeEmptyGitRefParents(cwd, d.rel);
+    }
+    return null;
+  } catch (e) {
+    if (touched.length) await rollback();
+    throw e;
   } finally {
     for (const l of held) await fsp.rm(l, { force: true }).catch(() => {});
   }
 }
+
+/** Removes folders a deleted ref leaves empty, below `<git dir>/refs/<kind>/` (never refs/, refs/heads/, ...). */
+async function removeEmptyGitRefParents(root: string, rel: string): Promise<void> {
+  const dir = gitDirOf(rel);
+  if (!dir) return;
+  for (let d = posix.dirname(rel); ; d = posix.dirname(d)) {
+    const inner = d.slice(dir.length + 1);
+    if (!inner.startsWith("refs/") || depthOf(inner) < 3) return;
+    if (!(await fsp.rmdir(join(root, d)).then(() => true, () => false))) return;
+  }
+}
+const depthOf = (r: string) => r.split("/").length;
 
 async function removeEmptyParents(root: string, rel: string): Promise<void> {
   let dir = posix.dirname(rel);

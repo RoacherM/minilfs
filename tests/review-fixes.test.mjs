@@ -1167,6 +1167,56 @@ try {
     assert.equal((await s.lfs.fs.read(s.workBranch, "/real/busy.txt")).text, "busy\n", "retry committed the held Workspace");
   });
 
+  await step("S5 apply takes a ref namespace change both ways: refs/heads/foo -> foo/bar, then foo/bar -> foo", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1"); g("branch", "foo");
+    const s = await open(cwd, "s5");
+    const env = "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t;";
+    const o = out();
+    await s.mutate("1", "bash", () => s.exec(`${env} echo two > two.txt && git add two.txt && git commit -qm c2 && git branch -D foo >/dev/null && git branch foo/bar && git rev-parse HEAD`, cwd, o));
+    const c2 = o.text().trim().split("\n").pop();
+    const ap = await s.apply();
+    assert.deepEqual(ap.warnings, [], ap.warnings.join("; "));
+    assert.equal(g("rev-parse", "refs/heads/foo/bar").stdout.trim(), c2, "foo/bar reached the folder");
+    assert.notEqual(g("rev-parse", "-q", "--verify", "refs/heads/foo").status, 0, "foo is gone");
+    assert.equal(g("rev-parse", "refs/heads/main").stdout.trim(), c2);
+    assert.equal(spawnSync("git", ["-C", cwd, "fsck", "--no-progress"]).status, 0, "git fsck clean");
+    // and back: foo/bar -> foo (a ref replaces the folder of refs)
+    const o2 = out();
+    await s.mutate("2", "bash", () => s.exec(`${env} echo three > three.txt && git add three.txt && git commit -qm c3 && git branch -D foo/bar >/dev/null && git branch foo && git rev-parse HEAD`, cwd, o2));
+    const c3 = o2.text().trim().split("\n").pop();
+    const ap2 = await s.apply();
+    assert.deepEqual(ap2.conflicts, []);
+    assert.deepEqual(ap2.warnings, [], ap2.warnings.join("; "));
+    assert.equal(g("rev-parse", "refs/heads/foo").stdout.trim(), c3, "foo reached the folder");
+    assert.notEqual(g("rev-parse", "-q", "--verify", "refs/heads/foo/bar").status, 0, "foo/bar is gone");
+    assert.equal(spawnSync("git", ["-C", cwd, "fsck", "--no-progress"]).status, 0, "git fsck clean");
+    assert.equal(g("status", "--porcelain").stdout.trim(), "", "folder clean");
+    const locks = spawnSync("find", [join(cwd, ".git"), "-name", "*.lock"], { encoding: "utf8" }).stdout.trim();
+    assert.equal(locks, "", "no lock left");
+  });
+
+  await step("S4 a failure midway through the git metadata puts every ref back (no half-moved refs), no lock left, main marked stale", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c0"); g("commit", "-q", "--allow-empty", "-m", "c1"); g("branch", "a"); g("branch", "b");
+    const c1 = g("rev-parse", "HEAD").stdout.trim();
+    const s = await open(cwd, "s4");
+    // only refs move (no file, no new object): nothing else marks main stale
+    await s.mutate("1", "bash", () => s.exec("git branch -f a HEAD~1 && git branch -f b HEAD~1", cwd, out()));
+    const realRename = fsp.rename;
+    let hit = 0;
+    fsp.rename = async (...args) => { if (String(args[1]).endsWith(".git/refs/heads/b") && hit++ === 0) throw Object.assign(new Error("disk full"), { code: "ENOSPC" }); return realRename.apply(fsp, args); };
+    try { await assert.rejects(s.apply(), (e) => e.code === "ENOSPC"); } finally { fsp.rename = realRename; }
+    assert.equal(hit, 1, "the injected failure fired");
+    for (const r of ["a", "b"]) assert.equal(g("rev-parse", `refs/heads/${r}`).stdout.trim(), c1, `refs/heads/${r} is back at the folder's commit`);
+    const locks = spawnSync("find", [join(cwd, ".git"), "-name", "*.lock"], { encoding: "utf8" }).stdout.trim();
+    assert.equal(locks, "", "no lock left");
+    assert.equal(s.bindings.byName(s.project).mainStale, true, "main marked stale");
+    assert.equal(spawnSync("git", ["-C", cwd, "fsck", "--no-progress"]).status, 0, "git fsck clean");
+  });
+
   await step("too-large first import is refused before copying, naming the largest folders", async () => {
     const cwd = project();
     mkdirSync(join(cwd, "big"));
