@@ -241,3 +241,21 @@ R3 R4 R5 R8 R10 R11 R12 R13; not fixed completely — R1. Push-ready: no.
 | S11 | index entries joined with "\n" then split: a filename with a newline yields bogus oids; an empty index parses as null | code | Minor |
 | S12 | `attr.tree` does not cover `.git/info/attributes` / `core.attributesFile` | git docs | Minor |
 | S13 | own-pid shortcut in `sessionAlive` skips the recorded start-time check | code | Minor |
+
+## 8. Review of the second round (757155a..fe7746d) by gpt-6.1-sol (high), 2026-10-27
+
+Implementation by claude-opus-5-5 from `docs/specs/review-fixes-2-2026-10-27.md` (6 commits; every new
+test failed before and passes after; full suite green: elevate 28, store-contention 7,
+native-seatbelt 25, review-fixes 59, …). Verdicts: fixed — S2 S3 S11 S12; fixed with caveat — S1 S5
+S10 S13; not fixed — S4 S6 S7 S8 S9 (residual cases below). Push-ready: no.
+
+| # | Finding | Severity |
+| --- | --- | --- |
+| F1 | nested D/F rollback (`foo` → `foo/deep/bar`): rollback cannot rmdir the transaction-created `foo/deep`, so the original `foo` is never restored (error swallowed) | Major |
+| F2 | rollback after a partial commit overwrites a host update made to an already-renamed ref (its lock was released) | Major |
+| F3 | a symbolic branch ref (`refs/heads/x = ref: refs/tags/blob`) resolves to a blob: commit typing applied only to HEAD | Major |
+| F4 | when start-time lookup fails (no python3, timeout, bad output) mount holders are SIGKILLed by bare pid; batch snapshot ≠ per-signal check | Major |
+| F5 | rescue allocator returns null (same as "already preserved") when dst, dst-oid12 and dst-oid all hold other objects; ancestor/descendant (D/F) occupancy not checked | Major |
+| F6 | classification is still lexical: a real submodule `a/logs` has its index classified `soft` → skips object check and the lock transaction | Major |
+| F7 | join index restore ignores `cp` failure and deletes the backup; the join then still commits | Major |
+| m | outside read: whole file slurped (no byte bound), `/dev/zero` unbounded, no concurrency limit; packed-refs name check accepts `a..b`; `IgnoreRules.load` runs host git with the inherited env | Minor |
