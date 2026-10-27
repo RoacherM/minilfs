@@ -251,6 +251,21 @@ try {
     } finally { rmSync(link, { force: true }); }
   });
 
+  await step("R18 close() during exec(\"sleep 60\") aborts the call promptly", async () => {
+    const cwd = project();
+    const s = await open(cwd, "r18");
+    const running = s.exec("sleep 60", cwd, { onData: () => {} });
+    running.catch(() => {});
+    await new Promise((r) => setTimeout(r, 1500));
+    const t0 = Date.now();
+    await s.close();
+    await assert.rejects(running, /aborted/);
+    const ms = Date.now() - t0;
+    assert.ok(ms < 15_000, `close took ${ms} ms`);
+    assert.equal(pgrep("sleep 60").stdout.trim(), "", "nothing left running");
+    return `${ms} ms`;
+  });
+
   await step("N1: background jobs started by bash die with the command (PID namespace)", async () => {
     const cwd = project();
     const s = await open(cwd, "n1");

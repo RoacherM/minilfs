@@ -363,6 +363,17 @@ try {
       assert.equal(await s.exists(join(t, "notes.md")), true);
     } finally { rmSync(t, { recursive: true, force: true }); }
   });
+  await step("R14 prelude timeout: 124 only when the limit fired, a command's own SIGTERM exit stays 143", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const { buildNativeShellPrelude } = await import("../src/core/driver.ts");
+    // PATH without GNU timeout, so the prelude defines its own
+    const sh = (cmd) => spawnSync("/bin/bash", ["-c", `${buildNativeShellPrelude(dir, dir)}\n${cmd}; echo "rc=$?"`], { encoding: "utf8", env: { PATH: "/usr/bin:/bin", TMPDIR: dir } }).stdout.trim();
+    assert.equal(sh("command -v timeout"), "timeout\nrc=0", "the prelude's function, not a binary");
+    assert.equal(sh("timeout 10 sh -c 'kill -TERM $$'"), "rc=143");
+    assert.equal(sh("timeout 1 sh -c 'sleep 10'"), "rc=124");
+    assert.equal(sh("timeout 5 sh -c 'exit 3'"), "rc=3");
+    assert.deepEqual((await import("node:fs")).readdirSync(dir).filter((n) => n.startsWith(".minilfs-timeout")), [], "no marker left");
+  });
 } finally {
   try { rmSync(dir, { recursive: true, force: true }); } catch {}
   console.log(`\n${results.filter(Boolean).length}/${results.length} passed`);

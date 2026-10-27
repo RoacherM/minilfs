@@ -12,7 +12,7 @@
 //
 //   node store-worker.mjs --dir <worker dir> --home <LayerFS home> --bundle <bundle dir> [--build B] [--idle-ms N]
 //
-// It writes <dir>/endpoint.json { home, port, secret, build, pid } (0600) once listening,
+// It writes <dir>/endpoint.json { home, port, secret, build, pid, startSec, startUsec } (0600) once listening,
 // on 127.0.0.1 only; the secret is made here and never passed in argv or env. It exits after
 // --idle-ms (default 10 min) with no client connection and no call running, closing its Stores
 // and removing its endpoint file.
@@ -22,6 +22,7 @@ import { createRequire } from "node:module";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { procStartTime } from "./core/proc-scan.ts";
 
 const arg = (name, fallback) => {
   const i = process.argv.indexOf(`--${name}`);
@@ -182,7 +183,9 @@ process.on("SIGINT", () => stop("SIGINT").catch(() => process.exit(1)));
 
 server.listen(0, "127.0.0.1", () => {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const info = { home, port: server.address().port, secret: secret.toString("hex"), build, pid: process.pid, startedAt: Date.now() };
+  // (pid, start time) is this process's identity: a client never signals a reused pid (core/worker.ts)
+  const me = procStartTime(process.pid);
+  const info = { home, port: server.address().port, secret: secret.toString("hex"), build, pid: process.pid, startedAt: Date.now(), ...(me ? { startSec: me.startSec, startUsec: me.startUsec } : {}) };
   writeFileSync(`${endpointFile}.${process.pid}`, JSON.stringify(info), { mode: 0o600 });
   renameSync(`${endpointFile}.${process.pid}`, endpointFile);
   log(`listening on 127.0.0.1:${info.port} (build ${build}, bundle ${bundle})`);

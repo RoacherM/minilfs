@@ -648,6 +648,28 @@ try {
     assert.match(r.out, /GIT-OK/, r.out);
   });
 
+  await step("7.1d R3 a call's reap spares another session's orphan in the shared cache dir, kills one in its branch scratch dir", async () => {
+    const scratch = join(root, "scratch", sA.project);
+    const shared = join(scratch, "shared"), mine = join(scratch, "branches", sA.logicalBranch);
+    mkdirSync(shared, { recursive: true }); mkdirSync(mine, { recursive: true });
+    const call = sA.mutate("r3", "bash", () => sA.exec("sleep 3", cwd, { onData: () => {} }));
+    await new Promise((res) => setTimeout(res, 1000));
+    // started during the call, orphaned (ppid 1), in their own sessions, as another session's server would be
+    const orphan = (dir, n) => spawnSync("/bin/sh", ["-c", `(cd '${dir}' && exec /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec q(sleep), ${n}') </dev/null >/dev/null 2>&1 &`]);
+    orphan(shared, 989);
+    orphan(mine, 988);
+    await new Promise((res) => setTimeout(res, 300));
+    assert.match(pgrep("sleep 989").stdout, /\d/, "the shared-cache orphan started");
+    await call;
+    await new Promise((res) => setTimeout(res, 300));
+    try {
+      assert.match(pgrep("sleep 989").stdout, /\d/, "the process in the shared cache dir survives another call");
+      assert.equal(pgrep("sleep 988").stdout.trim(), "", "the orphan in this branch's scratch dir is reaped");
+    } finally {
+      spawnSync("pkill", ["-f", "sleep 98[89]"]);
+    }
+  });
+
   await step("7.2 persistent mergedFileMtimes across multiple bash calls & cleanScratch", async () => {
     await sWorker.mutate("m-w1", "write", () => sWorker.writeFile(join(cwd, "persisted-mtime.rs"), "fn a() {}\n"));
     await new Promise((r) => setTimeout(r, 1100));

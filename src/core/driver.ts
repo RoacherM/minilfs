@@ -7,13 +7,12 @@
 //     sandbox workers (Cloudflare Sandbox, E2B, Modal, SSH/RPC cluster nodes) without changing
 //     any upper-layer agent tool, MCP, or CLI call.
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import { constants as fsc, existsSync, promises as fsp, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { LayerfsConfig } from "../config.ts";
 import { bothSpellings, buildSeatbeltProfile } from "../seatbelt.ts";
-import { killAll, leftovers, listOwnProcesses } from "./proc-scan.ts";
+import { killAll, leftovers, listOwnProcesses, nowUs } from "./proc-scan.ts";
 
 /** After the shell exits, how long its output may keep draining before the pipe is cut. */
 const PIPE_DRAIN_MS = 2000;
@@ -101,14 +100,18 @@ export function buildNativeShellPrelude(hostCwd: string, wsReal: string): string
     // children too (cargo test spawns the test binary); the watchdog holds no pipe and exits with it
     `    /usr/bin/perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' "$@" &`,
     `    local _cpid=$!`,
-    `    ( exec </dev/null >/dev/null 2>&1; sleep "$_dur" & _s=$!; trap 'kill -KILL $_s 2>/dev/null; exit 0' TERM; wait $_s && kill -TERM -- "-$_cpid" "$_cpid" 2>/dev/null && sleep 1 && kill -KILL -- "-$_cpid" "$_cpid" 2>/dev/null ) &`,
+    // the watchdog leaves a marker just before it kills: 124 means "timeout fired", never the
+    // command's own 143/137 (a command that kills itself)
+    `    local _mark="\${TMPDIR:-/tmp}/.minilfs-timeout.$$.$_cpid"`,
+    `    rm -f "$_mark"`,
+    `    ( exec </dev/null >/dev/null 2>&1; sleep "$_dur" & _s=$!; trap 'kill -KILL $_s 2>/dev/null; exit 0' TERM; wait $_s && : > "$_mark" && kill -TERM -- "-$_cpid" "$_cpid" 2>/dev/null && sleep 1 && kill -KILL -- "-$_cpid" "$_cpid" 2>/dev/null ) &`,
     `    local _wpid=$!`,
     `    wait "$_cpid" 2>/dev/null`,
     `    local _rc=$?`,
     `    kill -TERM "$_wpid" 2>/dev/null || true`,
     `    wait "$_wpid" 2>/dev/null || true`,
     `    kill -KILL -- "-$_cpid" 2>/dev/null || true`,
-    `    if [ $_rc -eq 143 ] || [ $_rc -eq 137 ]; then return 124; fi`,
+    `    if [ -e "$_mark" ]; then rm -f "$_mark"; return 124; fi`,
     `    return $_rc`,
     `  }`,
     `fi`,
@@ -123,7 +126,6 @@ export function buildNativeShellPrelude(hostCwd: string, wsReal: string): string
  */
 export class LocalNativeDriver implements ExecutionDriver {
   readonly name = "native";
-  private activeKills = new Map<string, () => Promise<void>>();
 
   async preflight(config: LayerfsConfig): Promise<string> {
     const problems: string[] = [];
@@ -199,21 +201,21 @@ export class LocalNativeDriver implements ExecutionDriver {
     const prelude = buildNativeShellPrelude(hostCwd, wsReal);
     const wrappedCommand = `${prelude}\n${command}`;
 
+    // taken before the spawn: everything the call starts is at or after it (proc-scan.ts)
+    const startedUs = nowUs();
     const child = spawn(
       "/usr/bin/sandbox-exec",
       ["-p", profile, "/bin/bash", "-c", wrappedCommand],
       { cwd: runCwd, env: childEnv, stdio: ["ignore", "pipe", "pipe"], detached: true },
     );
-    const startedSec = Math.floor(Date.now() / 1000);
     child.stdout.on("data", options.onData);
     child.stderr.on("data", options.onData);
-    // the call's processes may be found under these roots after the shell is gone (see proc-scan.ts)
-    const roots = [...new Set([wsReal, branchScratchDir, sharedCacheDir].flatMap((p) => bothSpellings(p)))];
+    // the call's processes may be found under these roots after the shell is gone (see proc-scan.ts);
+    // not sharedCacheDir: every session of the project uses it
+    const roots = [...new Set([wsReal, branchScratchDir].flatMap((p) => bothSpellings(p)))];
 
-    const tag = randomBytes(6).toString("hex");
     let stopping: Promise<void> | null = null;
     const kill = () => (stopping ??= this.killProcessGroup(child, wsReal, config.killGraceMs));
-    this.activeKills.set(tag, kill);
 
     // the caller's limit (Pi's bash `timeout`), else the overall limit every call has
     const limitS = Math.min(options.timeout && options.timeout > 0 ? options.timeout : Infinity, config.bashTimeoutS ?? 600);
@@ -254,7 +256,7 @@ export class LocalNativeDriver implements ExecutionDriver {
         } catch {}
       }
       await this.reapWorkspaceHolders(wsReal).catch(() => {});
-      await this.reapLeftovers(child.pid, startedSec, roots).catch(() => {});
+      await this.reapLeftovers(child.pid, startedUs, roots).catch(() => {});
 
       const lwwFile = join(wsReal, ".lww");
       if (!existsSync(lwwFile)) {
@@ -272,7 +274,6 @@ export class LocalNativeDriver implements ExecutionDriver {
     } finally {
       if (timer) clearTimeout(timer);
       options.signal?.removeEventListener("abort", onAbort);
-      this.activeKills.delete(tag);
       if (child.pid) {
         try {
           process.kill(-child.pid, "SIGKILL");
@@ -282,9 +283,9 @@ export class LocalNativeDriver implements ExecutionDriver {
   }
 
   /** Kills what a call left running outside its process group (see proc-scan.ts). */
-  private async reapLeftovers(pgid: number | undefined, sinceSec: number, roots: string[]): Promise<void> {
+  private async reapLeftovers(pgid: number | undefined, sinceUs: number, roots: string[]): Promise<void> {
     const rows = await listOwnProcesses();
-    killAll(leftovers(rows, { pgid, sinceSec, roots }).map((r) => r.pid));
+    killAll(leftovers(rows, { pgid, sinceUs, roots }).map((r) => r.pid));
   }
 
   private async killProcessGroup(child: ReturnType<typeof spawn>, wsReal: string, killGraceMs: number): Promise<void> {

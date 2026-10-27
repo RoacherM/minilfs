@@ -10,14 +10,16 @@
 // unlike reading another process's environment) and returns those that are
 //   - in the call's process group, or
 //   - orphans (ppid 1) started after the call began, whose executable or working directory is under
-//     one of the call's roots (the Workspace, the branch scratch dir, the shared build cache).
+//     one of the call's roots (the Workspace, the branch scratch dir). Not the project's shared build
+//     cache: every session of the project uses it, so another session's process may live there.
 // A process the user started in their own terminal is not an orphan of launchd and is not killed;
 // one started before the call is not killed either.
+import { spawnSync } from "node:child_process";
 import { run } from "./exec-helper.ts";
 
-/** libproc listing: [pid, ppid, pgid, startSec, executable, cwd] for every process of this user. */
+/** libproc listing: [pid, ppid, pgid, startSec, startUsec, executable, cwd] for every process of this user (or the one pid given). */
 const SCAN_PY = String.raw`
-import ctypes, os, json
+import ctypes, os, json, sys
 lib = ctypes.CDLL("/usr/lib/libproc.dylib")
 class BSD(ctypes.Structure):
     _fields_ = [("flags", ctypes.c_uint32), ("status", ctypes.c_uint32), ("xstatus", ctypes.c_uint32), ("pid", ctypes.c_uint32), ("ppid", ctypes.c_uint32),
@@ -28,9 +30,12 @@ class VI(ctypes.Structure):
     _fields_ = [("vi", ctypes.c_uint8 * 152), ("path", ctypes.c_char * 1024)]
 class VPI(ctypes.Structure):
     _fields_ = [("cdir", VI), ("rdir", VI)]
-n = lib.proc_listallpids(None, 0)
-buf = (ctypes.c_int * (n + 256))()
-n = lib.proc_listallpids(buf, ctypes.sizeof(buf))
+if len(sys.argv) > 1:
+    buf, n = [int(sys.argv[1])], 1
+else:
+    n = lib.proc_listallpids(None, 0)
+    buf = (ctypes.c_int * (n + 256))()
+    n = lib.proc_listallpids(buf, ctypes.sizeof(buf))
 uid, out = os.getuid(), []
 for p in buf[:n]:
     if p <= 0: continue
@@ -40,33 +45,53 @@ for p in buf[:n]:
     lib.proc_pidpath(p, path, 4096)
     v, cwd = VPI(), ""
     if lib.proc_pidinfo(p, 9, 0, ctypes.byref(v), ctypes.sizeof(v)) > 0: cwd = v.cdir.path.decode(errors="replace")
-    out.append([p, b.ppid, b.pgid, b.start_sec, path.value.decode(errors="replace"), cwd])
+    out.append([p, b.ppid, b.pgid, b.start_sec, b.start_usec, path.value.decode(errors="replace"), cwd])
 print(json.dumps(out))
 `;
 
-export interface ProcRow { pid: number; ppid: number; pgid: number; startSec: number; exe: string; cwd: string }
+/** A process; (pid, startSec, startUsec) identifies it (a pid alone may be reused). */
+export interface ProcRow { pid: number; ppid: number; pgid: number; startSec: number; startUsec: number; exe: string; cwd: string }
+
+const rowsOf = (stdout: string): ProcRow[] =>
+  (JSON.parse(stdout) as any[]).map(([pid, ppid, pgid, startSec, startUsec, exe, cwd]) => ({ pid, ppid, pgid, startSec, startUsec, exe, cwd }));
 
 /** This user's processes (empty when python3/libproc is unavailable). */
 export async function listOwnProcesses(): Promise<ProcRow[]> {
   const r = await run("/usr/bin/python3", ["-c", SCAN_PY], { timeoutMs: 10_000 }).catch(() => null);
   if (!r || r.code !== 0) return [];
   try {
-    return (JSON.parse(r.stdout.toString()) as any[]).map(([pid, ppid, pgid, startSec, exe, cwd]) => ({ pid, ppid, pgid, startSec, exe, cwd }));
+    return rowsOf(r.stdout.toString());
   } catch {
     return [];
   }
 }
 
+/** One process of this user with its start time (libproc), or null (gone, another user's, no python3). */
+export function procStartTime(pid: number): ProcRow | null {
+  const r = spawnSync("/usr/bin/python3", ["-c", SCAN_PY, String(pid)], { encoding: "utf8", timeout: 10_000 });
+  if (r.status !== 0) return null;
+  try {
+    return rowsOf(r.stdout).find((row) => row.pid === pid) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Microseconds since the epoch (wall clock, as libproc's start times). */
+export const nowUs = () => Date.now() * 1000;
+const startUs = (r: ProcRow) => r.startSec * 1_000_000 + (r.startUsec ?? 0);
+
 /**
- * The processes a call left behind: its process group, plus launchd orphans started since `sinceSec`
- * whose executable or cwd is under `roots` (every spelling given). Never this process or its parent.
+ * The processes a call left behind: its process group, plus launchd orphans started at or after
+ * `sinceUs` (taken before the shell was spawned, so no slack is needed) whose executable or cwd is
+ * under `roots` (every spelling given). Never this process or its parent.
  */
-export function leftovers(rows: ProcRow[], opts: { pgid?: number; sinceSec: number; roots: string[] }): ProcRow[] {
+export function leftovers(rows: ProcRow[], opts: { pgid?: number; sinceUs: number; roots: string[] }): ProcRow[] {
   const under = (p: string) => !!p && opts.roots.some((r) => p === r || p.startsWith(`${r}/`));
   return rows.filter((r) => {
     if (r.pid === process.pid || r.pid === process.ppid || r.pid <= 1) return false;
     if (opts.pgid && r.pgid === opts.pgid) return true;
-    return r.ppid === 1 && r.startSec >= opts.sinceSec - 1 && (under(r.exe) || under(r.cwd));
+    return r.ppid === 1 && startUs(r) >= opts.sinceUs && (under(r.exe) || under(r.cwd));
   });
 }
 

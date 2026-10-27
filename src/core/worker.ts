@@ -7,16 +7,22 @@
 // own (they then share the Store the old way, protected by the Busy retry in client.ts).
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, truncateSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, statSync, truncateSync } from "node:fs";
 import { connect } from "node:net";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { acquireLock, alive } from "../lock.ts";
+import { procStartTime } from "./proc-scan.ts";
 
-export interface WorkerEndpoint { home: string; port: number; secret: string; build: string; pid: number; startedAt?: number }
+export interface WorkerEndpoint { home: string; port: number; secret: string; build: string; pid: number; startedAt?: number; startSec?: number; startUsec?: number }
 
 const SCRIPT = fileURLToPath(new URL("../store-worker.mjs", import.meta.url));
 const READY_MS = 15_000;
+/** A busy worker (a long call on its thread pool) answers a ping late; this long is not stuck. */
+const PING_MS = 3000;
+/** Stuck = this many missed pings, PING_GAP_MS apart, over at least STUCK_MS. */
+const STUCK_PINGS = 3, PING_GAP_MS = 500, STUCK_MS = 6000;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const LOG_LIMIT = 5 * 1024 * 1024;
 
 /** The worker's folder for this root and build: <root>/worker/<build>. */
@@ -42,7 +48,7 @@ let frames: Promise<{ frame: (v: unknown) => Buffer; readFrames: (...a: any[]) =
 const framesOf = (bundle: string) => (frames ??= import(pathToFileURL(join(bundle, "api/agent/sdk/src/internal.js")).href));
 
 /** The worker's ping answer ({ ready, build, pid, ... }) within `ms`, else null. */
-export async function pingWorker(bundle: string, e: WorkerEndpoint, ms = 1000): Promise<any | null> {
+export async function pingWorker(bundle: string, e: WorkerEndpoint, ms = PING_MS): Promise<any | null> {
   const { frame, readFrames } = await framesOf(bundle);
   return new Promise((resolve) => {
     const socket = connect({ host: "127.0.0.1", port: e.port });
@@ -56,6 +62,28 @@ export async function pingWorker(bundle: string, e: WorkerEndpoint, ms = 1000): 
     socket.on("error", () => done(null));
     socket.on("close", () => done(null));
   });
+}
+
+/**
+ * The endpoint's pid is still that worker: alive, the start time it recorded, a node executable,
+ * its cwd the worker's folder. A reused pid (another program, or a later process) never matches;
+ * an endpoint without a start time (older worker) cannot be checked and does not match either.
+ */
+function isWorkerProcess(e: WorkerEndpoint, dir: string): boolean {
+  if (!e.pid || e.startSec === undefined || e.startUsec === undefined || !alive(e.pid)) return false;
+  const p = procStartTime(e.pid);
+  if (!p || p.startSec !== e.startSec || p.startUsec !== e.startUsec || !/node/i.test(basename(p.exe))) return false;
+  try { return p.cwd === realpathSync(dir); } catch { return false; }
+}
+
+/** SIGTERM, then SIGKILL after 2 s if it is still the same process. */
+async function stopWorkerProcess(e: WorkerEndpoint, dir: string): Promise<void> {
+  try { process.kill(e.pid, "SIGTERM"); } catch { return; }
+  for (const until = Date.now() + 2000; Date.now() < until; ) {
+    await sleep(100);
+    if (!isWorkerProcess(e, dir)) return;
+  }
+  if (isWorkerProcess(e, dir)) try { process.kill(e.pid, "SIGKILL"); } catch {}
 }
 
 /** Node to run the worker with: this process's when it is node, else `node` on PATH. */
@@ -79,11 +107,18 @@ export async function ensureWorker(opts: { root: string; home: string; bundle: s
   const lock = await acquireLock(join(dir, "start.lock"), READY_MS * 2);
   try {
     if (await answering()) return file; // another process started it while we waited
-    // a worker that runs but does not answer is stuck: replace it
+    // a worker that runs but does not answer may be busy: replace it only when it misses pings for
+    // a while, and signal it only when the pid is still that worker (else just start a new one)
     const stale = readEndpoint(file);
-    if (stale?.pid && alive(stale.pid)) {
+    if (stale && stale.home === opts.home && isWorkerProcess(stale, dir)) {
+      const t0 = Date.now();
+      for (let missed = 0; ; ) {
+        if ((await pingWorker(opts.bundle, stale))?.ready) return file;
+        if (++missed >= STUCK_PINGS && Date.now() - t0 >= STUCK_MS) break;
+        await sleep(PING_GAP_MS);
+      }
       opts.log?.(`store worker ${stale.pid} does not answer; replacing it`);
-      try { process.kill(stale.pid, "SIGKILL"); } catch {}
+      await stopWorkerProcess(stale, dir);
     }
     const logFile = join(dir, "worker.log");
     try { if (statSync(logFile).size > LOG_LIMIT) truncateSync(logFile, 0); } catch {}
@@ -124,7 +159,8 @@ export function stopWorkers(root: string): void {
   try { builds = readdirSync(base); } catch { return; }
   for (const b of builds) {
     const e = readEndpoint(join(base, b, "endpoint.json"));
-    if (e?.pid && e.pid !== process.pid && alive(e.pid)) {
+    // only the worker itself, never a process that reused its pid
+    if (e?.pid && e.pid !== process.pid && isWorkerProcess(e, join(base, b))) {
       try { process.kill(e.pid, "SIGTERM"); } catch {}
     }
   }

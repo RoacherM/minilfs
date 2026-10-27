@@ -10,6 +10,8 @@
 //   3. idle: the worker exits after its idle time and removes its endpoint
 //   4. in-process mode (MINILFS_STORE_WORKER=0): the same load finishes through the Busy retry
 //   5. R2: a write's reply lost after it landed, and the first check fails: it lands exactly once
+//   6. R4: a stale endpoint naming an innocent process's pid: that process is never signalled
+//   7. R4: a worker that answers a ping late (busy) is reused, not replaced
 // Run: node tests/store-contention.test.mjs
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -223,6 +225,57 @@ try {
       await lead.close();
     }
     return `revives ${revives}`;
+  });
+  await step("R4 stale endpoint (dead port) with the pid of an innocent sleep (cwd /tmp): the sleep survives ensureWorker", async () => {
+    const root = join(process.env.MINILFS_TEST_TMP ?? tmpdir(), `minilfs-contend-${Date.now().toString(36)}-r4`);
+    roots.push(root);
+    const spec = specOf(root, true);
+    const { ensureWorker, workerBuild, workerDir } = await import("../src/core/worker.ts");
+    const { LAYERFS_COMMIT } = await import("../src/bundle.ts");
+    const build = workerBuild(bundle, LAYERFS_COMMIT);
+    const innocent = spawn("sleep", ["99"], { cwd: "/tmp", detached: true, stdio: "ignore" });
+    innocent.unref();
+    try {
+      // a port nobody listens on
+      const net = await import("node:net");
+      const srv = net.createServer();
+      await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+      const port = srv.address().port;
+      await new Promise((r) => srv.close(r));
+      // its real start time too (only exe and cwd differ), as a reused pid would have
+      const ps = await import("../src/core/proc-scan.ts");
+      const st = ps.procStartTime?.(innocent.pid);
+      mkdirSync(workerDir(root, build), { recursive: true, mode: 0o700 });
+      writeFileSync(join(workerDir(root, build), "endpoint.json"), JSON.stringify({ home: spec.home, port, secret: "a".repeat(64), build, pid: innocent.pid, ...(st ? { startSec: st.startSec, startUsec: st.startUsec } : {}) }), { mode: 0o600 });
+      const file = await ensureWorker({ root, home: spec.home, bundle, build });
+      const now = JSON.parse(readFileSync(file, "utf8")).pid;
+      let sleeping = true;
+      try { process.kill(innocent.pid, 0); } catch { sleeping = false; }
+      assert.equal(sleeping, true, "the innocent process was not signalled");
+      assert.notEqual(now, innocent.pid, "a new worker serves the root");
+      return `new worker ${now}`;
+    } finally {
+      try { process.kill(innocent.pid, "SIGKILL"); } catch {}
+    }
+  });
+
+  await step("R4 a worker whose ping answers late (stopped 2.5 s) is reused, not replaced", async () => {
+    const { root, spec, lead } = await newProject(true);
+    roots.push(root);
+    await lead.close();
+    const { ensureWorker, workerBuild } = await import("../src/core/worker.ts");
+    const { LAYERFS_COMMIT } = await import("../src/bundle.ts");
+    const [pid] = workerPids(root);
+    process.kill(pid, "SIGSTOP");
+    const cont = setTimeout(() => { try { process.kill(pid, "SIGCONT"); } catch {} }, 2500);
+    try {
+      const file = await ensureWorker({ root, home: spec.home, bundle, build: workerBuild(bundle, LAYERFS_COMMIT) });
+      assert.equal(JSON.parse(readFileSync(file, "utf8")).pid, pid, "the same worker");
+      process.kill(pid, 0);
+    } finally {
+      clearTimeout(cont);
+      try { process.kill(pid, "SIGCONT"); } catch {}
+    }
   });
 } finally {
   for (const r of roots) stopWorkers(r);

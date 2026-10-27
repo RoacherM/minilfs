@@ -227,7 +227,8 @@ export class LayerfsSession {
 
   private lastStoreCommit: { kind: string; head: string | null } | null = null;
   private inMutate = false;
-  private activeSids = new Map<string, () => Promise<void>>();
+  /** running bash calls: close() aborts each and waits for it (its Commit and unmount) */
+  private activeExecs = new Map<AbortController, Promise<unknown>>();
   private pendingUnmounts = new Set<Promise<unknown>>();
   /** Workspaces this session has mounted and not yet unmounted, by `ws.path`. */
   private mounts = new Map<string, { ws: Workspace; wsReal: string }>();
@@ -1671,7 +1672,25 @@ export class LayerfsSession {
     options: { onData: (d: Buffer) => void; signal?: AbortSignal; timeout?: number; env?: NodeJS.ProcessEnv },
   ): Promise<{ exitCode: number | null }> {
     if (options.signal?.aborted) throw new Error("aborted");
+    // one controller per call, linked to the caller's signal, so close() can stop it too
+    const ctl = new AbortController();
+    const onAbort = () => ctl.abort();
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    const running = this.execOnce(command, hostCwd, { ...options, signal: ctl.signal });
+    this.activeExecs.set(ctl, running);
+    try {
+      return await running;
+    } finally {
+      this.activeExecs.delete(ctl);
+      options.signal?.removeEventListener("abort", onAbort);
+    }
+  }
 
+  private async execOnce(
+    command: string,
+    hostCwd: string,
+    options: { onData: (d: Buffer) => void; signal: AbortSignal; timeout?: number; env?: NodeJS.ProcessEnv },
+  ): Promise<{ exitCode: number | null }> {
     const { ws, wsReal } = await this.mountWorkspace(this.workBranch);
     // Everything after the mount sits inside this try, so a throw anywhere still releases the Workspace.
     let keepMounted = false;
@@ -2244,7 +2263,8 @@ export class LayerfsSession {
     const notes: string[] = [];
     if (this.closed) return { kept: true, notes };
     this.closed = true;
-    await Promise.allSettled([...this.activeSids.values()].map((k) => k()));
+    for (const ctl of this.activeExecs.keys()) ctl.abort();
+    await Promise.allSettled([...this.activeExecs.values()]);
     await Promise.allSettled([...this.pendingUnmounts]);
     if (this.blocked?.heldWs && !this.mounts.has(this.blocked.heldWs.path)) {
       this.mounts.set(this.blocked.heldWs.path, { ws: this.blocked.heldWs, wsReal: this.blocked.heldWs.path });
