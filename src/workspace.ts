@@ -15,6 +15,7 @@ import { isOrphan, MountLeases } from "./mount-leases.ts";
 import { GIT_JOIN_SCRIPT, parseJoin, symbolicHead, type JoinResult } from "./gitjoin.ts";
 import { stopWorkers } from "./core/worker.ts";
 import { alive } from "./lock.ts";
+import { procStartTime } from "./core/proc-scan.ts";
 
 export interface Workspace { sandbox: string; path: string; image?: string }
 export interface Checkpoint { origins: string[]; label: string; commit: string | null; branch: string; changed: boolean; at: number }
@@ -466,7 +467,8 @@ export class LayerfsSession {
       }
       guard();
       const pub = await this.lfs.branch.publish(syncBranch);
-      this.projectRecord.mainRef = pub.layer ?? this.projectRecord.mainRef;
+      // the SDK answers the new Layer as `publishedLayer` ({ id, ... }); UpToDate has none (main keeps its Layer)
+      this.projectRecord.mainRef = pub?.publishedLayer?.id ?? pub?.layer ?? this.projectRecord.mainRef;
       this.bindings.updateProjectMain(this.projectRecord.name, this.projectRecord.mainRef);
       this.bindings.writeHostIndex(this.projectRecord.name, curr);
       if (full) this.bindings.setMainStale(this.projectRecord.name, false);
@@ -524,14 +526,10 @@ export class LayerfsSession {
       if (byId && byId.project === this.projectRecord.name) {
         saved = byId;
       } else if (this.config.branchName) {
+        const byAlias = aliasOrder();
         const match = Object.entries(this.bindings.data.sessions)
           .filter(([, s]) => s.project === this.projectRecord.name && (s.logicalBranch === this.config.branchName || s.workBranch === this.config.branchName))
-          .sort((a, b) => {
-            const aCommit = a[1].headCommit ? 1 : 0;
-            const bCommit = b[1].headCommit ? 1 : 0;
-            if (aCommit !== bCommit) return bCommit - aCommit;
-            return (b[1].updatedAt ?? 0) - (a[1].updatedAt ?? 0);
-          })[0];
+          .sort((a, b) => byAlias(a[1], b[1]))[0];
         if (match) {
           this.sessionId = match[0];
           saved = match[1];
@@ -999,6 +997,7 @@ export class LayerfsSession {
       logicalBranch: this.logicalBranch,
       alignedRef: this.alignedRef,
       pid: this.closed ? undefined : process.pid,
+      ...(this.closed ? {} : ownStart()),
       host: hostname(),
     });
   }
@@ -1021,12 +1020,7 @@ export class LayerfsSession {
 
     const sessions = Object.values(this.bindings?.data?.sessions ?? {})
       .filter((s) => s.project === this.projectRecord?.name)
-      .sort((a, b) => {
-        const aCommit = a.headCommit ? 1 : 0;
-        const bCommit = b.headCommit ? 1 : 0;
-        if (aCommit !== bCommit) return bCommit - aCommit;
-        return (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
-      });
+      .sort(aliasOrder());
 
     for (const s of sessions) {
       if (s.logicalBranch === trimmed || (s as any).sessionId === trimmed) {
@@ -2178,7 +2172,12 @@ export class LayerfsSession {
         }
         if (toPublish) {
           const pub = await this.lfs.branch.publish(toPublish);
-          if (pub?.layer) this.bindings.updateProjectMain(this.projectRecord.name, pub.layer);
+          // the SDK answers the new Layer as `publishedLayer` ({ id, ... }); UpToDate has none: keep the ref, refresh the time
+          const layer = pub?.publishedLayer?.id ?? pub?.layer ?? this.bindings.byName(this.projectRecord.name)?.mainRef ?? this.projectRecord.mainRef;
+          if (layer) {
+            this.projectRecord.mainRef = layer;
+            this.bindings.updateProjectMain(this.projectRecord.name, layer);
+          }
         }
       } catch (e: any) {
         this.bindings.setMainStale(this.projectRecord.name, true);
@@ -2354,7 +2353,45 @@ export class LayerfsSession {
 function sessionAlive(s: SessionBinding): boolean {
   if (!s.pid) return false;
   if (s.host && s.host !== hostname()) return true;
-  return s.pid === process.pid || alive(s.pid);
+  if (s.pid === process.pid) return true;
+  if (!alive(s.pid)) return false;
+  // a recorded start time tells the session's process from a later one that reused its pid
+  if (s.pidStartSec === undefined) return true;
+  const p = procStartTime(s.pid);
+  return !p || (p.startSec === s.pidStartSec && p.startUsec === s.pidStartUsec);
+}
+
+/** This process's start time (libproc), recorded with the session's pid; looked up once. */
+let ownStartCache: { pidStartSec?: number; pidStartUsec?: number } | null = null;
+function ownStart(): { pidStartSec?: number; pidStartUsec?: number } {
+  if (!ownStartCache) {
+    const p = procStartTime(process.pid);
+    ownStartCache = p ? { pidStartSec: p.startSec, pidStartUsec: p.startUsec } : {};
+  }
+  return ownStartCache;
+}
+
+/**
+ * Which session holds an alias (`lead`, a worker's name) first: one whose process runs beats a
+ * finished or crashed one, then the newer, then one with a Commit. A dead earlier lead's Branch with
+ * commits must not shadow the running lead.
+ */
+export function compareSessionsForAlias(a: SessionBinding, b: SessionBinding, isAlive: (s: SessionBinding) => boolean = sessionAlive): number {
+  const la = isAlive(a) ? 1 : 0, lb = isAlive(b) ? 1 : 0;
+  if (la !== lb) return lb - la;
+  if ((a.updatedAt ?? 0) !== (b.updatedAt ?? 0)) return (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
+  return (b.headCommit ? 1 : 0) - (a.headCommit ? 1 : 0);
+}
+
+/** compareSessionsForAlias with each session's liveness looked up once per sort. */
+function aliasOrder(): (a: SessionBinding, b: SessionBinding) => number {
+  const memo = new Map<SessionBinding, boolean>();
+  const live = (s: SessionBinding) => {
+    let v = memo.get(s);
+    if (v === undefined) memo.set(s, (v = sessionAlive(s)));
+    return v;
+  };
+  return (a, b) => compareSessionsForAlias(a, b, live);
 }
 
 /** Removes git's lock and temp files (`*.lock`, `*.new`, `tmp_*`) left in a Workspace's `.git` by a killed command. */

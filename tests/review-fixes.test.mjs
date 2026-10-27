@@ -266,6 +266,20 @@ try {
     return `${ms} ms`;
   });
 
+  await step("R9 apply records main's new published Layer (publish answers publishedLayer)", async () => {
+    const cwd = project();
+    const s = await open(cwd, "r9");
+    s.bindings.reload();
+    const before = s.bindings.byName(s.project).mainRef;
+    await s.mutate("1", "write", () => s.writeFile(join(cwd, "pub.txt"), "p\n"));
+    await s.apply();
+    s.bindings.reload();
+    const rec = s.bindings.byName(s.project).mainRef;
+    const main = (await s.listAllBranches()).find((b) => b.name === "main");
+    assert.equal(rec, main.base, `recorded mainRef is main's publication Layer (before ${before})`);
+    assert.notEqual(rec, before);
+  });
+
   await step("N1: background jobs started by bash die with the command (PID namespace)", async () => {
     const cwd = project();
     const s = await open(cwd, "n1");

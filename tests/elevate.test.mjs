@@ -366,6 +366,24 @@ try {
     assert.equal(sessionAlive({ pid: 999999, host: "other" }), true, "another host: cannot check, assume it runs");
   });
 
+  await step("R8 alias resolution: a live lead (newer, no commit) beats a dead earlier lead with commits", async () => {
+    const { resolveConfig } = await import("../src/config.ts");
+    const { hostname } = await import("node:os");
+    const s = new ws.LayerfsSession(dir, "r8", resolveConfig({}));
+    s.projectRecord = { name: "p", volume: "v" };
+    const now = Date.now();
+    s.bindings = { reload() {}, data: { sessions: {
+      dead: { project: "p", logicalBranch: "lead", workBranch: "s-dead-3", headCommit: "c1", updatedAt: now - 60_000, pid: 999999, host: hostname() },
+      live: { project: "p", logicalBranch: "lead", workBranch: "s-live-1", headCommit: null, updatedAt: now, pid: process.pid, host: hostname() },
+    } } };
+    assert.equal(await s.resolveBranchName("lead"), "s-live-1");
+    const cmp = ws.compareSessionsForAlias;
+    assert.equal(typeof cmp, "function");
+    const live = () => true;
+    assert.ok(cmp({ updatedAt: 2 }, { updatedAt: 1, headCommit: "c" }, live) < 0, "both live: the newer first");
+    assert.ok(cmp({ updatedAt: 1 }, { updatedAt: 1, headCommit: "c" }, live) > 0, "same time: the one with a commit first");
+  });
+
   await step("paths in any macOS spelling of the project root map into the Branch (/var vs /private/var, /tmp)", async () => {
     const { resolveConfig } = await import("../src/config.ts");
     const real = "/private/var/folders/ct/xx/T/dsh-minilfs-test-c86npk/project";

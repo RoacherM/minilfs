@@ -31,6 +31,9 @@ export interface SessionBinding {
   alignedRef?: string | null;
   /** the process that holds this session; an alias such as `lead` is taken only while it runs */
   pid?: number;
+  /** the process's start time (libproc): a later process that reused the pid is not this session */
+  pidStartSec?: number;
+  pidStartUsec?: number;
   host?: string;
 }
 
