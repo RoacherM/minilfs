@@ -2491,13 +2491,17 @@ export class LayerfsSession {
  * true while the process that holds `s` runs. No pid (a closed session, or one written by an older
  * version): gone. Another host's pid cannot be checked: assume it runs.
  */
-function sessionAlive(s: SessionBinding): boolean {
+export function sessionAlive(s: SessionBinding): boolean {
   if (!s.pid) return false;
   if (s.host && s.host !== hostname()) return true;
-  if (s.pid === process.pid) return true;
-  if (!alive(s.pid)) return false;
-  // a recorded start time tells the session's process from a later one that reused its pid
+  if (s.pid !== process.pid && !alive(s.pid)) return false;
+  // a recorded start time tells the session's process from a later one that reused its pid (this
+  // process too: a stale binding may carry this pid)
   if (s.pidStartSec === undefined) return true;
+  if (s.pid === process.pid) {
+    const own = ownStart();
+    return own.pidStartSec === undefined || (own.pidStartSec === s.pidStartSec && own.pidStartUsec === s.pidStartUsec);
+  }
   const p = procStartTime(s.pid);
   return !p || (p.startSec === s.pidStartSec && p.startUsec === s.pidStartUsec);
 }

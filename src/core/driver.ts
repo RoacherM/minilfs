@@ -12,7 +12,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { LayerfsConfig } from "../config.ts";
 import { bothSpellings, buildSeatbeltProfile } from "../seatbelt.ts";
-import { killAll, leftovers, listOwnProcesses, nowUs } from "./proc-scan.ts";
+import { killAll, leftovers, listOwnProcesses, nowUs, procStartTimes } from "./proc-scan.ts";
 
 /** After the shell exits, how long its output may keep draining before the pipe is cut. */
 const PIPE_DRAIN_MS = 2000;
@@ -285,7 +285,7 @@ export class LocalNativeDriver implements ExecutionDriver {
   /** Kills what a call left running outside its process group (see proc-scan.ts). */
   private async reapLeftovers(pgid: number | undefined, sinceUs: number, roots: string[]): Promise<void> {
     const rows = await listOwnProcesses();
-    killAll(leftovers(rows, { pgid, sinceUs, roots }).map((r) => r.pid));
+    killAll(leftovers(rows, { pgid, sinceUs, roots }));
   }
 
   private async killProcessGroup(child: ReturnType<typeof spawn>, wsReal: string, killGraceMs: number): Promise<void> {
@@ -329,15 +329,12 @@ export class LocalNativeDriver implements ExecutionDriver {
       // `+D` walked the whole tree over NFS before every unmount (1 s per 20k files).
       const r = await run("lsof", ["-t", p], { timeoutMs: 5000 }).catch(() => null);
       if (r?.stdout && r.stdout.length > 0) {
-        const pids = r.stdout.toString().split(/\s+/).filter(Boolean);
-        for (const pid of pids) {
-          const n = Number(pid);
-          if (n > 0 && n !== process.pid) {
-            try {
-              process.kill(n, "SIGKILL");
-            } catch {}
-          }
-        }
+        const pids = r.stdout.toString().split(/\s+/).map(Number).filter((n) => n > 0 && n !== process.pid);
+        if (!pids.length) continue;
+        // identify each holder (pid + start time) and signal it only while it is still that process
+        const rows = procStartTimes(pids);
+        if (rows) killAll([...rows.values()]);
+        else for (const n of pids) try { process.kill(n, "SIGKILL"); } catch {} // no libproc lookup here: as before
       }
     }
   }

@@ -17,7 +17,7 @@
 import { spawnSync } from "node:child_process";
 import { run } from "./exec-helper.ts";
 
-/** libproc listing: [pid, ppid, pgid, startSec, startUsec, executable, cwd] for every process of this user (or the one pid given). */
+/** libproc listing: [pid, ppid, pgid, startSec, startUsec, executable, cwd] for every process of this user (or the pids given). */
 const SCAN_PY = String.raw`
 import ctypes, os, json, sys
 lib = ctypes.CDLL("/usr/lib/libproc.dylib")
@@ -31,7 +31,8 @@ class VI(ctypes.Structure):
 class VPI(ctypes.Structure):
     _fields_ = [("cdir", VI), ("rdir", VI)]
 if len(sys.argv) > 1:
-    buf, n = [int(sys.argv[1])], 1
+    buf = [int(a) for a in sys.argv[1:]]
+    n = len(buf)
 else:
     n = lib.proc_listallpids(None, 0)
     buf = (ctypes.c_int * (n + 256))()
@@ -68,17 +69,30 @@ export async function listOwnProcesses(): Promise<ProcRow[]> {
 
 /** One process of this user with its start time (libproc), or null (gone, another user's, no python3). */
 export function procStartTime(pid: number): ProcRow | null {
-  const r = spawnSync("/usr/bin/python3", ["-c", SCAN_PY, String(pid)], { encoding: "utf8", timeout: 10_000 });
+  return procStartTimes([pid])?.get(pid) ?? null;
+}
+
+/** These processes of this user (libproc, one look), by pid; absent: gone or another user's. null: cannot look (no python3). */
+export function procStartTimes(pids: number[]): Map<number, ProcRow> | null {
+  const r = spawnSync("/usr/bin/python3", ["-c", SCAN_PY, ...pids.map(String)], { encoding: "utf8", timeout: 10_000 });
   if (r.status !== 0) return null;
   try {
-    return rowsOf(r.stdout).find((row) => row.pid === pid) ?? null;
+    return new Map(rowsOf(r.stdout).map((row) => [row.pid, row]));
   } catch {
     return null;
   }
 }
 
-/** Microseconds since the epoch (wall clock, as libproc's start times). */
-export const nowUs = () => Date.now() * 1000;
+/**
+ * Microseconds since the epoch (wall clock, as libproc's start times), at microsecond resolution.
+ * The high-resolution clock stops while the Mac sleeps: it is used only while it agrees with the
+ * wall clock to within a millisecond, else the wall clock's milliseconds.
+ */
+export const nowUs = () => {
+  const wall = Date.now();
+  const fine = performance.timeOrigin + performance.now();
+  return Math.floor((Math.abs(fine - wall) < 1 ? fine : wall) * 1000);
+};
 const startUs = (r: ProcRow) => r.startSec * 1_000_000 + (r.startUsec ?? 0);
 
 /**
@@ -95,11 +109,20 @@ export function leftovers(rows: ProcRow[], opts: { pgid?: number; sinceUs: numbe
   });
 }
 
-/** SIGKILLs `pids`; returns how many were signalled. */
-export function killAll(pids: number[]): number {
+/**
+ * Signals each process that is still the one found: its (pid, start time) is looked up again right
+ * before (time has passed since the listing; the pid may now be another process). Never this
+ * process or its parent. Returns how many were signalled.
+ */
+export function killAll(rows: Array<Pick<ProcRow, "pid" | "startSec" | "startUsec">>, sig: NodeJS.Signals = "SIGKILL"): number {
+  const targets = rows.filter((r) => r.pid > 1 && r.pid !== process.pid && r.pid !== process.ppid);
+  if (!targets.length) return 0;
+  const now = procStartTimes(targets.map((r) => r.pid));
   let n = 0;
-  for (const pid of pids) {
-    try { process.kill(pid, "SIGKILL"); n++; } catch {}
+  for (const r of targets) {
+    const cur = now?.get(r.pid);
+    if (!cur || cur.startSec !== r.startSec || cur.startUsec !== r.startUsec) continue;
+    try { process.kill(r.pid, sig); n++; } catch {}
   }
   return n;
 }

@@ -76,8 +76,10 @@ function isWorkerProcess(e: WorkerEndpoint, dir: string): boolean {
   try { return p.cwd === realpathSync(dir); } catch { return false; }
 }
 
-/** SIGTERM, then SIGKILL after 2 s if it is still the same process. */
+/** SIGTERM, then SIGKILL after 2 s, each only while the pid is still that worker. */
 async function stopWorkerProcess(e: WorkerEndpoint, dir: string): Promise<void> {
+  // seconds of pings passed since it was identified: the pid may be another process by now
+  if (!isWorkerProcess(e, dir)) return;
   try { process.kill(e.pid, "SIGTERM"); } catch { return; }
   for (const until = Date.now() + 2000; Date.now() < until; ) {
     await sleep(100);

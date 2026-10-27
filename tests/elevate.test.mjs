@@ -445,6 +445,37 @@ try {
     assert.equal(sessionAlive({ pid: 999999, host: "other" }), true, "another host: cannot check, assume it runs");
   });
 
+  await step("S7 killAll signals a process only while (pid, start time) still match; nowUs has microseconds", async () => {
+    const { spawn } = await import("node:child_process");
+    const { killAll, nowUs, procStartTime } = await import("../src/core/proc-scan.ts");
+    const child = spawn("/bin/sleep", ["600.37"], { stdio: "ignore" });
+    const gone = new Promise((r) => child.once("exit", r));
+    try {
+      await new Promise((r) => setTimeout(r, 100));
+      const row = procStartTime(child.pid);
+      assert.ok(row, "the helper is listed");
+      assert.equal(killAll([{ pid: child.pid, startSec: row.startSec, startUsec: row.startUsec + 1 }]), 0, "another start time: not that process");
+      assert.equal(child.exitCode === null && child.signalCode === null, true, "still running");
+      assert.equal(killAll([row]), 1);
+      await gone;
+      assert.equal(child.signalCode, "SIGKILL");
+    } finally { try { child.kill("SIGKILL"); } catch {} }
+    const samples = [];
+    for (let i = 0; i < 50; i++) { samples.push(nowUs()); await new Promise((r) => setImmediate(r)); }
+    assert.ok(samples.some((u) => u % 1000 !== 0), "sub-millisecond digits");
+    assert.ok(Math.abs(samples.at(-1) / 1000 - Date.now()) < 50, "the wall clock");
+  });
+
+  await step("S13 sessionAlive checks the recorded start time for this process's own pid too", async () => {
+    const { hostname } = await import("node:os");
+    const { procStartTime } = await import("../src/core/proc-scan.ts");
+    assert.equal(typeof ws.sessionAlive, "function");
+    assert.equal(ws.sessionAlive({ pid: process.pid, host: hostname(), pidStartSec: 1, pidStartUsec: 0 }), false, "a stale binding that carries this pid");
+    const me = procStartTime(process.pid);
+    assert.equal(ws.sessionAlive({ pid: process.pid, host: hostname(), pidStartSec: me.startSec, pidStartUsec: me.startUsec }), true);
+    assert.equal(ws.sessionAlive({ pid: process.pid, host: hostname() }), true, "no start time recorded: alive");
+  });
+
   await step("R8 alias resolution: a live lead (newer, no commit) beats a dead earlier lead with commits", async () => {
     const { resolveConfig } = await import("../src/config.ts");
     const { hostname } = await import("node:os");
