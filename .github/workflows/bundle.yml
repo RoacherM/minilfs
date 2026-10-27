@@ -12,6 +12,7 @@ on:
       - scripts/setup-layerfs.sh
       - scripts/package-bundle.sh
       - scripts/smoke-bundle.mjs
+      - layerfs.json
       - .github/workflows/bundle.yml
   workflow_dispatch:
     inputs:

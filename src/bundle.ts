@@ -1,4 +1,6 @@
-// The LayerFS native bundle (layerfs-daemon, layerfs.node, JS SDK) that minilfs runs on.
+// The LayerFS v1.1.0 native bundle (layerfs-daemon, layerfs.node, @layerfs/agent) that minilfs runs on.
+// The LayerFS commit is pinned once, in layerfs.json; the default bundle folder is named after it
+// (~/.cache/minilfs/bundle-<commit7>), so a new pin never replaces a bundle running sessions use.
 // A first start on a new Mac downloads a prebuilt bundle from this repository's GitHub release,
 // checks its sha256, and unpacks it atomically. scripts/setup-layerfs.sh still builds one from source.
 import { spawn } from "node:child_process";
@@ -8,8 +10,25 @@ import { arch, platform } from "node:os";
 import { dirname, join } from "node:path";
 import { acquireLock } from "./lock.ts";
 
-/** Files minilfs needs from a bundle. */
-export const BUNDLE_FILES = ["layerfs.node", "layerfs-daemon", "sdk/js/src/index.js"];
+/** Files minilfs needs from a bundle (@layerfs/agent imports only its own files and node:*; the store worker uses internal.js frames). */
+export const BUNDLE_FILES = ["layerfs.node", "layerfs-daemon", "api/agent/sdk/src/index.js", "api/agent/sdk/src/internal.js"];
+
+/** The LayerFS commit this minilfs runs on (layerfs.json; scripts/setup-layerfs.sh builds the same REF). */
+export const LAYERFS_COMMIT: string = JSON.parse(readFileSync(new URL("../layerfs.json", import.meta.url), "utf8")).commit;
+
+/** The default bundle folder for the pinned commit. */
+export function defaultBundleDir(cacheRoot: string): string {
+  return join(cacheRoot, `bundle-${LAYERFS_COMMIT.slice(0, 7)}`);
+}
+
+/** A problem text when `bundle` was built from another LayerFS commit (its BUILD-INFO.txt), else null. */
+export async function bundleVersionProblem(bundle: string): Promise<string | null> {
+  const info = await fsp.readFile(join(bundle, "BUILD-INFO.txt"), "utf8").catch(() => null);
+  if (info === null) return null; // a hand-made bundle: its files were checked
+  const m = /\b([0-9a-f]{7,40})\b/.exec(info);
+  if (!m || LAYERFS_COMMIT.startsWith(m[1]) || m[1].startsWith(LAYERFS_COMMIT)) return null;
+  return `the LayerFS bundle in ${bundle} is LayerFS ${m[1].slice(0, 12)}, but this minilfs needs ${LAYERFS_COMMIT.slice(0, 12)} (layerfs.json); remove MINILFS_BUNDLE to use the default folder, or rebuild with scripts/setup-layerfs.sh --bundle ${bundle}`;
+}
 
 /**
  * The prebuilt bundle per machine (`<platform>-<arch>`): its release URL and pinned sha256.
@@ -34,11 +53,15 @@ export async function missingBundleFiles(bundle: string): Promise<string[]> {
  * text when it cannot (no prebuilt for this machine, offline, checksum mismatch), else null.
  */
 export async function ensureBundle(bundle: string, log: (msg: string) => void = () => {}): Promise<string | null> {
-  if (!(await missingBundleFiles(bundle)).length) return null;
+  if (!(await missingBundleFiles(bundle)).length) return bundleVersionProblem(bundle);
   const key = `${platform()}-${arch()}`;
   const pre = PREBUILT[key];
-  const build = "build one from source with scripts/setup-layerfs.sh in the minilfs repository (needs Rust)";
+  const build = `build one from source with scripts/setup-layerfs.sh --bundle ${bundle} in the minilfs repository (needs Rust)`;
   if (!pre) return `no prebuilt LayerFS bundle for ${key}; ${build}`;
+  // the pinned release must be built from the commit this code needs (tag bundle-layerfs-<commit7>-<recipe>)
+  if (!pre.tag.includes(`-${LAYERFS_COMMIT.slice(0, 7)}-`)) {
+    return `the prebuilt LayerFS bundle for ${LAYERFS_COMMIT.slice(0, 7)} is not published yet (src/bundle.json pins ${pre.tag}); ${build}`;
+  }
   const lock = await acquireLock(`${bundle}.lock`, 10 * 60_000);
   try {
     if (!(await missingBundleFiles(bundle)).length) return null; // another process installed it meanwhile

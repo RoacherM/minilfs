@@ -36,6 +36,7 @@
   },
   "files": [
     "src/",
+    "layerfs.json",
     "scripts/setup-layerfs.sh",
     "scripts/setup-layerfs-native.sh",
     "scripts/package-bundle.sh",
@@ -55,7 +56,7 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "scripts": {
-    "test": "node tests/elevate.test.mjs && node tests/native-seatbelt.test.mjs && node tests/backend.test.mjs && node tests/review-fixes.test.mjs && node tests/pi.test.mjs && node tests/cli.test.mjs && node tests/rpc.test.mjs && node tests/scale.test.mjs && node tests/orphan-mount.test.mjs",
+    "test": "node tests/elevate.test.mjs && node tests/store-contention.test.mjs && node tests/native-seatbelt.test.mjs && node tests/backend.test.mjs && node tests/review-fixes.test.mjs && node tests/pi.test.mjs && node tests/cli.test.mjs && node tests/rpc.test.mjs && node tests/scale.test.mjs && node tests/orphan-mount.test.mjs",
     "test:elevate": "node tests/elevate.test.mjs",
     "test:native": "node tests/native-seatbelt.test.mjs",
     "test:backend": "node tests/backend.test.mjs",
