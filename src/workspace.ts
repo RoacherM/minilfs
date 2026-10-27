@@ -10,7 +10,7 @@ import { createProjectClient, ensureNativeDirs, initProjectClient, type NativeSp
 import { resolveExecutionDriver, type ExecutionDriver } from "./core/driver.ts";
 import { run } from "./core/exec-helper.ts";
 import { bothSpellings, buildSeatbeltProfile } from "./seatbelt.ts";
-import { decideGitPath, GIT_APPLY_ORDER, GIT_JOIN_HINT, gitChangeSummary, gitPathKind, gitSig, isProtectedPath, isSafeRefName, MERGE_UNITS, type GitPathKind } from "./gitpaths.ts";
+import { decideGitPath, GIT_JOIN_HINT, gitChangeSummary, gitDirOf, gitPathKind, gitSig, indexEntries, isProtectedPath, isSafeRefName, MERGE_UNITS, type GitPathKind } from "./gitpaths.ts";
 import { isOrphan, MountLeases } from "./mount-leases.ts";
 import { GIT_JOIN_SCRIPT, parseJoin, symbolicHead, type JoinResult } from "./gitjoin.ts";
 import { stopWorkers } from "./core/worker.ts";
@@ -2047,54 +2047,94 @@ export class LayerfsSession {
         gitPlan.push(...kept);
         result.warnings.push(`your folder's git moved since this Branch started (${gitConflicts.slice(0, 4).join(", ")}${gitConflicts.length > 4 ? ", …" : ""}): the files were applied, but no ref, HEAD or index was changed, so the Branch's commits are not on your branches (their objects were added; the changes show as uncommitted). Commit them in your folder, or sync the Branch and apply again.`);
       }
-      const gitSummary = gitChangeSummary(gitPlan.map((g) => g.rel));
-      if (gitSummary) result.git = gitSummary;
-
       const depth = (r: string) => r.split("/").length;
+      // git metadata (refs, HEAD, index, logs) comes after the files and the objects, all or none:
+      // only when every object it names is in the folder, and under git's own lock files
+      const gitObjects = gitPlan.filter((g) => g.git === "object");
+      const gitMeta = gitPlan.filter((g) => g.git !== "object");
       const ordered = [
         ...plan.filter((p) => !p.next).sort((a, b) => depth(b.rel) - depth(a.rel)),
         ...plan.filter((p) => p.next).sort((a, b) => depth(a.rel) - depth(b.rel)),
-        // git last, objects before the refs that name them, HEAD and the index at the very end: a stop
-        // midway leaves extra objects, never a ref to a missing object
-        ...gitPlan.sort((a, b) => GIT_APPLY_ORDER[a.git] - GIT_APPLY_ORDER[b.git] || depth(a.rel) - depth(b.rel)),
+        ...gitObjects.sort((a, b) => depth(a.rel) - depth(b.rel)),
       ];
       const hostIndex = this.bindings.readHostIndex(this.projectRecord.name);
       const tmps: string[] = [];
+      const checkTarget = async (rel: string) => {
+        const target = join(this.cwd, rel);
+        await assertInsideWorkspace(this.cwd, target, true);
+        await assertNotProtectedTarget(this.cwd, target, false);
+        return target;
+      };
+      const put = async (rel: string, next: Next) => {
+        const target = join(this.cwd, rel);
+        if (!next) {
+          await fsp.rm(target, { force: true });
+          delete hostIndex[rel];
+          await removeEmptyParents(this.cwd, rel);
+        } else if (next.kind === "symlink") {
+          await fsp.mkdir(dirname(target), { recursive: true });
+          await fsp.rm(target, { force: true });
+          await fsp.symlink(next.target, target);
+          const st = await fsp.lstat(target);
+          hostIndex[rel] = { ...linkSig(next.target), mtimeMs: st.mtimeMs, size: st.size };
+        } else {
+          await fsp.mkdir(dirname(target), { recursive: true });
+          const tmp = join(dirname(target), `.${posix.basename(rel)}.minilfs-${randomBytes(4).toString("hex")}`);
+          tmps.push(tmp);
+          await fsp.writeFile(tmp, next.data, { mode: next.mode & 0o7777 });
+          await fsp.chmod(tmp, next.mode & 0o7777);
+          await fsp.rename(tmp, target);
+          tmps.pop();
+          const st = await fsp.lstat(target);
+          hostIndex[rel] = { ...fileSig(next.data, next.mode), mode: next.mode & 0o7777, mtimeMs: st.mtimeMs, size: st.size };
+        }
+        result.applied.push(rel);
+        this.bindings.writeHostIndex(this.projectRecord.name, hostIndex);
+      };
       try {
         for (const { rel, next, host } of ordered) {
           guard();
-          const target = join(this.cwd, rel);
-          await assertInsideWorkspace(this.cwd, target, true);
-          await assertNotProtectedTarget(this.cwd, target, false);
+          const target = await checkTarget(rel);
           const now = await hostState(target);
           if (now === "other" || !sameSig(now, host)) {
             result.conflicts.push(rel);
             throw new LayerfsError("ChangedDuringApply", `${rel} changed on disk while applying`);
           }
-          if (!next) {
-            await fsp.rm(target, { force: true });
-            delete hostIndex[rel];
-            await removeEmptyParents(this.cwd, rel);
-          } else if (next.kind === "symlink") {
-            await fsp.mkdir(dirname(target), { recursive: true });
-            await fsp.rm(target, { force: true });
-            await fsp.symlink(next.target, target);
-            const st = await fsp.lstat(target);
-            hostIndex[rel] = { ...linkSig(next.target), mtimeMs: st.mtimeMs, size: st.size };
-          } else {
-            await fsp.mkdir(dirname(target), { recursive: true });
-            const tmp = join(dirname(target), `.${posix.basename(rel)}.minilfs-${randomBytes(4).toString("hex")}`);
-            tmps.push(tmp);
-            await fsp.writeFile(tmp, next.data, { mode: next.mode & 0o7777 });
-            await fsp.chmod(tmp, next.mode & 0o7777);
-            await fsp.rename(tmp, target);
-            tmps.pop();
-            const st = await fsp.lstat(target);
-            hostIndex[rel] = { ...fileSig(next.data, next.mode), mode: next.mode & 0o7777, mtimeMs: st.mtimeMs, size: st.size };
-          }
-          result.applied.push(rel);
-          this.bindings.writeHostIndex(this.projectRecord.name, hostIndex);
+          await put(rel, next);
         }
+        if (gitMeta.length) {
+          guard();
+          const dropMeta = (why: string) => {
+            gitDiverged = true;
+            result.skipped.push(...gitMeta.map((g) => g.rel));
+            result.warnings.push(`${why}: the files were applied, but no ref, HEAD or index was changed, so the Branch's commits are not on your branches (their objects were added; the changes show as uncommitted). Commit them in your folder, or sync the Branch and apply again.`);
+          };
+          for (const g of gitMeta) await checkTarget(g.rel);
+          const missing = await gitObjectsMissing(this.cwd, gitMeta);
+          const locked = gitMeta.filter((g) => g.git !== "soft");
+          const moved = missing ? null : await writeGitLocked(this.cwd, locked);
+          if (missing) dropMeta(`the Branch's git names objects your folder does not have (${missing})`);
+          else if (moved) dropMeta(`your folder's git moved while applying (${moved})`);
+          else {
+            for (const g of locked) {
+              result.applied.push(g.rel);
+              if (!g.next) delete hostIndex[g.rel];
+              else {
+                const st = await fsp.lstat(join(this.cwd, g.rel)).catch(() => null);
+                if (st) hostIndex[g.rel] = { ...fileSig(g.next.data, g.next.mode), mtimeMs: st.mtimeMs, size: st.size };
+              }
+            }
+            this.bindings.writeHostIndex(this.projectRecord.name, hostIndex);
+            // logs and messages: only where the folder still has the base version
+            for (const g of gitMeta.filter((x) => x.git === "soft")) {
+              const now = await hostState(join(this.cwd, g.rel));
+              if (now !== "other" && sameSig(now, g.host)) await put(g.rel, g.next);
+              else result.skipped.push(g.rel);
+            }
+          }
+        }
+        const gitSummary = gitChangeSummary(result.applied.filter((r) => gitPathKind(r) !== "none"));
+        if (gitSummary) result.git = gitSummary;
       } catch (e: any) {
         for (const t of tmps) await fsp.rm(t, { force: true }).catch(() => {});
         this.bindings.writeHostIndex(this.projectRecord.name, hostIndex);
@@ -2359,6 +2399,104 @@ async function hostState(abs: string): Promise<HostEntry | null | "other"> {
   if (st.isSymbolicLink()) return linkSig(await fsp.readlink(abs));
   if (st.isFile()) return fileSig(await fsp.readFile(abs), st.mode);
   return "other";
+}
+
+type GitWrite = { rel: string; git: GitPathKind; next: { kind: "file"; data: Buffer; mode: number } | { kind: "symlink"; target: string } | null; host: HostEntry | null };
+const OID_RX = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/**
+ * Why the folder cannot take these refs/HEAD/index, or null: each object they name (ref targets,
+ * packed-refs lines and their peeled `^` lines, a detached HEAD, index blobs; not submodule
+ * gitlinks) must already be in the folder's git directory, and each ref must parse. A ref written by
+ * a file tool, or objects never added, would otherwise leave the folder's git pointing at nothing.
+ */
+async function gitObjectsMissing(cwd: string, meta: GitWrite[]): Promise<string | null> {
+  const byDir = new Map<string, Set<string>>();
+  for (const g of meta) {
+    if (g.git === "soft" || !g.next || g.next.kind !== "file") continue;
+    const dir = gitDirOf(g.rel);
+    if (!dir) continue;
+    const oids = byDir.get(dir) ?? new Set<string>();
+    byDir.set(dir, oids);
+    const text = g.next.data.toString("utf8");
+    if (g.git === "index") {
+      const entries = indexEntries(g.next.data);
+      if (entries === null) return `${g.rel} cannot be read`;
+      for (const line of entries ? entries.split("\n") : []) {
+        const [mode, oid] = line.split(" ");
+        if (mode !== "160000") oids.add(oid);
+      }
+    } else if (g.rel.endsWith("/packed-refs") || g.rel === "packed-refs") {
+      for (const line of text.split("\n")) {
+        if (!line || line.startsWith("#")) continue;
+        const m = /^([0-9a-f]+) \S+$/.exec(line) ?? /^\^([0-9a-f]+)$/.exec(line);
+        if (!m || !OID_RX.test(m[1])) return `${g.rel} has a malformed line`;
+        oids.add(m[1]);
+      }
+    } else {
+      const t = text.trim();
+      if (/^ref: refs\/\S+$/.test(t)) continue; // symbolic: names a ref, not an object
+      if (!OID_RX.test(t)) return `${g.rel} is not a ref`;
+      oids.add(t);
+    }
+  }
+  for (const [dir, oids] of byDir) {
+    if (!oids.size) continue;
+    const r = await run("git", ["--git-dir", join(cwd, dir), "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "cat-file", "--batch-check"], {
+      input: [...oids].join("\n") + "\n",
+      timeoutMs: 60_000,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    }).catch((e) => ({ code: null, stdout: Buffer.alloc(0), stderr: String(e?.message ?? e) }));
+    if (r.code !== 0) return `git cat-file failed in ${dir}: ${r.stderr.trim().slice(0, 120)}`;
+    const missing = r.stdout.toString().split("\n").filter((l) => / missing$/.test(l)).map((l) => l.split(" ")[0].slice(0, 12));
+    if (missing.length) return `${missing.length} missing in ${dir}: ${missing.slice(0, 3).join(", ")}${missing.length > 3 ? ", …" : ""}`;
+  }
+  return null;
+}
+
+/**
+ * Writes refs, HEAD and the index the way git does, so a git command running in the folder at the
+ * same time is never overwritten: `<path>.lock` taken exclusively for every path first (sorted),
+ * the folder's version checked again under the lock, the new bytes written into the lock file, then
+ * each lock renamed over its path (a deletion unlinks the path, then the lock). Returns why nothing
+ * was written (a lock git holds, a path that moved), or null when all were written.
+ */
+async function writeGitLocked(cwd: string, items: GitWrite[]): Promise<string | null> {
+  const sorted = [...items].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+  const held: string[] = [];
+  try {
+    for (const it of sorted) {
+      const target = join(cwd, it.rel);
+      const lock = `${target}.lock`;
+      await fsp.mkdir(dirname(target), { recursive: true });
+      const mode = it.next?.kind === "file" ? it.next.mode & 0o7777 : 0o644;
+      const fh = await fsp.open(lock, "wx", mode).catch((e: any) => (e?.code === "EEXIST" ? null : Promise.reject(e)));
+      if (!fh) return `${it.rel}.lock exists: git is running there`;
+      held.push(lock);
+      try {
+        const now = await hostState(target);
+        if (now === "other" || !sameSig(now, it.host)) return `${it.rel} changed`;
+        if (it.next?.kind === "file") {
+          await fh.writeFile(it.next.data);
+          await fh.chmod(mode);
+        }
+      } finally {
+        await fh.close();
+      }
+    }
+    for (const it of sorted) {
+      const target = join(cwd, it.rel);
+      if (it.next) await fsp.rename(`${target}.lock`, target);
+      else {
+        await fsp.rm(target, { force: true });
+        await fsp.rm(`${target}.lock`, { force: true });
+      }
+      held.splice(held.indexOf(`${target}.lock`), 1);
+    }
+    return null;
+  } finally {
+    for (const l of held) await fsp.rm(l, { force: true }).catch(() => {});
+  }
 }
 
 async function removeEmptyParents(root: string, rel: string): Promise<void> {

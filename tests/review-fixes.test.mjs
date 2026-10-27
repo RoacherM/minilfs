@@ -1012,6 +1012,43 @@ try {
     assert.match(g("status", "--short").stdout, /b\.txt/, "the Branch's file shows as a change to commit");
   });
 
+  await step("R11 apply never installs a ref to an object the folder lacks: dangling oid in refs/heads/main via a file tool", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+    const hostHead = g("rev-parse", "HEAD").stdout.trim();
+    const s = await open(cwd, "r11");
+    await s.mutate("1", "write", () => s.writeFile(join(cwd, ".git/refs/heads/main"), `${"de".repeat(20)}\n`));
+    await s.mutate("2", "write", () => s.writeFile(join(cwd, "normal.txt"), "n\n"));
+    const ap = await s.apply();
+    assert.ok(ap.applied.includes("normal.txt"), `the file is applied: ${ap.applied}`);
+    assert.equal(g("rev-parse", "refs/heads/main").stdout.trim(), hostHead, "host ref unchanged");
+    assert.match(ap.warnings.join("\n"), /objects your folder does not have/);
+    assert.equal(spawnSync("git", ["-C", cwd, "fsck", "--no-progress"]).status, 0, "git fsck clean");
+  });
+
+  await step("R10 apply takes git's ref lock: a held refs/heads/main.lock keeps the host ref, leaves no lock of ours", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+    const hostHead = g("rev-parse", "HEAD").stdout.trim();
+    const s = await open(cwd, "r10");
+    const env = "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t;";
+    await s.mutate("1", "bash", () => s.exec(`${env} echo branch > b.txt && git add b.txt && git commit -qm by-branch`, cwd, out()));
+    // git is updating main in the folder right now
+    writeFileSync(join(cwd, ".git/refs/heads/main.lock"), `${hostHead}\n`);
+    const ap = await s.apply();
+    assert.ok(ap.applied.includes("b.txt"), `files applied: ${ap.applied}`);
+    assert.ok(!ap.applied.some((p) => /^\.git\/(HEAD|index|refs\/)/.test(p)), `no ref/HEAD/index written: ${ap.applied}`);
+    assert.match(ap.warnings.join("\n"), /folder's git moved/);
+    assert.equal(readFileSync(join(cwd, ".git/refs/heads/main"), "utf8").trim(), hostHead, "host ref unchanged");
+    assert.equal(readFileSync(join(cwd, ".git/refs/heads/main.lock"), "utf8").trim(), hostHead, "git's own lock is left alone");
+    const locks = spawnSync("find", [join(cwd, ".git"), "-name", "*.lock"], { encoding: "utf8" }).stdout.trim().split("\n").filter(Boolean);
+    assert.deepEqual(locks, [join(cwd, ".git/refs/heads/main.lock")], "no lock of ours left");
+    rmSync(join(cwd, ".git/refs/heads/main.lock"));
+    assert.equal(spawnSync("git", ["-C", cwd, "fsck", "--no-progress"]).status, 0, "git fsck clean");
+  });
+
   await step("git attacks: config, config.worktree, commondir, hooks, alternates, submodule config/hooks, symlink into .git/hooks never reach the folder", async () => {
     const cwd = project();
     const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
