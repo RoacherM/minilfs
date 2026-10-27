@@ -219,3 +219,25 @@ Tests the reviewers would add first: an Epi-worker boundary test (endpoint not r
 file tools, no apply); a lost-reply write (worker killed after commit, before the reply, first
 verification fails): exactly one Commit; host commit racing apply: host commit stays reachable,
 `git fsck` clean; a second call's orphan under the shared cache survives another call's reap.
+
+## 7. Review of the fixes (9e027d7..cf47bca) by gpt-6.1-sol (high), 2026-10-27
+
+Implementation by claude-opus-5-5 (7 commits, one per spec step; every new test failed before and
+passes after; full suite green). Review verdicts: fixed — R6 R7 R9 R14 R18; fixed with caveat — R2b
+R3 R4 R5 R8 R10 R11 R12 R13; not fixed completely — R1. Push-ready: no.
+
+| # | Finding | Checked here | Severity |
+| --- | --- | --- | --- |
+| S1 | R1 guard is check-then-use: `readFile(await resolveOutsideRead(p))`; an attacker swaps an authorized `/tmp` ancestor for a symlink to the private root between check and open | real TOCTOU in code; exploitable by a sandboxed agent's own bash racing its file tool (both in its control) | Blocker |
+| S2 | APFS case variants of the root bypass the lexical match | **not reproduced**: `resolveOutsideRead` realpaths the nearest existing ancestor; `~/.Cache/…/worker/nope/endpoint.json` and `~/.CACHE/MINILFS-QUARRY/worker` both refused (2026-10-27). Keep a regression test | — (add test) |
+| S3 | `withMountedBranch` retries `workspace.commit` with "(failed)" after a failure: a landed-but-unanswered commit is resent | code: catch → second commit | Major |
+| S4 | apply's metadata renames are not rolled back on an exception midway; partial metadata write may skip mainStale | code | Major |
+| S5 | ref namespace change (`refs/heads/foo` → `refs/heads/foo/bar`) fails: locks taken before deletions, mkdir hits the old file | code | Major |
+| S6 | object check is existence only: a blob as `refs/heads/main`, a commit with missing parents, symbolic refs unchecked; `cat-file` inherits cwd/env (`GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`) | code | Major |
+| S7 | process identity dropped before signalling: `killAll(pids)` and `stopWorkerProcess` SIGTERM without re-checking start time; `Date.now()*1000` is ms precision | code | Major |
+| S8 | rescue collisions: an existing refs/minilfs/* suppresses a differing losing oid; generated rescues can overwrite; no object check on rescued targets; oid length 40–64 accepted | code | Major |
+| S9 | ambiguous submodule names (`modules/a/refs/…`) pick the wrong git dir for the object check | code (gitDirOf heuristic) | Major (rare) |
+| S10 | join rollback `read-tree "$cur"` discards pre-existing staging instead of restoring the original index | code | Major |
+| S11 | index entries joined with "\n" then split: a filename with a newline yields bogus oids; an empty index parses as null | code | Minor |
+| S12 | `attr.tree` does not cover `.git/info/attributes` / `core.attributesFile` | git docs | Minor |
+| S13 | own-pid shortcut in `sessionAlive` skips the recorded start-time check | code | Minor |
