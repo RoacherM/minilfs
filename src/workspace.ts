@@ -1677,31 +1677,51 @@ export class LayerfsSession {
     const { ws, wsReal: wsPath } = await this.mountWorkspace(branch);
     let keepMounted = false;
     try {
-      const value = await fn(wsPath, ws);
+      let value!: T;
+      let fnErr: unknown = null;
+      let failed = false;
+      try { value = await fn(wsPath, ws); } catch (e) { fnErr = e; failed = true; }
       if (commitAfter) {
-        const res = await this.lfs.workspace.commit(ws, message.slice(0, 4000));
-        const rec = { kind: res.kind, head: res.commit?.id ?? res.head ?? null };
-        // a commit on another branch (a merge fork, a sync branch) is no checkpoint of this session
-        if (branch === this.workBranch) this.recordStoreCommit(rec, message);
-        else this.lastStoreCommit = rec;
-      }
-      return value;
-    } catch (e) {
-      if (commitAfter) {
+        // one commit, whatever fn did: a second one after a failed commit could resend a landed one
         try {
-          const res = await this.lfs.workspace.commit(ws, `${message} (failed)`.slice(0, 4000));
-          const rec = { kind: res.kind, head: res.commit?.id ?? res.head ?? null };
-          if (branch === this.workBranch) this.recordStoreCommit(rec, message);
-          else this.lastStoreCommit = rec;
-        } catch (ce: any) {
+          await this.commitWorkspaceOnce(ws, branch, failed ? `${message} (failed)` : message, message);
+        } catch (ce) {
           keepMounted = true;
-          this.blocked = { reason: `${ce?.code ?? "Error"}: ${String(ce?.message ?? ce).slice(0, 200)}`, heldWs: ws };
+          if (!failed) { fnErr = ce; failed = true; }
         }
       }
-      throw e;
+      if (failed) throw fnErr;
+      return value;
     } finally {
       if (!keepMounted) await this.releaseWorkspace(ws, wsPath, !commitAfter);
     }
+  }
+
+  /**
+   * `workspace.commit` exactly once (it is not idempotent). When it fails, the branch head tells
+   * whether it landed anyway (a lost reply): then it is recorded as made; else the session is blocked
+   * with the Workspace held for /minilfs retry, and the error is thrown.
+   */
+  private async commitWorkspaceOnce(ws: Workspace, branch: string, message: string, label: string): Promise<void> {
+    // read from the Store, not headCommit (which may name a Layer): compared with the same read below
+    const headOf = () => this.lfs.branch.list_commits(branch, 1, 0).then((p: any) => (p?.items?.[0]?.id ?? null) as string | null);
+    const before = await headOf().catch(() => undefined);
+    let rec: { kind: string; head: string | null };
+    try {
+      const res = await this.lfs.workspace.commit(ws, message.slice(0, 4000));
+      rec = { kind: res.kind, head: res.commit?.id ?? res.head ?? null };
+    } catch (ce: any) {
+      const now = before === undefined ? null : await headOf().catch(() => null);
+      if (!now || now === before) {
+        this.blocked = { reason: `${ce?.code ?? "Error"}: ${String(ce?.message ?? ce).slice(0, 200)}`, heldWs: ws };
+        throw ce;
+      }
+      this.log(`workspace commit answered ${ce?.code ?? "Error"} but landed as ${now}`);
+      rec = { kind: "Committed", head: now };
+    }
+    // a commit on another branch (a merge fork, a sync branch) is no checkpoint of this session
+    if (branch === this.workBranch) this.recordStoreCommit(rec, label);
+    else this.lastStoreCommit = rec;
   }
 
   /** Runs a shell snippet in a short-lived Workspace of `workBranch` (read-only helper for tests/apply). */
@@ -1754,7 +1774,8 @@ export class LayerfsSession {
     hostCwd: string,
     options: { onData: (d: Buffer) => void; signal: AbortSignal; timeout?: number; env?: NodeJS.ProcessEnv },
   ): Promise<{ exitCode: number | null }> {
-    const { ws, wsReal } = await this.mountWorkspace(this.workBranch);
+    const branch = this.workBranch;
+    const { ws, wsReal } = await this.mountWorkspace(branch);
     // Everything after the mount sits inside this try, so a throw anywhere still releases the Workspace.
     let keepMounted = false;
     let execErr: unknown = null;
@@ -1796,11 +1817,9 @@ export class LayerfsSession {
       if (execErr || code === 124 || code === null) await removeGitLeftovers(wsReal).catch(() => {});
       const msg = `pi bash (exit ${code ?? "sig"}) [${this.pendingOrigins.join(",") || "bash"}]`.slice(0, 4000);
       try {
-        const res = await this.lfs.workspace.commit(ws, msg);
-        this.recordStoreCommit({ kind: res.kind, head: res.commit?.id ?? res.head ?? null }, "bash");
-      } catch (ce: any) {
-        keepMounted = true;
-        this.blocked = { reason: `${ce?.code ?? "Error"}: ${String(ce?.message ?? ce).slice(0, 200)}`, heldWs: ws };
+        await this.commitWorkspaceOnce(ws, branch, msg, "bash");
+      } catch {
+        keepMounted = true; // blocked, the Workspace held for /minilfs retry
       }
       if (execErr) throw execErr;
       return { exitCode: code };

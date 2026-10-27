@@ -1134,6 +1134,39 @@ try {
     assert.equal(existsSync(pwned), false, "no command ran on the host");
   });
 
+  await step("S3 a failed Workspace commit is sent once: a lost reply is recorded as landed, a refused one blocks with the Workspace held", async () => {
+    const cwd = project();
+    const s = await open(cwd, "s3");
+    // a symlinked folder makes writeFile go through a mounted Workspace (withMountedBranch + commit)
+    await s.mutate("0", "bash", () => s.exec("mkdir real && ln -s real link", cwd, out()));
+    const wsNs = s.lfs.workspace;
+    const realCommit = wsNs.commit;
+    const headOf = async () => (await s.lfs.branch.list_commits(s.workBranch, 1, 0)).items[0].id;
+    let calls = 0;
+    try {
+      // 1. the commit lands, the reply is lost
+      wsNs.commit = async (...a) => { calls++; await realCommit(...a); throw Object.assign(new Error("the connection to the LayerFS worker was lost"), { code: "Unknown" }); };
+      const r1 = await s.mutate("1", "write", () => s.writeFile(join(cwd, "link/lost.txt"), "lost\n"));
+      assert.equal(calls, 1, "workspace.commit sent once");
+      assert.equal(s.blocked, null, "not blocked: the commit landed");
+      assert.equal(s.headCommit, await headOf(), "headCommit advanced to the landed commit");
+      assert.equal(r1.checkpoint?.commit, s.headCommit);
+      assert.equal((await s.lfs.fs.read(s.workBranch, "/real/lost.txt")).text, "lost\n");
+      // 2. the commit is refused before it ran
+      calls = 0;
+      const before = s.headCommit;
+      wsNs.commit = async () => { calls++; throw Object.assign(new Error("Busy"), { code: "Busy" }); };
+      await assert.rejects(s.mutate("2", "write", () => s.writeFile(join(cwd, "link/busy.txt"), "busy\n")), (e) => e.code === "Busy");
+      assert.equal(calls, 1, "workspace.commit sent once, no second '(failed)' commit");
+      assert.ok(s.blocked?.heldWs, "blocked with the Workspace held");
+      assert.equal(await headOf(), before, "nothing committed");
+    } finally { wsNs.commit = realCommit; }
+    const rt = await s.retry();
+    assert.equal(rt.error, null, String(rt.error));
+    assert.equal(s.blocked, null);
+    assert.equal((await s.lfs.fs.read(s.workBranch, "/real/busy.txt")).text, "busy\n", "retry committed the held Workspace");
+  });
+
   await step("too-large first import is refused before copying, naming the largest folders", async () => {
     const cwd = project();
     mkdirSync(join(cwd, "big"));
