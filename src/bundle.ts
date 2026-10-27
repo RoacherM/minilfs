@@ -3,7 +3,7 @@
 // checks its sha256, and unpacks it atomically. scripts/setup-layerfs.sh still builds one from source.
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { constants as fsc, promises as fsp } from "node:fs";
+import { constants as fsc, promises as fsp, readFileSync } from "node:fs";
 import { arch, platform } from "node:os";
 import { dirname, join } from "node:path";
 import { acquireLock } from "./lock.ts";
@@ -11,13 +11,14 @@ import { acquireLock } from "./lock.ts";
 /** Files minilfs needs from a bundle. */
 export const BUNDLE_FILES = ["layerfs.node", "layerfs-daemon", "sdk/js/src/index.js"];
 
-/** The prebuilt bundle for this minilfs version (LayerFS 833acf7, see scripts/setup-layerfs.sh). */
-export const PREBUILT = {
-  "darwin-arm64": {
-    url: "https://github.com/RoacherM/minilfs/releases/download/bundle-layerfs-833acf7/layerfs-bundle-darwin-arm64.tar.gz",
-    sha256: "3203b9bfd9f738b0b398408ebfe7fd74906785afe94895224e1fbd067fbf51d8",
-  },
-} as Record<string, { url: string; sha256: string }>;
+/**
+ * The prebuilt bundle per machine (`<platform>-<arch>`): its release URL and pinned sha256.
+ * Written by the "LayerFS bundle" workflow (.github/workflows/bundle.yml), which builds the bundle
+ * with scripts/setup-layerfs.sh on a macOS runner whenever that recipe changes.
+ */
+export const PREBUILT = JSON.parse(
+  readFileSync(new URL("./bundle.json", import.meta.url), "utf8"),
+) as Record<string, { tag: string; url: string; sha256: string }>;
 
 export async function missingBundleFiles(bundle: string): Promise<string[]> {
   const missing: string[] = [];

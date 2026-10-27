@@ -38,6 +38,8 @@
     "src/",
     "scripts/setup-layerfs.sh",
     "scripts/setup-layerfs-native.sh",
+    "scripts/package-bundle.sh",
+    "scripts/smoke-bundle.mjs",
     "docs/EPI-INTEGRATION.md",
     "docs/DESIGN-v0.2.md",
     "README.md",

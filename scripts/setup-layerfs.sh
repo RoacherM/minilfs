@@ -32,7 +32,7 @@ if [ ! -d "${SRC}/.git" ]; then
   mkdir -p "$(dirname "${SRC}")"
   git clone --filter=blob:none --no-checkout https://github.com/Ephemeral-AI-Lab/layerfs.git "${SRC}"
 fi
-git -C "${SRC}" sparse-checkout set --no-cone '/core/' '!/core/docs/' '/sdk/js/' '/.cargo/'
+git -C "${SRC}" sparse-checkout set --no-cone '/core/' '!/core/docs/' '/sdk/js/' '/.cargo/' '/LICENSE'
 
 for attempt in 1 2 3 4 5; do
   git -C "${SRC}" fetch --filter=blob:none origin "refs/pull/427/head" "${REF}" "${CHERRY_MOUNT}" "${CHERRY_APPLEDOUBLE}" "${CHERRY_OVERLAY}" && git -C "${SRC}" checkout --force --quiet "${REF}" && break
@@ -73,6 +73,8 @@ fi
 chmod +x "${BUNDLE}/layerfs-daemon" "${BUNDLE}/layerfs.node"
 
 cp -R "${SRC}/sdk/js/src" "${SRC}/sdk/js/operator" "${SRC}/sdk/js/package.json" "${BUNDLE}/sdk/js/"
+[ -f "${SRC}/LICENSE" ] && cp "${SRC}/LICENSE" "${BUNDLE}/LICENSE-layerfs"
+printf 'LayerFS %s (+ %s %s %s), built by minilfs scripts/setup-layerfs.sh\n' "${REF}" "${CHERRY_MOUNT}" "${CHERRY_APPLEDOUBLE}" "${CHERRY_OVERLAY}" > "${BUNDLE}/BUILD-INFO.txt"
 
 echo
 echo "Done."

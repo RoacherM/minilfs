@@ -43,9 +43,11 @@ It isolates coding agents' file operations and shell commands on copy-on-write L
 
 ## 1. Prerequisites (Once per Mac — Zero Docker, Zero Root, Zero macFUSE)
 
-Nothing on Apple silicon (macOS 11+): the first start downloads the prebuilt LayerFS bundle (`layerfs-daemon`, `layerfs.node`, JS SDK; ~8 MB) from this repository's [GitHub release](https://github.com/RoacherM/minilfs/releases/tag/bundle-layerfs-833acf7), checks its sha256 and installs it in `~/.cache/minilfs/bundle-native` (`MINILFS_BUNDLE`).
+Nothing on Apple silicon (macOS 11+): the first start downloads the prebuilt LayerFS bundle (`layerfs-daemon`, `layerfs.node`, JS SDK; ~8 MB) from this repository's [GitHub releases](https://github.com/RoacherM/minilfs/releases), checks its pinned sha256 and installs it in `~/.cache/minilfs/bundle-native` (`MINILFS_BUNDLE`).
 
-To build it from LayerFS source instead (needs Rust), or on another machine:
+The bundle is built in CI: `.github/workflows/bundle.yml` runs `scripts/setup-layerfs.sh` on a macOS Apple-silicon runner whenever that recipe changes (or by hand), packs it with `scripts/package-bundle.sh`, smoke-tests it (`scripts/smoke-bundle.mjs`: LayerFS Init and a read with the packed binaries), publishes a release and pins its URL and sha256 in `src/bundle.json`. To upgrade LayerFS, change the commit in `scripts/setup-layerfs.sh` and push.
+
+To build it from LayerFS source yourself (needs Rust), or on another machine:
 
 ```bash
 git clone https://github.com/RoacherM/minilfs.git

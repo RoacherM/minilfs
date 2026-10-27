@@ -1,0 +1,7 @@
+{
+  "darwin-arm64": {
+    "tag": "bundle-layerfs-833acf7",
+    "url": "https://github.com/RoacherM/minilfs/releases/download/bundle-layerfs-833acf7/layerfs-bundle-darwin-arm64.tar.gz",
+    "sha256": "3203b9bfd9f738b0b398408ebfe7fd74906785afe94895224e1fbd067fbf51d8"
+  }
+}

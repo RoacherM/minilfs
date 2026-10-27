@@ -1,0 +1,121 @@
+# Builds the LayerFS native bundle that minilfs downloads on first start, publishes it as a
+# GitHub release, and pins its URL and sha256 in src/bundle.json.
+#
+# Runs when the build recipe changes (scripts/setup-layerfs.sh pins the LayerFS commit), or by hand.
+# The release tag is derived from the recipe, so an unchanged recipe reuses the existing release.
+name: LayerFS bundle
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/setup-layerfs.sh
+      - scripts/package-bundle.sh
+      - scripts/smoke-bundle.mjs
+      - .github/workflows/bundle.yml
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and replace the release even if it exists
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: layerfs-bundle
+  cancel-in-progress: false
+
+jobs:
+  darwin-arm64:
+    runs-on: macos-14 # Apple silicon
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Release tag for this recipe
+        id: tag
+        run: |
+          ref=$(sed -n 's/^REF="\([0-9a-f]*\)"/\1/p' scripts/setup-layerfs.sh)
+          recipe=$(cat scripts/setup-layerfs.sh scripts/package-bundle.sh | shasum -a 256 | cut -c1-8)
+          echo "tag=bundle-layerfs-${ref:0:7}-${recipe}" >> "$GITHUB_OUTPUT"
+
+      - name: Skip when this recipe is already released
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.tag.outputs.tag }}" >/dev/null 2>&1 && [ "${{ inputs.force }}" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.exists.outputs.skip != 'true'
+        with:
+          node-version: 22
+
+      - name: Rust toolchain
+        if: steps.exists.outputs.skip != 'true'
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: actions/cache@v4
+        if: steps.exists.outputs.skip != 'true'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/minilfs/src-native/core/target
+          key: layerfs-${{ runner.os }}-${{ steps.tag.outputs.tag }}
+          restore-keys: layerfs-${{ runner.os }}-
+
+      - name: Build
+        if: steps.exists.outputs.skip != 'true'
+        run: scripts/setup-layerfs.sh --bundle "$RUNNER_TEMP/bundle"
+
+      - name: Package
+        if: steps.exists.outputs.skip != 'true'
+        id: pack
+        run: |
+          out="$RUNNER_TEMP/layerfs-bundle-darwin-arm64.tar.gz"
+          sha=$(scripts/package-bundle.sh "$RUNNER_TEMP/bundle" "$out")
+          echo "file=$out" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test (LayerFS Init + read with the packed bundle)
+        if: steps.exists.outputs.skip != 'true'
+        run: node scripts/smoke-bundle.mjs "${{ steps.pack.outputs.file }}"
+
+      - name: Publish release
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          notes="Prebuilt LayerFS bundle minilfs downloads on first start (macOS 11+ on Apple silicon).
+          Built by .github/workflows/bundle.yml from $(cat "$RUNNER_TEMP/bundle/BUILD-INFO.txt" 2>/dev/null)
+          sha256: ${{ steps.pack.outputs.sha256 }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${{ steps.pack.outputs.file }}" --clobber
+          else
+            gh release create "$tag" "${{ steps.pack.outputs.file }}" --title "LayerFS bundle $tag" --notes "$notes"
+          fi
+
+      - name: Pin the bundle in src/bundle.json
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          url="https://github.com/${{ github.repository }}/releases/download/$tag/layerfs-bundle-darwin-arm64.tar.gz"
+          node -e '
+            const fs = require("fs"); const p = "src/bundle.json";
+            const j = JSON.parse(fs.readFileSync(p, "utf8"));
+            j["darwin-arm64"] = { tag: process.argv[1], url: process.argv[2], sha256: process.argv[3] };
+            fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
+          ' "$tag" "$url" "${{ steps.pack.outputs.sha256 }}"
+          if git diff --quiet src/bundle.json; then echo "pin unchanged"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/bundle.json
+          git commit -m "chore(bundle): pin LayerFS bundle $tag"
+          git pull --rebase origin main
+          git push origin HEAD:main
