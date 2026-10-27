@@ -1275,6 +1275,36 @@ try {
     assert.ok(g("ls-files", "-z").stdout.split("\0").includes(name), "the entry reached the folder's index");
   });
 
+  await step("S8 rescued refs: a name already kept at another commit gets -<oid12> (both kept); a dangling or 42-digit ref of the losing side is not copied", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+    const lead = await open(cwd, "s8-lead"), w1 = await open(cwd, "s8-w1"), w2 = await open(cwd, "s8-w2");
+    const env = "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t;";
+    // w1: feat at c1; the lead commits after it (its .git wins) and merges w1: refs/minilfs/<w1>/heads/feat = c1
+    const o1 = out();
+    await w1.mutate("1", "bash", () => w1.exec(`${env} git checkout -q -b feat && echo f > f.txt && git add f.txt && git commit -qm on-feat && git rev-parse HEAD && git checkout -q main`, cwd, o1));
+    const c1 = o1.text().trim().split("\n")[0];
+    const label = w1.workBranch;
+    await lead.mutate("2", "bash", () => lead.exec(`${env} echo l > l.txt && git add l.txt && git commit -qm by-lead`, cwd, out()));
+    assert.ok((await lead.mergeBranch(w1.workBranch)).merged);
+    // w2 names the same rescue ref at another commit c2, plus a dangling branch and a 42-digit tag
+    const o2 = out();
+    await w2.mutate("3", "bash", () => w2.exec(`${env} git checkout -q -b side && echo s > s.txt && git add s.txt && git commit -qm side && c2=$(git rev-parse HEAD) && git checkout -q main && git branch -D side >/dev/null && echo w2 > w2.txt && git add w2.txt && git commit -qm by-w2 && mkdir -p .git/refs/minilfs/${label}/heads && echo $c2 > .git/refs/minilfs/${label}/heads/feat && echo ${"de".repeat(20)} > .git/refs/heads/ghost && mkdir -p .git/refs/tags && echo ${"ab".repeat(21)} > .git/refs/tags/bogus && echo $c2`, cwd, o2));
+    const c2 = o2.text().trim().split("\n").pop();
+    assert.match(c2, /^[0-9a-f]{40}$/, o2.text());
+    await lead.mutate("4", "bash", () => lead.exec(`${env} echo l2 > l2.txt && git add l2.txt && git commit -qm by-lead-2`, cwd, out()));
+    const m = await lead.mergeBranch(w2.workBranch);
+    assert.ok(m.merged, JSON.stringify(m.conflicts));
+    const o = out();
+    await lead.mutate("5", "bash", () => lead.exec("git for-each-ref --format='%(objectname) %(refname)' 2>/dev/null; git fsck --no-progress >/dev/null 2>&1 && echo FSCK-OK", cwd, o));
+    const lines = o.text().split("\n");
+    assert.ok(lines.includes(`${c1} refs/minilfs/${label}/heads/feat`), `c1 kept at its name: ${o.text()}`);
+    assert.ok(lines.includes(`${c2} refs/minilfs/${label}/heads/feat-${c2.slice(0, 12)}`), `c2 kept beside it: ${o.text()}`);
+    assert.ok(!lines.some((l) => /ghost|bogus/.test(l)), `no dangling or malformed ref copied: ${o.text()}`);
+    assert.match(o.text(), /FSCK-OK/);
+  });
+
   await step("too-large first import is refused before copying, naming the largest folders", async () => {
     const cwd = project();
     mkdirSync(join(cwd, "big"));

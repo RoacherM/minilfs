@@ -392,6 +392,45 @@ try {
     assert.equal(existsSync(marker), false, "the filter driver did not run");
   });
 
+  await step("S10 S12 git join: a failed ref update puts back the staged index; no driver from .git/info/attributes or core.attributesFile runs", async () => {
+    const { execSync, spawnSync } = await import("node:child_process");
+    const { readFileSync } = await import("node:fs");
+    const { GIT_JOIN_SCRIPT, parseJoin } = await import("../src/gitjoin.ts");
+    const genv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "a", GIT_AUTHOR_EMAIL: "a@b", GIT_COMMITTER_NAME: "a", GIT_COMMITTER_EMAIL: "a@b" };
+    const sh = (cwd, c) => execSync(c, { cwd, env: genv, encoding: "utf8", shell: "/bin/bash" }).trim();
+    const joinIn = (cwd, ours, theirs) => parseJoin(spawnSync("/bin/bash", ["-c", GIT_JOIN_SCRIPT, "_", ours, theirs, "refs/heads/main", "Merge w into main"], { cwd, env: genv, encoding: "utf8" }).stdout);
+    const conflicted = (name) => {
+      const d = join(dir, "s10-" + name); mkdirSync(d, { recursive: true });
+      sh(d, "git init -q -b main && printf base > a.txt && git add -A && git commit -qm base");
+      sh(d, "git checkout -q -b w && printf W > a.txt && echo w > w.txt && git add -A && git commit -qm by-w"); const theirs = sh(d, "git rev-parse HEAD");
+      sh(d, "git checkout -q main && printf L > a.txt && echo l > l.txt && git add -A && git commit -qm by-l"); const ours = sh(d, "git rev-parse HEAD");
+      writeFileSync(join(d, "a.txt"), "resolved"); writeFileSync(join(d, "w.txt"), "w\n");
+      return { d, ours, theirs };
+    };
+    // S10: something staged before the join, the branch ref locked: the join fails and the index is as it was
+    let { d, ours, theirs } = conflicted("staged");
+    sh(d, "echo staged > staged.txt && git add staged.txt");
+    const before = readFileSync(join(d, ".git/index"));
+    writeFileSync(join(d, ".git/refs/heads/main.lock"), "");
+    let r = joinIn(d, ours, theirs);
+    assert.equal(r.mode, "fail", JSON.stringify(r));
+    assert.equal(sh(d, "git rev-parse refs/heads/main"), ours, "the branch did not move");
+    assert.equal(sh(d, "git diff --cached --name-only"), "staged.txt", "the staged change is still staged");
+    assert.ok(readFileSync(join(d, ".git/index")).equals(before), "the index is byte for byte the one before");
+    rmSync(join(d, ".git/refs/heads/main.lock"));
+    // S12: attributes from .git/info/attributes and core.attributesFile name drivers the config defines
+    ({ d, ours, theirs } = conflicted("attrs"));
+    const marker = join(dir, "s12-pwned");
+    mkdirSync(join(d, ".git/info"), { recursive: true });
+    writeFileSync(join(d, ".git/info/attributes"), "* filter=pwn merge=pwn\n");
+    writeFileSync(join(dir, "s12-attributes"), "* filter=pwn merge=pwn\n");
+    sh(d, `git config core.attributesFile '${join(dir, "s12-attributes")}' && git config filter.pwn.clean 'touch ${marker}; cat' && git config filter.pwn.process 'touch ${marker}' && git config filter.pwn.required true && git config merge.pwn.driver 'touch ${marker}; false'`);
+    r = joinIn(d, ours, theirs);
+    assert.equal(r.mode, "worktree", JSON.stringify(r));
+    assert.equal(existsSync(marker), false, "no filter or merge driver ran");
+    assert.equal(sh(d, "git show HEAD:a.txt"), "resolved");
+  });
+
   await step("team lead alias: a finished or crashed earlier lead does not keep `lead`; a running one does", async () => {
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(new URL("../src/workspace.ts", import.meta.url), "utf8");

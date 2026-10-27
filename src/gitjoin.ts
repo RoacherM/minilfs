@@ -14,17 +14,30 @@
 //   - merge-tree conflicts                 -> the tree of the merged work tree instead (worktree):
 //                                             LayerFS already resolved the files, the commit records it
 // The index is set to the new head's tree first (`git read-tree`, the work tree untouched), then the
-// branch moves (`update-ref` against its old value); if that fails the index goes back, so a failed
-// join leaves no half state. `git status` then shows exactly the changes neither side committed.
+// branch moves (`update-ref` against its old value); if that fails the index is put back byte for
+// byte from a copy (staged changes kept), so a failed join leaves no half state. `git status` then
+// shows exactly the changes neither side committed.
 // The script runs with bash under the session's Seatbelt profile, with hooks, fsmonitor, automatic
-// gc and attribute filters (attr.tree = the empty tree: no clean/smudge driver from the Branch's
-// .gitattributes runs) off.
+// gc and every attribute driver off: no attribute source (attr.tree = the empty tree for the
+// Branch's .gitattributes, core.attributesFile and the system file off) and, since
+// .git/info/attributes cannot be turned off, every filter and merge driver the config defines is
+// overridden on the command line (clean/smudge/process empty, required false, merge driver `false`).
 
-/** Bash script (run with /bin/bash); arguments: $1 ours, $2 theirs, $3 branch ref (refs/heads/x), $4 message. */
+/** Bash script (run with /bin/bash); arguments: $1 ours, $2 theirs, $3 branch ref (refs/heads/x), $4 message. (`${"$"}{` below is a literal `${`.) */
 export const GIT_JOIN_SCRIPT = String.raw`
 set -u
+export GIT_ATTR_NOSYSTEM=1
 EMPTY=$(git hash-object -t tree /dev/null) || { echo "JOIN fail empty-tree"; exit 0; }
-g() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c gc.auto=0 -c maintenance.auto=false -c advice.detachedHead=false -c attr.tree="$EMPTY" -c core.autocrlf=false "$@"; }
+DRV=(-c core.hooksPath=/dev/null -c core.fsmonitor=false -c gc.auto=0 -c maintenance.auto=false -c advice.detachedHead=false -c core.attributesFile=/dev/null -c attr.tree="$EMPTY" -c core.autocrlf=false)
+# .git/info/attributes still applies: neutralize every driver it could name
+while IFS= read -r k; do
+  case "$k" in
+    filter.*.required) DRV+=(-c "$k=false") ;;
+    filter.*) DRV+=(-c "$k=") ;;
+    merge.*.driver) DRV+=(-c "$k=false") ;;
+  esac
+done < <(git config --includes --name-only --get-regexp '^(filter|merge)\.' 2>/dev/null || true)
+g() { git "${"$"}{DRV[@]}" "$@"; }
 OURS=$1; THEIRS=$2; BRANCH=$3; MSG=$4
 # merge-tree --write-tree --no-messages needs git 2.40
 v=$(g version | awk '{ split($3, a, "."); print a[1] * 1000 + a[2] }')
@@ -74,12 +87,22 @@ else
   new=$(printf '%s\n' "$MSG" | g commit-tree "$tree" -p "$OURS" -p "$THEIRS") || { echo "JOIN fail commit-tree"; exit 0; }
 fi
 if [ "$new" != "$cur" ]; then
-  # index first (fails cleanly, e.g. on index.lock, before anything moved), then the ref
-  g read-tree "$new" || { echo "JOIN fail read-tree"; exit 0; }
-  if ! g update-ref -m "minilfs: $MSG" "$BRANCH" "$new" $cur; then
-    [ -n "$cur" ] && g read-tree "$cur"
-    echo "JOIN fail update-ref"; exit 0
+  # index first (fails cleanly, e.g. on index.lock, before anything moved), then the ref; a copy of
+  # the index puts it back exactly (read-tree "$cur" would drop what was staged)
+  orig_idx=$(mktemp "/tmp/minilfs-join-orig-index.XXXXXX") || { echo "JOIN fail mktemp"; exit 0; }
+  had_idx=0
+  if [ -f .git/index ]; then
+    cp -p .git/index "$orig_idx" || { rm -f "$orig_idx"; echo "JOIN fail backup-index"; exit 0; }
+    had_idx=1
   fi
+  if ! g read-tree "$new"; then
+    rm -f "$orig_idx"; echo "JOIN fail read-tree"; exit 0
+  fi
+  if ! g update-ref -m "minilfs: $MSG" "$BRANCH" "$new" $cur; then
+    if [ "$had_idx" -eq 1 ]; then cp -p "$orig_idx" .git/index 2>/dev/null || true; else rm -f .git/index; fi
+    rm -f "$orig_idx"; echo "JOIN fail update-ref"; exit 0
+  fi
+  rm -f "$orig_idx"
   # the stat cache read-tree dropped (so status need not hash every file); a changed file is fine
   g update-index -q --refresh >/dev/null 2>&1 || true
 fi

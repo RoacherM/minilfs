@@ -828,7 +828,9 @@ export class LayerfsSession {
    * After a merge in which both sides changed the `git` unit: the merged `.git` is the kept side's
    * whole (consistent refs, HEAD and index). The losing side's refs (loose refs and packed-refs) are
    * kept in the merged Branch: branch heads as `refs/minilfs/<label>/heads/<name>`, earlier rescues
-   * `refs/minilfs/*` as they are, tags, and a detached HEAD: its commits stay reachable (gc keeps them). The files are already merged by LayerFS, so
+   * `refs/minilfs/*` as they are, tags, and a detached HEAD: its commits stay reachable (gc keeps them). Only refs whose
+   * objects the merged branch has (branch heads: commits); a name it already uses for another commit
+   * gets `-<oid12>` appended, so nothing is overwritten or dropped. The files are already merged by LayerFS, so
    * the histories join with `git merge -s ours --no-commit <ref> && git add -A && git commit`
    * (verified: both parents recorded, tree = the merged files, fsck clean).
    */
@@ -860,64 +862,58 @@ export class LayerfsSession {
     const losing = unit.kept === "ours" ? theirs : ours;
     const keptName = unit.kept === "ours" ? "this Branch" : label;
     const lostName = unit.kept === "ours" ? label : "this Branch";
-    // every ref of the losing side (packed-refs, then loose refs, which win), by full name
-    const refs = new Map<string, string>();
-    // packed-refs can exceed one fs.read window (2000 lines / 48 KiB): page through it
-    let packed = "";
-    for (let line = 1; line > 0; ) {
-      const r: any = await this.lfs.fs.read(losing, "/.git/packed-refs", line).catch(() => null);
-      if (!r) break;
-      packed += String(r.text ?? "");
-      line = r.truncated && r.endLine ? r.endLine + 1 : 0;
-    }
-    for (const line of packed.split("\n")) {
-      const mm = /^([0-9a-f]{40,64}) (refs\/.+)$/.exec(line.trim());
-      if (mm) refs.set(mm[2], mm[1]);
-    }
-    const walk = async (dir: string, prefix: string) => {
-      for (let pos = 0; ; ) {
-        const page = await this.lfs.fs.list(losing, dir, 1000, pos).catch(() => null);
-        for (const it of page?.items ?? []) {
-          const sp = `${dir}/${it.name}`;
-          if (it.type === "dir") await walk(sp, `${prefix}${it.name}/`);
-          else if (it.type === "file") {
-            const oid = await this.lfs.fs.read(losing, sp).then((r: any) => String(r.text ?? "").trim(), () => "");
-            if (/^[0-9a-f]{40,64}$/.test(oid)) refs.set(`${prefix}${it.name}`, oid);
-          }
-        }
-        if (!page?.hasMore || !(page?.items ?? []).length) break;
-        pos = page.nextPagePos ?? (pos + page.items.length);
-      }
-    };
-    await walk("/.git/refs", "refs/");
+    // the repository's hash length: a 42-digit "oid" is no ref
+    const cfg = await this.lfs.fs.read(target, "/.git/config", 1).then((r: any) => String(r.text ?? ""), () => "");
+    const oidLen = /^\s*objectformat\s*=\s*sha256\s*$/im.test(cfg) ? 64 : 40;
+    // every ref of the losing side and of the merged branch (packed-refs, then loose refs, which win), by full name
+    const refs = await this.readGitRefs(losing, oidLen);
+    const existing = await this.readGitRefs(target, oidLen);
     // the refs are named after the side they come from: the other Branch, or this session (the work branch before the merge)
     const safeLabel = (unit.kept === "ours" ? label : this.workBranch).replace(/[^A-Za-z0-9._-]/g, "-");
+    const rawHead = (b: string) => this.lfs.fs.read(b, "/.git/HEAD").then((r: any) => String(r.text ?? "").trim(), () => "");
+    const lostHead = await rawHead(losing);
+    // what could be kept: plain ref names only (they are shown in a command), objects the merged
+    // branch has with the right type (a branch head is a commit), in a fixed order
+    const isOid = (o: string) => o.length === oidLen && /^[0-9a-f]+$/.test(o);
+    // (a ref the merged branch has at the same commit needs nothing)
+    const candidates = [...refs].filter(([ref, oid]) => isSafeRefName(ref) && isOid(oid) && /^refs\/(heads|tags|minilfs)\//.test(ref) && existing.get(ref) !== oid)
+      .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : x[1] < y[1] ? -1 : x[1] > y[1] ? 1 : 0));
+    const detached = isOid(lostHead) && lostHead !== (await rawHead(target));
+    const needsCommit = (ref: string) => ref === "HEAD" || /^refs\/heads\//.test(ref) || /^refs\/minilfs\/[^/]+\/(heads\/|HEAD$)/.test(ref);
+    const types = await this.branchObjectTypes(target, [...candidates.map(([, oid]) => oid), ...(detached ? [lostHead] : [])]);
+    const verified = (ref: string, oid: string) => { const t = types.get(oid); return Boolean(t) && (!needsCommit(ref) || t === "commit"); };
+    // a name the merged branch already uses for another commit is never overwritten nor skipped:
+    // the commit is kept as <name>-<oid12> (or <name>-<oid>)
+    const allocate = (dst: string, oid: string): string | null => {
+      for (const name of [dst, `${dst}-${oid.slice(0, 12)}`, `${dst}-${oid}`]) {
+        const cur = existing.get(name);
+        if (cur === oid) return null; // already kept there
+        if (!cur) { existing.set(name, oid); return name; }
+      }
+      return null;
+    };
     // where each ref goes in the merged .git, so nothing the losing side could reach is dropped (each
     // merge round keeps the earlier rescues): branch heads under refs/minilfs/<label>/heads/, earlier
     // rescues (refs/minilfs/*) at the same path, tags under their name (or refs/minilfs/<label>/tags/
     // when the kept side has that tag at another commit), a detached HEAD as refs/minilfs/<label>/HEAD
     const wanted: Array<[string, string]> = [];
-    for (const [ref, oid] of refs) {
-      // ref names come from the other side's .git: only plain git ref names (they are shown in a command)
-      if (!isSafeRefName(ref)) continue;
-      const mineOf = async (r: string) => (await this.gitRefOid(target, r)) ?? "";
+    const want = (dst: string, oid: string) => { const name = allocate(dst, oid); if (name) wanted.push([name, oid]); };
+    const base = new Map(existing);
+    for (const [ref, oid] of candidates) {
+      if (!verified(ref, oid)) continue;
       if (ref.startsWith("refs/heads/")) {
-        if ((await mineOf(ref)) !== oid) wanted.push([`refs/minilfs/${safeLabel}/heads/${ref.slice("refs/heads/".length)}`, oid]);
+        want(`refs/minilfs/${safeLabel}/heads/${ref.slice("refs/heads/".length)}`, oid);
       } else if (ref.startsWith("refs/minilfs/")) {
-        if (!(await mineOf(ref))) wanted.push([ref, oid]);
-      } else if (ref.startsWith("refs/tags/")) {
-        const mine = await mineOf(ref);
-        if (!mine) wanted.push([ref, oid]);
-        else if (mine !== oid) wanted.push([`refs/minilfs/${safeLabel}/tags/${ref.slice("refs/tags/".length)}`, oid]);
+        want(ref, oid);
+      } else {
+        if (!base.get(ref)) want(ref, oid);
+        else want(`refs/minilfs/${safeLabel}/tags/${ref.slice("refs/tags/".length)}`, oid);
       }
     }
-    const rawHead = (b: string) => this.lfs.fs.read(b, "/.git/HEAD").then((r: any) => String(r.text ?? "").trim(), () => "");
-    const lostHead = await rawHead(losing);
-    if (/^[0-9a-f]{40,64}$/.test(lostHead) && lostHead !== (await rawHead(target))) wanted.push([`refs/minilfs/${safeLabel}/HEAD`, lostHead]);
+    if (detached && verified("HEAD", lostHead)) want(`refs/minilfs/${safeLabel}/HEAD`, lostHead);
     const ops: any[] = [];
     const kept: string[] = [];
     for (const [ref, oid] of wanted) {
-      if ((await this.gitRefOid(target, ref)) === oid) continue;
       const refPath = `/.git/${ref}`;
       ops.push({ op: "mkdir", path: posix.dirname(refPath) }, { op: "write", path: refPath, bytes: Buffer.from(`${oid}\n`) });
       kept.push(ref);
@@ -951,20 +947,84 @@ export class LayerfsSession {
     };
   }
 
-  /** A git ref's commit on `branch` (loose ref, else packed-refs), or null. */
-  private async gitRefOid(branch: string, ref: string): Promise<string | null> {
+  /** A git ref's commit on `branch` (loose ref, else packed-refs), or null; an oid of exactly `oidLen` digits (40 or 64 when not given). */
+  private async gitRefOid(branch: string, ref: string, oidLen?: number): Promise<string | null> {
+    const ok = (o: string) => (oidLen ? o.length === oidLen : o.length === 40 || o.length === 64) && /^[0-9a-f]+$/.test(o);
     const loose = await this.lfs.fs.read(branch, `/.git/${ref}`).then((r: any) => String(r.text ?? "").trim(), () => "");
-    if (/^[0-9a-f]{40,64}$/.test(loose)) return loose;
+    if (ok(loose)) return loose;
     for (let line = 1; line > 0; ) {
       const r: any = await this.lfs.fs.read(branch, "/.git/packed-refs", line).catch(() => null);
       if (!r) break;
       for (const l of String(r.text ?? "").split("\n")) {
-        const m = /^([0-9a-f]{40,64}) (\S+)$/.exec(l.trim());
-        if (m && m[2] === ref) return m[1];
+        const m = /^([0-9a-f]+) (\S+)$/.exec(l.trim());
+        if (m && m[2] === ref && ok(m[1])) return m[1];
       }
       line = r.truncated && r.endLine ? r.endLine + 1 : 0;
     }
     return null;
+  }
+
+  /** Every ref of `branch`'s git (packed-refs, then loose refs, which win) whose value is an oid of `oidLen` digits. */
+  private async readGitRefs(branch: string, oidLen: number): Promise<Map<string, string>> {
+    const refs = new Map<string, string>();
+    const isOid = (o: string) => o.length === oidLen && /^[0-9a-f]+$/.test(o);
+    // packed-refs can exceed one fs.read window (2000 lines / 48 KiB): page through it
+    let packed = "";
+    for (let line = 1; line > 0; ) {
+      const r: any = await this.lfs.fs.read(branch, "/.git/packed-refs", line).catch(() => null);
+      if (!r) break;
+      packed += String(r.text ?? "");
+      line = r.truncated && r.endLine ? r.endLine + 1 : 0;
+    }
+    for (const line of packed.split("\n")) {
+      const mm = /^([0-9a-f]+) (refs\/.+)$/.exec(line.trim());
+      if (mm && isOid(mm[1])) refs.set(mm[2], mm[1]);
+    }
+    const walk = async (dir: string, prefix: string) => {
+      for (let pos = 0; ; ) {
+        const page = await this.lfs.fs.list(branch, dir, 1000, pos).catch(() => null);
+        for (const it of page?.items ?? []) {
+          const sp = `${dir}/${it.name}`;
+          if (it.type === "dir") await walk(sp, `${prefix}${it.name}/`);
+          else if (it.type === "file") {
+            const oid = await this.lfs.fs.read(branch, sp).then((r: any) => String(r.text ?? "").trim(), () => "");
+            if (isOid(oid)) refs.set(`${prefix}${it.name}`, oid);
+          }
+        }
+        if (!page?.hasMore || !(page?.items ?? []).length) break;
+        pos = page.nextPagePos ?? (pos + page.items.length);
+      }
+    };
+    await walk("/.git/refs", "refs/");
+    return refs;
+  }
+
+  /**
+   * The type of each of `oids` that `branch`'s git has (absent: missing), in one mount: git
+   * cat-file under the session's Seatbelt profile, with a clean environment (the Branch's .git is
+   * agent state).
+   */
+  private async branchObjectTypes(branch: string, oids: string[]): Promise<Map<string, string>> {
+    const types = new Map<string, string>();
+    const list = [...new Set(oids)];
+    if (!list.length) return types;
+    await this.withMountedBranch(branch, false, "check git objects", async (wsPath) => {
+      const scratchDir = join(this.config.root, "scratch", this.projectRecord.name, "join");
+      await fsp.mkdir(scratchDir, { recursive: true });
+      const profile = buildSeatbeltProfile({
+        wsPath, hostCwd: this.cwd, scratchDir, configRoot: this.config.root,
+        excludes: this.config.excludes, outsideSecrets: OUTSIDE_SECRET_PATTERNS, network: "deny",
+      });
+      const r = await run("/usr/bin/sandbox-exec", ["-p", profile, "git", "--git-dir", join(wsPath, ".git"), "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+        "cat-file", "--batch-check=%(objectname) %(objecttype)"], { cwd: wsPath, env: cleanGitEnv(scratchDir), input: list.join("\n") + "\n", timeoutMs: 60_000 });
+      if (r.code !== 0) throw new LayerfsError("Failed", `git cat-file failed: ${r.stderr.trim().slice(0, 160)}`);
+      const lines = r.stdout.toString().split("\n");
+      list.forEach((oid, i) => {
+        const [name, type] = (lines[i] ?? "").split(" ");
+        if (name === oid && type && type !== "missing") types.set(oid, type);
+      });
+    });
+    return types;
   }
 
   /**
