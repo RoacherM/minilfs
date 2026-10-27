@@ -36,6 +36,7 @@ import {
 
 export const CHECKPOINT_ENTRY = "minilfs-checkpoint";
 export const SESSION_ENTRY = "minilfs-session";
+const ONLY_LEAD = "only the lead applies to the folder; you are a sub-agent: report your branch name (`minilfs` action=status) instead";
 
 export default function minilfsExtension(pi: ExtensionAPI) {
   pi.registerFlag("no-minilfs", { description: "Disable minilfs isolation for this run (tools act on the host folder)", type: "boolean", default: false });
@@ -209,6 +210,8 @@ export default function minilfsExtension(pi: ExtensionAPI) {
         parameters: LAYERFS_APPLY_TOOL_SCHEMA as any,
         async execute(_id: string, _params: any, _signal: any, _onUpdate: any, ctx: ExtensionContext) {
           if (disabled) return text("minilfs is off for this run: your edits are already in the user's folder.");
+          // registered by the role seen at load; session_start may find this is a sub-agent after all
+          if (role.role !== "lead") throw new Error(ONLY_LEAD);
           const s = await need();
           const out = await executeLayerfsApply(s, {
             onStatusChange: () => status(ctx, describe(s)),
@@ -304,6 +307,10 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     }
     const branchEntries = ctx.sessionManager.getBranch();
     role = resolveRole({ sessionFile: ctx.sessionManager.getSessionFile?.() });
+    if (role.role !== "lead" && typeof pi.getActiveTools === "function" && typeof pi.setActiveTools === "function") {
+      const active = pi.getActiveTools();
+      if (active.includes("minilfs_apply")) pi.setActiveTools(active.filter((t) => t !== "minilfs_apply"));
+    }
     const branchInfo = inspectBranchEntries(branchEntries);
     const forkRef = event.reason === "fork" ? (pendingForkRef ?? branchInfo.headCommit ?? branchInfo.baseRef ?? null) : null;
     pendingForkRef = null;
@@ -502,6 +509,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
         return say(`Cleaned scratch build caches at ${res.removedPath}.`);
       }
       if (sub === "apply") {
+        if (role.role !== "lead") return say(ONLY_LEAD, "error");
         const allowRevert = argv.includes("--revert");
         const d = await applicableDiff(s);
         const git = await gitLine(s);

@@ -37,14 +37,16 @@ const load = async ({ env = {}, sessionFile, hasUI = true, branch = [] } = {}) =
   const saved = {};
   for (const [k, v] of Object.entries(env)) { saved[k] = process.env[k]; process.env[k] = v; }
   const h = {}, c = {}, tools = {}, entries = [], notes = [], flags = [];
+  const active = { names: [] };
   try {
-    ext({ registerFlag: (n) => flags.push(n), registerTool: (t) => (tools[t.name] = t), getFlag: () => false, on: (n, f) => (h[n] = f),
+    ext({ registerFlag: (n) => flags.push(n), registerTool: (t) => (tools[t.name] = t, active.names.push(t.name)), getFlag: () => false, on: (n, f) => (h[n] = f),
+      getActiveTools: () => [...active.names], setActiveTools: (names) => (active.names = [...names]),
       registerCommand: (n, x) => (c[n] = x), appendEntry: (t, d) => entries.push({ type: "custom", customType: t, data: d }), events: { emit() {} } });
     const ctx = { cwd: dir, hasUI, ui: { notify: (m) => notes.push(m), setStatus() {}, select: async () => "Run" },
       sessionManager: { getBranch: () => branch, getSessionId: () => "sid", getSessionFile: () => sessionFile } };
     await h.session_start({ reason: "startup" }, ctx);
     await new Promise((r) => setTimeout(r, 10));
-    return { h, c, tools, entries, notes, ctx, flags };
+    return { h, c, tools, entries, notes, ctx, flags, active };
   } finally {
     for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   }
@@ -86,6 +88,18 @@ try {
     const e = await load({ env: { PI_SUBAGENT_CHILD: "1" } });
     assert.equal(e.tools.bash.parameters.properties.elevated, undefined);
     assert.equal(e.tools.minilfs_apply, undefined);
+  });
+
+  await step("R7 an Epi task found only at session_start (session file) cannot apply: tool and /minilfs apply refuse, tool deactivated", async () => {
+    const e = await load({ sessionFile: "/Users/x/.epi/runtime/task/sessions/0193abcd-1111-2222-3333-444455556666.jsonl" });
+    assert.ok(e.tools.minilfs_apply, "registered at load (no env marker yet)");
+    await assert.rejects(e.tools.minilfs_apply.execute("id", {}, undefined, undefined, e.ctx), /only .*lead/);
+    const said = [];
+    await e.c.minilfs.handler("apply", { ...e.ctx, ui: { ...e.ctx.ui, notify: (m) => said.push(m) } });
+    assert.match(said.at(-1), /only .*lead/);
+    assert.equal(e.active.names.includes("minilfs_apply"), false, "removed from the active tools");
+    const lead = await load();
+    assert.ok(lead.active.names.includes("minilfs_apply"), "the lead keeps it");
   });
 
   await step("bash always runs on the Branch, even when an old caller passes elevated: true", async () => {
