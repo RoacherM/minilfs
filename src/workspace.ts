@@ -1215,16 +1215,28 @@ export class LayerfsSession {
     });
   }
 
+  /**
+   * The real path of a read outside the project, or EACCES when it (as named, or after symlinks) is
+   * minilfs's private state (the store worker's endpoint secret, Stores, bindings), the bundle, a
+   * configured exclude or a $HOME credential. Seatbelt guards bash; the file tools run in this
+   * process and need this check themselves.
+   */
+  async resolveOutsideRead(hostPath: string): Promise<string> {
+    const abs = resolve(this.cwd, hostPath);
+    const real = await realpathNearest(abs);
+    for (const p of [abs, real]) {
+      if (isPrivateMinilfsPath(p, this.config) || isOutsideSecret(p, this.config.excludes)) {
+        const err = new Error(`cannot read ${hostPath}: secret file outside the project is not readable`);
+        (err as any).code = "EACCES";
+        throw err;
+      }
+    }
+    return real;
+  }
+
   async readFile(hostPath: string): Promise<Buffer> {
     const sp = this.toStorePath(hostPath);
-    if (!sp) {
-      const abs = resolve(this.cwd, hostPath);
-      const real = await fsp.realpath(abs).catch(() => abs);
-      if (isOutsideSecret(real, this.config.excludes)) {
-        throw new Error(`cannot read ${hostPath}: secret file outside the project is not readable`);
-      }
-      return fsp.readFile(abs);
-    }
+    if (!sp) return fsp.readFile(await this.resolveOutsideRead(hostPath));
     return this.readBytesAtRef(this.workBranch, sp, hostPath);
   }
 
@@ -1232,7 +1244,7 @@ export class LayerfsSession {
     const sp = this.toStorePath(hostPath);
     if (!sp) {
       if (write) this.mustStorePath(hostPath);
-      return fsp.access(resolve(this.cwd, hostPath), fsc.R_OK);
+      return fsp.access(await this.resolveOutsideRead(hostPath), fsc.R_OK);
     }
     const rel = sp.replace(/^\/+/, "");
     if (rel && isExcludedPath(rel, this.config.excludes)) throw enoent(hostPath, "not accessible");
@@ -1251,7 +1263,11 @@ export class LayerfsSession {
 
   async exists(hostPath: string): Promise<boolean> {
     const sp = this.toStorePath(hostPath);
-    if (!sp) return fsp.access(resolve(this.cwd, hostPath)).then(() => true, () => false);
+    if (!sp) {
+      // a denied path does not exist for the agent (no EACCES that would confirm it is there)
+      const real = await this.resolveOutsideRead(hostPath).catch(() => null);
+      return real !== null && fsp.access(real).then(() => true, () => false);
+    }
     const rel = sp.replace(/^\/+/, "");
     if (rel && isExcludedPath(rel, this.config.excludes)) return false;
     const st = await this.lfs.fs.stat(this.workBranch, sp).catch(() => null);
@@ -1268,7 +1284,7 @@ export class LayerfsSession {
 
   async isDirectory(hostPath: string): Promise<boolean> {
     const sp = this.toStorePath(hostPath);
-    if (!sp) return (await fsp.stat(resolve(this.cwd, hostPath))).isDirectory();
+    if (!sp) return (await fsp.stat(await this.resolveOutsideRead(hostPath))).isDirectory();
     const rel = sp.replace(/^\/+/, "");
     if (rel && isExcludedPath(rel, this.config.excludes)) throw enoent(hostPath, "no such file or directory");
     const st = await this.lfs.fs.stat(this.workBranch, sp).catch(() => null);
@@ -1286,7 +1302,7 @@ export class LayerfsSession {
 
   async readdir(hostPath: string): Promise<string[]> {
     const sp = this.toStorePath(hostPath);
-    if (!sp) return fsp.readdir(resolve(this.cwd, hostPath));
+    if (!sp) return fsp.readdir(await this.resolveOutsideRead(hostPath));
     try {
       const names: string[] = [];
       for (let pos = 0; ; ) {
@@ -2330,6 +2346,25 @@ async function removeEmptyParents(root: string, rel: string): Promise<void> {
   while (dir && dir !== "." && dir !== "/") {
     try { await fsp.rmdir(join(root, dir)); } catch { return; }
     dir = posix.dirname(dir);
+  }
+}
+
+/** True when `abs` is minilfs's root (Stores, bindings, the store worker's endpoint) or its bundle, in any spelling. */
+export function isPrivateMinilfsPath(abs: string, config: { root: string; bundle: string }): boolean {
+  const dirs = [config.root, config.bundle].filter(Boolean).flatMap((d) => bothSpellings(d));
+  return dirs.some((d) => abs === d || abs.startsWith(`${d}/`));
+}
+
+/** realpath of `abs`, or of its nearest existing ancestor plus the rest (a path that does not exist yet). */
+async function realpathNearest(abs: string): Promise<string> {
+  const rest: string[] = [];
+  for (let probe = abs; ; ) {
+    const real = await fsp.realpath(probe).catch(() => null);
+    if (real) return rest.length ? join(real, ...rest) : real;
+    const up = dirname(probe);
+    if (up === probe) return abs;
+    rest.unshift(basename(probe));
+    probe = up;
   }
 }
 

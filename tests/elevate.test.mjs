@@ -323,6 +323,32 @@ try {
     assert.equal(s.toStorePath("/var/folders/ct/xx/T/dsh-minilfs-test-c86npk/other/w1.txt"), null);
     assert.equal(s.toStorePath(`${real}-evil/x`), null);
   });
+  await step("R1 file tools cannot read minilfs's root (worker endpoint), in any spelling or through a symlink; exists is false", async () => {
+    const { resolveConfig } = await import("../src/config.ts");
+    const { symlinkSync } = await import("node:fs");
+    const { homedir } = await import("node:os");
+    const t = `/tmp/minilfs-r1-${Date.now().toString(36)}`;
+    const root = join(t, "root"), wdir = join(root, "worker", "b1"), endpoint = join(wdir, "endpoint.json");
+    mkdirSync(wdir, { recursive: true }); mkdirSync(join(t, "proj")); writeFileSync(endpoint, '{"secret":"s"}');
+    writeFileSync(join(t, "notes.md"), "ok\n");
+    symlinkSync(endpoint, join(t, "link-to-endpoint"));
+    symlinkSync(join(homedir(), ".ssh"), join(t, "link-to-ssh"));
+    try {
+      const s = new ws.LayerfsSession(join(t, "proj"), "r1", { ...resolveConfig({}), root });
+      const denied = (e) => e.code === "EACCES";
+      for (const p of [endpoint, `/private${endpoint}`, join(t, "link-to-endpoint")]) await assert.rejects(s.readFile(p), denied, p);
+      await assert.rejects(s.readdir(join(root, "worker")), denied);
+      await assert.rejects(s.readdir(`/private${root}/worker`), denied);
+      await assert.rejects(s.readdir(join(t, "link-to-ssh")), denied);
+      await assert.rejects(s.access(endpoint), denied);
+      await assert.rejects(s.access(join(root, "worker", "nope", "x")), denied, "a missing child under the root: EACCES, not ENOENT");
+      await assert.rejects(s.isDirectory(join(root, "worker")), denied);
+      assert.equal(await s.exists(endpoint), false);
+      assert.equal(await s.exists(join(t, "link-to-endpoint")), false);
+      assert.equal((await s.readFile(join(t, "notes.md"))).toString(), "ok\n", "other outside files stay readable");
+      assert.equal(await s.exists(join(t, "notes.md")), true);
+    } finally { rmSync(t, { recursive: true, force: true }); }
+  });
 } finally {
   try { rmSync(dir, { recursive: true, force: true }); } catch {}
   console.log(`\n${results.filter(Boolean).length}/${results.length} passed`);

@@ -2,7 +2,7 @@
 // Run: node tests/review-fixes.test.mjs
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, promises as fsp, readFileSync, readdirSync, readlinkSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, promises as fsp, readFileSync, readdirSync, readlinkSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { resolveConfig } from "../src/config.ts";
@@ -17,6 +17,8 @@ const config = { ...resolveConfig({ MINILFS_BUNDLE: process.env.MINILFS_BUNDLE }
 const pgrep = (pattern) => spawnSync("pgrep", ["-f", pattern], { encoding: "utf8" });
 const results = [];
 const step = async (name, fn) => {
+  // MINILFS_TEST_ONLY=<regex>: run only the matching steps (before/after checks of one fix)
+  if (process.env.MINILFS_TEST_ONLY && !new RegExp(process.env.MINILFS_TEST_ONLY).test(name)) return;
   const t0 = Date.now();
   try { const ev = await fn(); results.push(true); console.log(`PASS ${name} (${Date.now() - t0} ms)${ev ? ` :: ${String(ev).slice(0, 200)}` : ""}`); }
   catch (e) { results.push(false); console.log(`FAIL ${name}: ${e.stack?.split("\n").slice(0, 4).join(" | ")}`); }
@@ -228,6 +230,25 @@ try {
     (await import("node:fs")).symlinkSync(real, link);
     await assert.rejects(s.readFile(link), /secret file|ENOENT/);
     assert.equal((await s.readFile(join(base, "notes.md"))).toString(), "ok\n");
+  });
+
+  await step("R1 file tools cannot read the store worker's endpoint (secret) or list <root>/worker, directly or via a /tmp symlink", async () => {
+    const cwd = project();
+    const s = await open(cwd, "r1");
+    const wroot = join(config.root, "worker");
+    const endpoint = readdirSync(wroot).map((b) => join(wroot, b, "endpoint.json")).find((f) => existsSync(f));
+    assert.ok(endpoint, "a store worker runs");
+    const link = `/tmp/minilfs-r1-link-${id}`;
+    (await import("node:fs")).symlinkSync(endpoint, link);
+    try {
+      const denied = (e) => e.code === "EACCES";
+      await assert.rejects(s.readFile(endpoint), denied);
+      await assert.rejects(s.readFile(link), denied);
+      await assert.rejects(s.readdir(wroot), denied);
+      await assert.rejects(s.access(endpoint), denied);
+      await assert.rejects(s.isDirectory(wroot), denied);
+      assert.equal(await s.exists(endpoint), false);
+    } finally { rmSync(link, { force: true }); }
   });
 
   await step("N1: background jobs started by bash die with the command (PID namespace)", async () => {
