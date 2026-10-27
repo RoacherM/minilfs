@@ -44,15 +44,17 @@ done
 git -C "${SRC}" reset --hard "${REF}" && git -C "${SRC}" clean -fd
 git -C "${SRC}" show "${CHERRY_MOUNT}" -- core/ | git -C "${SRC}" apply -
 git -C "${SRC}" show "${CHERRY_APPLEDOUBLE}" -- core/ | git -C "${SRC}" apply -
-git -C "${SRC}" show "${CHERRY_OVERLAY}" -- sdk/js/native/src/direct.rs | git -C "${SRC}" apply -
+# upstream moved the binding to api/binding/ after REF; it lives in sdk/js/native/ here
+git -C "${SRC}" show "${CHERRY_OVERLAY}" -- api/binding/src/direct.rs | sed 's#api/binding/src/direct.rs#sdk/js/native/src/direct.rs#g' | git -C "${SRC}" apply -
 
 for f in core/Cargo.lock .cargo/config.toml sdk/js/src/index.js; do
   [ -f "${SRC}/${f}" ] || { echo "LayerFS checkout incomplete: missing ${f}; rerun to resume" >&2; exit 1; }
 done
 
 echo "==> Building layerfs-daemon + layerfs.node (macOS native, zero Docker)"
-CARGO_PROFILE_RELEASE_STRIP=none cargo build --manifest-path "${SRC}/core/Cargo.toml" --release \
-  -p layerfs-node --lib -p layerfs-daemon --bins
+# run from the checkout root: cargo reads .cargo/config.toml (the aarch64 AEAD flags) from the current directory
+(cd "${SRC}" && CARGO_PROFILE_RELEASE_STRIP=none cargo build --manifest-path core/Cargo.toml --release \
+  -p layerfs-node --lib -p layerfs-daemon --bins)
 
 echo "==> Assembling native bundle -> ${BUNDLE}"
 mkdir -p "${BUNDLE}/sdk/js/native"
