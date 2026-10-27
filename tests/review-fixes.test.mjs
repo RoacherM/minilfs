@@ -262,7 +262,7 @@ try {
     await assert.rejects(running, /aborted/);
     const ms = Date.now() - t0;
     assert.ok(ms < 15_000, `close took ${ms} ms`);
-    assert.equal(pgrep("sleep 60").stdout.trim(), "", "nothing left running");
+    assert.equal(pgrep("^sleep 60$").stdout.trim(), "", "nothing left running");
     return `${ms} ms`;
   });
 
@@ -990,6 +990,36 @@ try {
     assert.equal(g("rev-list", "--merges", "--count", "main").stdout.trim(), "3", "the merges reached the folder");
     assert.equal(g("status", "--porcelain").stdout.trim(), "", "folder clean");
     return `main: ${g("log", "--format=%s", "--graph", "main").stdout.split("\n").length} lines of graph`;
+  });
+
+  await step("R12 rescued refs survive later merges: w1's branch, tag and detached-HEAD commit stay reachable after w1 -> w2 -> lead", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+    const lead = await open(cwd, "r12-lead"), w1 = await open(cwd, "r12-w1"), w2 = await open(cwd, "r12-w2");
+    const env = "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t;";
+    const o1 = out();
+    await w1.mutate("1", "bash", () => w1.exec(`${env} git checkout -q -b feat && echo f > f.txt && git add f.txt && git commit -qm on-feat && git tag v1.0 && git checkout -q main && git checkout -q --detach && echo d > d.txt && git add d.txt && git commit -qm detached && git rev-parse feat v1.0 HEAD`, cwd, o1));
+    const [feat, tag, detached] = o1.text().trim().split("\n");
+    assert.match(detached ?? "", /^[0-9a-f]{40}$/, o1.text());
+    // w2 commits after w1, so w2's .git wins the w1 -> w2 merge; the lead commits last and wins the next
+    await w2.mutate("2", "bash", () => w2.exec(`${env} echo w2 > w2.txt && git add w2.txt && git commit -qm by-w2`, cwd, out()));
+    const m1 = await w2.mergeBranch(w1.workBranch);
+    assert.ok(m1.merged, JSON.stringify(m1.conflicts));
+    await lead.mutate("3", "bash", () => lead.exec(`${env} echo l > l.txt && git add l.txt && git commit -qm by-lead`, cwd, out()));
+    const m2 = await lead.mergeBranch(w2.workBranch);
+    assert.ok(m2.merged, JSON.stringify(m2.conflicts));
+    const o = out();
+    await lead.mutate("4", "bash", () => lead.exec("git for-each-ref --format='%(objectname) %(refname)'; git fsck --no-progress --connectivity-only >/dev/null 2>&1 && echo FSCK-OK", cwd, o));
+    const lines = o.text().split("\n");
+    const has = (rx, oid) => lines.some((l) => rx.test(l) && l.startsWith(`${oid} `));
+    assert.ok(has(/ refs\/minilfs\/[^ ]+\/heads\/feat$/, feat), `w1's feat is kept: ${o.text()}`);
+    assert.ok(has(/ refs\/tags\/v1\.0$/, tag), `v1.0 is kept: ${o.text()}`);
+    assert.ok(has(/ refs\/minilfs\/[^ ]+\/HEAD$/, detached), `w1's detached HEAD commit is kept: ${o.text()}`);
+    assert.match(o.text(), /FSCK-OK/);
+    const c = out();
+    await lead.mutate("5", "bash", () => lead.exec(`git cat-file -t ${feat} && git cat-file -t ${detached} && git cat-file -t v1.0`, cwd, c));
+    assert.equal(c.text().trim().split("\n").filter((t) => t === "commit").length, 3, c.text());
   });
 
   await step("apply never overwrites the folder's git history: a host commit meanwhile keeps its refs, files still apply", async () => {

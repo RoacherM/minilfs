@@ -265,7 +265,7 @@ try {
     const { GIT_JOIN_SCRIPT, parseJoin } = await import("../src/gitjoin.ts");
     const genv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "a", GIT_AUTHOR_EMAIL: "a@b", GIT_COMMITTER_NAME: "a", GIT_COMMITTER_EMAIL: "a@b" };
     const sh = (cwd, c) => execSync(c, { cwd, env: genv, encoding: "utf8", shell: "/bin/sh" }).trim();
-    const joinIn = (cwd, ours, theirs) => parseJoin(spawnSync("/bin/sh", ["-c", GIT_JOIN_SCRIPT, "_", ours, theirs, "refs/heads/main", "Merge w into main"], { cwd, env: genv, encoding: "utf8" }).stdout);
+    const joinIn = (cwd, ours, theirs) => parseJoin(spawnSync("/bin/bash", ["-c", GIT_JOIN_SCRIPT, "_", ours, theirs, "refs/heads/main", "Merge w into main"], { cwd, env: genv, encoding: "utf8" }).stdout);
     const repo = (name) => { const d = join(dir, "join-" + name); mkdirSync(d, { recursive: true }); sh(d, "git init -q -b main && echo a > a.txt && git add -A && git commit -qm base"); return d; };
     // diverged; the work tree holds LayerFS's merge (both files) plus one uncommitted edit
     let d = repo("div");
@@ -312,6 +312,44 @@ try {
     // HEAD on another branch: nothing is changed
     d = repo("other"); sh(d, "git checkout -q -b feat"); const h = sh(d, "git rev-parse HEAD");
     assert.equal(joinIn(d, h, h).mode, "skip");
+  });
+
+  await step("R5 R6 R13 git join: a newline in a conflicting name, a held index.lock (no half state), no filter driver runs", async () => {
+    const { execSync, spawnSync } = await import("node:child_process");
+    const { GIT_JOIN_SCRIPT, parseJoin } = await import("../src/gitjoin.ts");
+    const genv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "a", GIT_AUTHOR_EMAIL: "a@b", GIT_COMMITTER_NAME: "a", GIT_COMMITTER_EMAIL: "a@b" };
+    const sh = (cwd, c) => execSync(c, { cwd, env: genv, encoding: "utf8", shell: "/bin/bash" }).trim();
+    const joinIn = (cwd, ours, theirs) => parseJoin(spawnSync("/bin/bash", ["-c", GIT_JOIN_SCRIPT, "_", ours, theirs, "refs/heads/main", "Merge w into main"], { cwd, env: genv, encoding: "utf8" }).stdout);
+    // both sides edit `file`, plus a clean change each: git conflicts on `file`, LayerFS resolved it
+    const conflicted = (name, file) => {
+      const d = join(dir, "r5-" + name); mkdirSync(d, { recursive: true });
+      const f = file.replace(/'/g, "'\\''");
+      sh(d, `git init -q -b main && printf base > '${f}' && git add -A && git commit -qm base`);
+      sh(d, `git checkout -q -b w && printf W > '${f}' && echo w > w.txt && git add -A && git commit -qm by-w`); const theirs = sh(d, "git rev-parse HEAD");
+      sh(d, `git checkout -q main && printf L > '${f}' && echo l > l.txt && git add -A && git commit -qm by-l`); const ours = sh(d, "git rev-parse HEAD");
+      writeFileSync(join(d, file), "resolved"); writeFileSync(join(d, "w.txt"), "w\n");
+      return { d, ours, theirs };
+    };
+    // R6: the name holds a newline
+    let { d, ours, theirs } = conflicted("nl", "line1\nline2.txt");
+    let r = joinIn(d, ours, theirs);
+    assert.equal(r.mode, "worktree", JSON.stringify(r));
+    assert.equal(sh(d, "git show 'HEAD:line1\nline2.txt'"), "resolved", "the name is intact in the commit");
+    assert.deepEqual(sh(d, "git ls-tree -z --name-only HEAD").split("\0").filter(Boolean), ["l.txt", "line1\nline2.txt", "w.txt"]);
+    // R5: index.lock held -> fail, the branch ref unchanged
+    ({ d, ours, theirs } = conflicted("lock", "a.txt"));
+    writeFileSync(join(d, ".git/index.lock"), "");
+    r = joinIn(d, ours, theirs);
+    assert.equal(r.mode, "fail", JSON.stringify(r));
+    assert.equal(sh(d, "git rev-parse refs/heads/main"), ours, "the branch did not move");
+    rmSync(join(d, ".git/index.lock"));
+    // R13: a clean filter from the repo's config + .gitattributes never runs
+    ({ d, ours, theirs } = conflicted("filter", "a.txt"));
+    const marker = join(dir, "r13-pwned");
+    sh(d, `git config filter.pwn.clean 'touch ${marker}; cat' && echo '* filter=pwn' > .gitattributes`);
+    r = joinIn(d, ours, theirs);
+    assert.equal(r.mode, "worktree", JSON.stringify(r));
+    assert.equal(existsSync(marker), false, "the filter driver did not run");
   });
 
   await step("team lead alias: a finished or crashed earlier lead does not keep `lead`; a running one does", async () => {

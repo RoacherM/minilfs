@@ -808,9 +808,9 @@ export class LayerfsSession {
 
   /**
    * After a merge in which both sides changed the `git` unit: the merged `.git` is the kept side's
-   * whole (consistent refs, HEAD and index). The losing side's branch heads (loose refs and
-   * packed-refs under refs/heads) are written as `refs/minilfs/<label>/heads/<name>` in the merged
-   * Branch: its commits stay reachable (gc keeps them). The files are already merged by LayerFS, so
+   * whole (consistent refs, HEAD and index). The losing side's refs (loose refs and packed-refs) are
+   * kept in the merged Branch: branch heads as `refs/minilfs/<label>/heads/<name>`, earlier rescues
+   * `refs/minilfs/*` as they are, tags, and a detached HEAD: its commits stay reachable (gc keeps them). The files are already merged by LayerFS, so
    * the histories join with `git merge -s ours --no-commit <ref> && git add -A && git commit`
    * (verified: both parents recorded, tree = the merged files, fsck clean).
    */
@@ -842,7 +842,8 @@ export class LayerfsSession {
     const losing = unit.kept === "ours" ? theirs : ours;
     const keptName = unit.kept === "ours" ? "this Branch" : label;
     const lostName = unit.kept === "ours" ? label : "this Branch";
-    const heads = new Map<string, string>();
+    // every ref of the losing side (packed-refs, then loose refs, which win), by full name
+    const refs = new Map<string, string>();
     // packed-refs can exceed one fs.read window (2000 lines / 48 KiB): page through it
     let packed = "";
     for (let line = 1; line > 0; ) {
@@ -852,8 +853,8 @@ export class LayerfsSession {
       line = r.truncated && r.endLine ? r.endLine + 1 : 0;
     }
     for (const line of packed.split("\n")) {
-      const mm = /^([0-9a-f]{40,64}) refs\/heads\/(.+)$/.exec(line.trim());
-      if (mm) heads.set(mm[2], mm[1]);
+      const mm = /^([0-9a-f]{40,64}) (refs\/.+)$/.exec(line.trim());
+      if (mm) refs.set(mm[2], mm[1]);
     }
     const walk = async (dir: string, prefix: string) => {
       for (let pos = 0; ; ) {
@@ -863,30 +864,48 @@ export class LayerfsSession {
           if (it.type === "dir") await walk(sp, `${prefix}${it.name}/`);
           else if (it.type === "file") {
             const oid = await this.lfs.fs.read(losing, sp).then((r: any) => String(r.text ?? "").trim(), () => "");
-            if (/^[0-9a-f]{40,64}$/.test(oid)) heads.set(`${prefix}${it.name}`, oid);
+            if (/^[0-9a-f]{40,64}$/.test(oid)) refs.set(`${prefix}${it.name}`, oid);
           }
         }
         if (!page?.hasMore || !(page?.items ?? []).length) break;
         pos = page.nextPagePos ?? (pos + page.items.length);
       }
     };
-    await walk("/.git/refs/heads", "");
-    // only heads that differ from the merged result's own refs
-    const ops: any[] = [];
+    await walk("/.git/refs", "refs/");
     // the refs are named after the side they come from: the other Branch, or this session (the work branch before the merge)
     const safeLabel = (unit.kept === "ours" ? label : this.workBranch).replace(/[^A-Za-z0-9._-]/g, "-");
+    // where each ref goes in the merged .git, so nothing the losing side could reach is dropped (each
+    // merge round keeps the earlier rescues): branch heads under refs/minilfs/<label>/heads/, earlier
+    // rescues (refs/minilfs/*) at the same path, tags under their name (or refs/minilfs/<label>/tags/
+    // when the kept side has that tag at another commit), a detached HEAD as refs/minilfs/<label>/HEAD
+    const wanted: Array<[string, string]> = [];
+    for (const [ref, oid] of refs) {
+      // ref names come from the other side's .git: only plain git ref names (they are shown in a command)
+      if (!isSafeRefName(ref)) continue;
+      const mineOf = async (r: string) => (await this.gitRefOid(target, r)) ?? "";
+      if (ref.startsWith("refs/heads/")) {
+        if ((await mineOf(ref)) !== oid) wanted.push([`refs/minilfs/${safeLabel}/heads/${ref.slice("refs/heads/".length)}`, oid]);
+      } else if (ref.startsWith("refs/minilfs/")) {
+        if (!(await mineOf(ref))) wanted.push([ref, oid]);
+      } else if (ref.startsWith("refs/tags/")) {
+        const mine = await mineOf(ref);
+        if (!mine) wanted.push([ref, oid]);
+        else if (mine !== oid) wanted.push([`refs/minilfs/${safeLabel}/tags/${ref.slice("refs/tags/".length)}`, oid]);
+      }
+    }
+    const rawHead = (b: string) => this.lfs.fs.read(b, "/.git/HEAD").then((r: any) => String(r.text ?? "").trim(), () => "");
+    const lostHead = await rawHead(losing);
+    if (/^[0-9a-f]{40,64}$/.test(lostHead) && lostHead !== (await rawHead(target))) wanted.push([`refs/minilfs/${safeLabel}/HEAD`, lostHead]);
+    const ops: any[] = [];
     const kept: string[] = [];
-    for (const [name, oid] of heads) {
-      // a branch name comes from the other side's .git: only plain git ref names (it is shown in a command)
-      if (!isSafeRefName(name)) continue;
-      const mine = (await this.gitRefOid(target, `refs/heads/${name}`)) ?? "";
-      if (mine === oid) continue;
-      const refPath = `/.git/refs/minilfs/${safeLabel}/heads/${name}`;
+    for (const [ref, oid] of wanted) {
+      if ((await this.gitRefOid(target, ref)) === oid) continue;
+      const refPath = `/.git/${ref}`;
       ops.push({ op: "mkdir", path: posix.dirname(refPath) }, { op: "write", path: refPath, bytes: Buffer.from(`${oid}\n`) });
-      kept.push(`refs/minilfs/${safeLabel}/heads/${name}`);
+      kept.push(ref);
     }
     if (ops.length) {
-      const res = await this.lfs.fs.apply(target, ops, `keep ${lostName}'s git branch heads`);
+      const res = await this.lfs.fs.apply(target, ops, `keep ${lostName}'s git refs`);
       head = res.commit?.id ?? res.head ?? head;
     }
 
@@ -898,7 +917,7 @@ export class LayerfsSession {
       return null;
     });
     if (joined?.head) head = joined.head;
-    const keptRefs = kept.length ? ` Its other branch heads are kept as ${kept.slice(0, 3).join(", ")}${kept.length > 3 ? ", …" : ""}.` : "";
+    const keptRefs = kept.length ? ` Its other refs are kept as ${kept.slice(0, 3).join(", ")}${kept.length > 3 ? ", …" : ""}.` : "";
     const what = joined?.result;
     if (what && (what.mode === "merged" || what.mode === "worktree")) {
       return { head, note: `both sides ran git; ${joined!.branch} now has a merge commit ${what.commit!.slice(0, 7)} with both sides' commits as parents${what.mode === "worktree" ? " (git saw conflicts; the commit records LayerFS's merged files)" : ""}.${keptRefs}` };
@@ -910,7 +929,7 @@ export class LayerfsSession {
     if (!kept.length) return { note: `both sides ran git; .git (refs, HEAD, index) is ${keptName}'s, ${lostName}'s branch heads were already in it${why}`, head };
     return {
       head,
-      note: `both sides ran git; .git (refs, HEAD, index) is ${keptName}'s; the histories could not be joined automatically${why}.${keptRefs} Join them in bash with \`${GIT_JOIN_HINT(kept[0])}\``,
+      note: `both sides ran git; .git (refs, HEAD, index) is ${keptName}'s; the histories could not be joined automatically${why}.${keptRefs} Join them in bash with \`${GIT_JOIN_HINT(kept.find((k) => k.includes("/heads/")) ?? kept[0])}\``,
     };
   }
 
@@ -958,7 +977,7 @@ export class LayerfsSession {
         GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0",
         GIT_AUTHOR_NAME: "minilfs", GIT_AUTHOR_EMAIL: "minilfs@localhost", GIT_COMMITTER_NAME: "minilfs", GIT_COMMITTER_EMAIL: "minilfs@localhost",
       };
-      const r = await run("/usr/bin/sandbox-exec", ["-p", profile, "/bin/sh", "-c", GIT_JOIN_SCRIPT, "minilfs-join", oOurs, oTheirs, hOurs, message], { cwd: wsPath, env, timeoutMs: 120_000 });
+      const r = await run("/usr/bin/sandbox-exec", ["-p", profile, "/bin/bash", "-c", GIT_JOIN_SCRIPT, "minilfs-join", oOurs, oTheirs, hOurs, message], { cwd: wsPath, env, timeoutMs: 120_000 });
       result = parseJoin(r.stdout.toString());
       if (result.mode === "fail") this.log(`git join: ${r.stdout.toString().slice(-300)} ${r.stderr.slice(-300)}`);
     });

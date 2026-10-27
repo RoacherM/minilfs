@@ -659,14 +659,14 @@ try {
     orphan(shared, 989);
     orphan(mine, 988);
     await new Promise((res) => setTimeout(res, 300));
-    assert.match(pgrep("sleep 989").stdout, /\d/, "the shared-cache orphan started");
+    assert.match(pgrep("^sleep 989$").stdout, /\d/, "the shared-cache orphan started");
     await call;
     await new Promise((res) => setTimeout(res, 300));
     try {
-      assert.match(pgrep("sleep 989").stdout, /\d/, "the process in the shared cache dir survives another call");
-      assert.equal(pgrep("sleep 988").stdout.trim(), "", "the orphan in this branch's scratch dir is reaped");
+      assert.match(pgrep("^sleep 989$").stdout, /\d/, "the process in the shared cache dir survives another call");
+      assert.equal(pgrep("^sleep 988$").stdout.trim(), "", "the orphan in this branch's scratch dir is reaped");
     } finally {
-      spawnSync("pkill", ["-f", "sleep 98[89]"]);
+      spawnSync("pkill", ["-f", "^sleep 98[89]$"]);
     }
   });
 
