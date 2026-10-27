@@ -26,10 +26,13 @@ export {
   decideGitPath,
   gitChangeSummary,
   gitPathKind,
+  gitSig,
   indexEntries,
+  parseIndexEntries,
   isProtectedPath,
   MERGE_UNITS,
   type GitPathKind,
+  type IndexEntry,
 } from "../gitpaths.ts";
 
 export {

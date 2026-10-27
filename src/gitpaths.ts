@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { lstatSync } from "node:fs";
+import { join } from "node:path";
 
 // Paths inside a git directory (`.git/` at any depth) and what minilfs lets a Branch do with them.
 //
@@ -110,26 +112,71 @@ export function gitPathKind(rel: string): GitPathKind {
 }
 
 const BODY_RX = new RegExp(`^(${GIT_ALLOWED_BODY})$`);
-const NESTED_RX = new RegExp(`^((modules/.+?/)|(worktrees/[^/]+/))(${GIT_ALLOWED_BODY})$`);
 
 /**
- * The path below its own git directory: `modules/a/b/refs/x` -> `refs/x`. A top-level entry wins
- * (`refs/heads/modules/x` is a ref); else the shortest `modules/<name>/` prefix, so
- * `modules/x/logs/refs/heads/main` is a log of `modules/x`, not a ref.
+ * Every way to read `inner` (a path below a top-level `.git`) as `<git dir>/<tail>`, shortest git
+ * dir first: the top-level dir, a linked worktree's, and each `modules/<name>/` split (a submodule
+ * name may contain `/`, so `modules/a/refs/refs/heads/main` is both `modules/a` + `refs/refs/...`
+ * and the submodule `a/refs` + `refs/heads/main`).
  */
-function innerOfGitDir(inner: string): string {
-  if (BODY_RX.test(inner)) return inner;
-  const m = NESTED_RX.exec(inner);
-  return m ? inner.slice(m[1].length) : inner;
+function candidateGitDirs(dir: string, inner: string): Array<{ gitDir: string; tail: string }> {
+  const out: Array<{ gitDir: string; tail: string }> = [];
+  if (BODY_RX.test(inner)) out.push({ gitDir: dir, tail: inner });
+  const wt = /^worktrees\/([^/]+)\/(.+)$/.exec(inner);
+  if (wt && BODY_RX.test(wt[2])) out.push({ gitDir: `${dir}/worktrees/${wt[1]}`, tail: wt[2] });
+  if (inner.startsWith("modules/")) {
+    const parts = inner.split("/");
+    for (let k = 2; k < parts.length; k++) {
+      const tail = parts.slice(k).join("/");
+      if (BODY_RX.test(tail)) out.push({ gitDir: `${dir}/${parts.slice(0, k).join("/")}`, tail });
+    }
+  }
+  return out;
 }
 
-/** The git directory (relative path, e.g. `.git` or `.git/modules/x`) a git path belongs to. */
-export function gitDirOf(rel: string): string | null {
+/** a git directory on disk: HEAD a file, objects/ and refs/ folders */
+function hasGitLayout(abs: string): boolean {
+  try {
+    return lstatSync(join(abs, "HEAD")).isFile() && lstatSync(join(abs, "objects")).isDirectory() && lstatSync(join(abs, "refs")).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The git dir a path belongs to. With `cwd`, the most specific candidate that is a git dir on disk.
+ * Else (or none is) by name: the most specific candidate that is not inside a namespace of a shorter
+ * one, so `modules/x/logs/refs/heads/main` is a log of `modules/x` and `modules/x/refs/heads/index`
+ * a branch of `modules/x`, while `modules/a/refs/refs/heads/main` is a ref of the submodule `a/refs`.
+ */
+function pickGitDir(dir: string, inner: string, cwd?: string): { gitDir: string; tail: string } | null {
+  const all = candidateGitDirs(dir, inner);
+  if (!all.length) return null;
+  if (cwd) {
+    const onDisk = all.filter((c) => hasGitLayout(join(cwd, c.gitDir)));
+    if (onDisk.length) return onDisk[onDisk.length - 1];
+  }
+  const inNamespace = (c: { gitDir: string }, i: number) => all.slice(0, i).some((s) => {
+    const rel = c.gitDir.slice(s.gitDir.length + 1);
+    return /^(logs|objects|info|lfs)(\/|$)/.test(rel) || /^refs\/[^/]+/.test(rel);
+  });
+  const ok = all.filter((c, i) => i === 0 || !inNamespace(c, i));
+  return ok[ok.length - 1];
+}
+
+/** The path below its own git directory: `modules/a/b/refs/x` -> `refs/x` (see pickGitDir). */
+function innerOfGitDir(inner: string): string {
+  return pickGitDir("", inner)?.tail ?? inner;
+}
+
+/**
+ * The git directory (relative path, e.g. `.git` or `.git/modules/x`) a git path belongs to; with
+ * `cwd`, git dirs that exist there decide an ambiguous submodule name.
+ */
+export function gitDirOf(rel: string, cwd?: string): string | null {
   const g = splitGitPath(rel);
   if (!g || !g.inner) return null;
-  const tail = innerOfGitDir(g.inner);
-  const prefix = g.inner.slice(0, g.inner.length - tail.length).replace(/\/+$/, "");
-  return prefix ? `${g.dir}/${prefix}` : g.dir;
+  return pickGitDir(g.dir, g.inner, cwd)?.gitDir ?? g.dir;
 }
 
 /**
@@ -205,6 +252,16 @@ export function gitChangeSummary(paths: string[]): string {
  * this parser reads (split index, unknown version, damaged): callers then compare bytes.
  */
 export function indexEntries(buf: Buffer): string | null {
+  const out = parseIndexEntries(buf);
+  return out === null ? null : out.map(entryLine).join("\n");
+}
+
+/** One staged entry of a git index (no stat data). */
+export interface IndexEntry { mode: number; oid: string; stage: number; flags: number; path: string }
+const entryLine = (e: IndexEntry) => `${e.mode.toString(8)} ${e.oid} ${e.stage} ${e.flags} ${e.path}`;
+
+/** The entries of a git index file ([] for an empty index), or null (see indexEntries). Paths may hold any byte, `\n` too. */
+export function parseIndexEntries(buf: Buffer): IndexEntry[] | null {
   try {
     if (buf.length < 12 + 20 || buf.toString("latin1", 0, 4) !== "DIRC") return null;
     const version = buf.readUInt32BE(4);
@@ -212,7 +269,7 @@ export function indexEntries(buf: Buffer): string | null {
     const count = buf.readUInt32BE(8);
     for (const hashLen of [20, 32]) {
       const out = parseEntries(buf, version, count, hashLen);
-      if (out) return out;
+      if (out !== null) return out;
     }
     return null;
   } catch {
@@ -220,11 +277,11 @@ export function indexEntries(buf: Buffer): string | null {
   }
 }
 
-function parseEntries(buf: Buffer, version: number, count: number, hashLen: number): string | null {
+function parseEntries(buf: Buffer, version: number, count: number, hashLen: number): IndexEntry[] | null {
   const end = buf.length - hashLen; // trailing checksum
   let pos = 12;
   let prev = "";
-  const lines: string[] = [];
+  const lines: IndexEntry[] = [];
   for (let i = 0; i < count; i++) {
     const start = pos;
     if (pos + 40 + hashLen + 2 > end) return null;
@@ -256,7 +313,7 @@ function parseEntries(buf: Buffer, version: number, count: number, hashLen: numb
     }
     if (pos > end) return null;
     prev = name;
-    lines.push(`${mode.toString(8)} ${oid} ${(flags >> 12) & 3} ${ext & 0x6000} ${name}`);
+    lines.push({ mode, oid, stage: (flags >> 12) & 3, flags: ext & 0x6000, path: name });
   }
   // extensions follow; a split index ("link") keeps entries elsewhere: not comparable by entries
   while (pos + 8 <= end) {
@@ -266,7 +323,7 @@ function parseEntries(buf: Buffer, version: number, count: number, hashLen: numb
     pos += 8 + size;
   }
   if (pos !== end) return null;
-  return lines.join("\n");
+  return lines;
 }
 
 /**
@@ -277,8 +334,9 @@ export function gitSig(kind: GitPathKind, entry: { data: Buffer; mode: number } 
   if (!entry) return null;
   if ("target" in entry) return `link:${entry.target}`;
   if (kind === "index") {
-    const e = indexEntries(entry.data);
-    if (e !== null) return `index:${createHash("sha256").update(e).digest("hex")}`;
+    // NUL-terminated: a path holding "\n" cannot pass for two entries
+    const e = parseIndexEntries(entry.data);
+    if (e !== null) return `index:${createHash("sha256").update(e.map((x) => `${entryLine(x)}\0`).join("")).digest("hex")}`;
   }
   return `file:${createHash("sha256").update(entry.data).digest("hex")}:${(entry.mode & 0o111) ? "x" : "-"}`;
 }

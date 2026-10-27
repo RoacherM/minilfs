@@ -10,7 +10,7 @@ import { createProjectClient, ensureNativeDirs, initProjectClient, type NativeSp
 import { resolveExecutionDriver, type ExecutionDriver } from "./core/driver.ts";
 import { run } from "./core/exec-helper.ts";
 import { bothSpellings, buildSeatbeltProfile } from "./seatbelt.ts";
-import { decideGitPath, GIT_APPLY_ORDER, GIT_JOIN_HINT, gitChangeSummary, gitDirOf, gitPathKind, gitSig, indexEntries, isProtectedPath, isSafeRefName, MERGE_UNITS, type GitPathKind } from "./gitpaths.ts";
+import { decideGitPath, GIT_APPLY_ORDER, GIT_JOIN_HINT, gitChangeSummary, gitDirOf, gitPathKind, gitSig, isProtectedPath, parseIndexEntries, isSafeRefName, MERGE_UNITS, type GitPathKind } from "./gitpaths.ts";
 import { isOrphan, MountLeases } from "./mount-leases.ts";
 import { GIT_JOIN_SCRIPT, parseJoin, symbolicHead, type JoinResult } from "./gitjoin.ts";
 import { stopWorkers } from "./core/worker.ts";
@@ -2539,54 +2539,172 @@ async function hostState(abs: string): Promise<HostEntry | null | "other"> {
 }
 
 type GitWrite = { rel: string; git: GitPathKind; next: { kind: "file"; data: Buffer; mode: number } | { kind: "symlink"; target: string } | null; host: HostEntry | null };
-const OID_RX = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
+/**
+ * git's environment for checks on a repository: nothing inherited from this process (GIT_DIR,
+ * GIT_OBJECT_DIRECTORY, GIT_ALTERNATE_OBJECT_DIRECTORIES, GIT_INDEX_FILE, ... would point git at
+ * other objects), no global or system config or attributes, no prompt.
+ */
+const cleanGitEnv = (home = "/var/empty"): NodeJS.ProcessEnv => ({
+  PATH: process.env.PATH || "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+  HOME: home,
+  TMPDIR: "/private/tmp",
+  LANG: "C",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_ATTR_NOSYSTEM: "1",
+  GIT_TERMINAL_PROMPT: "0",
+});
+/** A ref a symbolic ref may name: under refs/, no `.`/`..` component (it is looked up as a path). */
+const isRefTarget = (r: string) => /^refs\/\S+$/.test(r) && !/(^|\/)\.\.?(\/|$)/.test(r) && !r.includes("//");
+/** Refs that must name a commit: HEAD, branch heads (and minilfs's rescues of them). */
+const wantsCommit = (inner: string) => inner === "HEAD" || inner.startsWith("refs/heads/") || /^refs\/minilfs\/[^/]+\/(heads\/|HEAD$)/.test(inner);
 
 /**
- * Why the folder cannot take these refs/HEAD/index, or null: each object they name (ref targets,
- * packed-refs lines and their peeled `^` lines, a detached HEAD, index blobs; not submodule
- * gitlinks) must already be in the folder's git directory, and each ref must parse. A ref written by
- * a file tool, or objects never added, would otherwise leave the folder's git pointing at nothing.
+ * What `name` (a ref of git dir `dir`) resolves to once `meta` is written: an oid, null (no such
+ * ref), or "loop" (more than 5 symbolic hops). Planned refs first, then the folder's loose ref, then
+ * packed-refs (the planned one, else the folder's), as git looks them up.
+ */
+async function resolveRefAfter(cwd: string, dir: string, name: string, meta: GitWrite[]): Promise<string | null | "loop"> {
+  const planned = (inner: string) => meta.find((g) => g.rel === `${dir}/${inner}`);
+  const content = (g: GitWrite) => (g.next?.kind === "file" ? g.next.data.toString("utf8") : null);
+  for (let hop = 0; hop < 5; hop++) {
+    const p = planned(name);
+    const text = p ? content(p) : await fsp.readFile(join(cwd, dir, name), "utf8").catch(() => null);
+    if (text === null) {
+      const pp = planned("packed-refs");
+      const packed = pp ? (content(pp) ?? "") : await fsp.readFile(join(cwd, dir, "packed-refs"), "utf8").catch(() => "");
+      for (const line of packed.split("\n")) {
+        const m = /^([0-9a-f]+) (\S+)$/.exec(line);
+        if (m && m[2] === name) return m[1];
+      }
+      return null;
+    }
+    const m = /^ref: (\S+)$/.exec(text.trim());
+    if (!m) return text.trim();
+    if (!isRefTarget(m[1])) return null;
+    name = m[1];
+  }
+  return "loop";
+}
+
+/**
+ * Why the folder cannot take these refs/HEAD/index, or null. In each git dir (as the folder has it):
+ * every ref parses (oids of the repository's hash length), branch heads and HEAD name commits, index
+ * entries name blobs (not gitlinks, not intent-to-add), packed-refs' peeled `^` lines are what their
+ * tag peels to, symbolic refs resolve (HEAD may be unborn only in a repository without commits), and
+ * everything the new commits and tags reach is there (`rev-list --objects --missing=print`, minus
+ * what the folder's refs already reach). git runs with cleanGitEnv, no hooks, no fsmonitor. A ref
+ * written by a file tool, or objects never added, would otherwise leave the folder's git broken.
  */
 async function gitObjectsMissing(cwd: string, meta: GitWrite[]): Promise<string | null> {
-  const byDir = new Map<string, Set<string>>();
+  type Want = "commit" | "blob" | "any";
+  type Dir = { want: Map<string, Set<Want>>; tips: Set<string>; peeled: Array<[string, string]>; symrefs: Array<[string, string]>; addsHeads: boolean };
+  const byDir = new Map<string, Dir>();
   for (const g of meta) {
     if (g.git === "soft" || !g.next || g.next.kind !== "file") continue;
-    const dir = gitDirOf(g.rel);
+    const dir = gitDirOf(g.rel, cwd);
     if (!dir) continue;
-    const oids = byDir.get(dir) ?? new Set<string>();
-    byDir.set(dir, oids);
+    const inner = g.rel.slice(dir.length + 1);
+    let d = byDir.get(dir);
+    if (!d) byDir.set(dir, (d = { want: new Map(), tips: new Set(), peeled: [], symrefs: [], addsHeads: false }));
+    const need = (oid: string, w: Want) => d!.want.set(oid, (d!.want.get(oid) ?? new Set<Want>()).add(w));
     const text = g.next.data.toString("utf8");
     if (g.git === "index") {
-      const entries = indexEntries(g.next.data);
+      const entries = parseIndexEntries(g.next.data);
       if (entries === null) return `${g.rel} cannot be read`;
-      for (const line of entries ? entries.split("\n") : []) {
-        const [mode, oid] = line.split(" ");
-        if (mode !== "160000") oids.add(oid);
+      for (const e of entries) {
+        if (e.mode === 0o160000 || e.flags & 0x2000) continue; // a submodule's commit; intent-to-add (no blob yet)
+        need(e.oid, e.mode === 0o040000 ? "any" : "blob"); // sparse index: a directory entry names a tree
       }
-    } else if (g.rel.endsWith("/packed-refs") || g.rel === "packed-refs") {
+    } else if (inner === "packed-refs") {
+      let last: string | null = null;
       for (const line of text.split("\n")) {
         if (!line || line.startsWith("#")) continue;
-        const m = /^([0-9a-f]+) \S+$/.exec(line) ?? /^\^([0-9a-f]+)$/.exec(line);
-        if (!m || !OID_RX.test(m[1])) return `${g.rel} has a malformed line`;
-        oids.add(m[1]);
+        const peel = /^\^([0-9a-f]+)$/.exec(line);
+        if (peel) {
+          if (!last) return `${g.rel} has a malformed line`;
+          d.peeled.push([last, peel[1]]);
+          need(peel[1], "any");
+          last = null;
+          continue;
+        }
+        const m = /^([0-9a-f]+) (\S+)$/.exec(line);
+        if (!m || !isRefTarget(m[2])) return `${g.rel} has a malformed line`;
+        need(m[1], wantsCommit(m[2]) ? "commit" : "any");
+        d.tips.add(m[1]);
+        if (m[2].startsWith("refs/heads/")) d.addsHeads = true;
+        last = m[1];
       }
     } else {
       const t = text.trim();
-      if (/^ref: refs\/\S+$/.test(t)) continue; // symbolic: names a ref, not an object
-      if (!OID_RX.test(t)) return `${g.rel} is not a ref`;
-      oids.add(t);
+      if (t.startsWith("ref:")) {
+        const m = /^ref: (\S+)$/.exec(t);
+        if (!m || !isRefTarget(m[1])) return `${g.rel} is not a ref`;
+        d.symrefs.push([inner, m[1]]);
+        continue;
+      }
+      if (!/^[0-9a-f]+$/.test(t)) return `${g.rel} is not a ref`;
+      need(t, wantsCommit(inner) ? "commit" : "any");
+      d.tips.add(t);
+      if (inner.startsWith("refs/heads/")) d.addsHeads = true;
     }
   }
-  for (const [dir, oids] of byDir) {
-    if (!oids.size) continue;
-    const r = await run("git", ["--git-dir", join(cwd, dir), "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "cat-file", "--batch-check"], {
-      input: [...oids].join("\n") + "\n",
-      timeoutMs: 60_000,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-    }).catch((e) => ({ code: null, stdout: Buffer.alloc(0), stderr: String(e?.message ?? e) }));
-    if (r.code !== 0) return `git cat-file failed in ${dir}: ${r.stderr.trim().slice(0, 120)}`;
-    const missing = r.stdout.toString().split("\n").filter((l) => / missing$/.test(l)).map((l) => l.split(" ")[0].slice(0, 12));
-    if (missing.length) return `${missing.length} missing in ${dir}: ${missing.slice(0, 3).join(", ")}${missing.length > 3 ? ", …" : ""}`;
+  for (const [dir, d] of byDir) {
+    const git = (args: string[], input?: string) =>
+      run("git", ["--git-dir", join(cwd, dir), "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args], { cwd, env: cleanGitEnv(), input, timeoutMs: 120_000 })
+        .catch((e) => ({ code: null, stdout: Buffer.alloc(0), stderr: String(e?.message ?? e) }));
+    const fmt = await git(["rev-parse", "--show-object-format"]);
+    if (fmt.code !== 0) return `git failed in ${dir}: ${fmt.stderr.trim().slice(0, 120)}`;
+    const oidLen = fmt.stdout.toString().trim() === "sha256" ? 64 : 40;
+    const isOid = (o: string) => o.length === oidLen && /^[0-9a-f]+$/.test(o);
+    // symbolic refs resolve once everything is written
+    let unborn: string | null = null;
+    for (const [inner, target] of d.symrefs) {
+      const r = await resolveRefAfter(cwd, dir, target, meta);
+      if (r === "loop") return `${dir}/${inner}: symbolic ref loop at ${target}`;
+      if (r === null) {
+        if (inner !== "HEAD") return `${dir}/${inner} names ${target}, which does not exist`;
+        unborn = target;
+        continue;
+      }
+      if (!isOid(r)) return `${dir}/${inner} names ${target}, which is not a ref`;
+      d.want.set(r, (d.want.get(r) ?? new Set<Want>()).add(inner === "HEAD" ? "commit" : "any"));
+      d.tips.add(r);
+    }
+    const oids = [...d.want.keys()];
+    const bad = oids.find((o) => !isOid(o));
+    if (bad) return `${dir} names ${bad.slice(0, 16)}…, not a ${oidLen}-digit object id`;
+    // every object: there, of the right type; a peeled line is its tag's target
+    const types = new Map<string, string>();
+    const queries = [...oids, ...d.peeled.map(([tag]) => `${tag}^{}`)];
+    if (queries.length) {
+      const r = await git(["cat-file", "--batch-check=%(objectname) %(objecttype)"], queries.join("\n") + "\n");
+      if (r.code !== 0) return `git cat-file failed in ${dir}: ${r.stderr.trim().slice(0, 120)}`;
+      const lines = r.stdout.toString().split("\n");
+      const missing: string[] = [];
+      const wrong: string[] = [];
+      queries.forEach((q, i) => {
+        const [name, type] = (lines[i] ?? "").split(" ");
+        if (!type || type === "missing") { missing.push(q.slice(0, 12)); return; }
+        if (i < oids.length) {
+          types.set(q, type);
+          for (const w of d.want.get(q)!) if (w !== "any" && w !== type) wrong.push(`${q.slice(0, 12)} is a ${type}, not a ${w}`);
+        } else if (name !== d.peeled[i - oids.length][1]) wrong.push(`${q.slice(0, 12)} does not peel to ${d.peeled[i - oids.length][1].slice(0, 12)}`);
+      });
+      if (missing.length) return `${missing.length} missing in ${dir}: ${missing.slice(0, 3).join(", ")}${missing.length > 3 ? ", …" : ""}`;
+      if (wrong.length) return `${dir}: ${wrong.slice(0, 3).join(", ")}${wrong.length > 3 ? ", …" : ""}`;
+    }
+    if (unborn) {
+      const any = d.addsHeads ? null : await git(["rev-list", "-n", "1", "--all"]);
+      if (!any || any.code !== 0 || any.stdout.toString().trim()) return `${dir}/HEAD names ${unborn}, which does not exist`;
+    }
+    // everything the new commits and tags reach (their parents, trees, blobs), beyond what the folder's refs reach
+    const tips = [...d.tips].filter((o) => types.get(o) === "commit" || types.get(o) === "tag");
+    if (tips.length) {
+      const r = await git(["rev-list", "--objects", "--missing=print", "--stdin"], [...tips, "--not", "--all", ""].join("\n"));
+      const lost = r.stdout.toString().split("\n").filter((l) => l.startsWith("?")).map((l) => l.slice(1, 13));
+      if (r.code !== 0 || lost.length) return `missing reachable objects in ${dir}: ${lost.slice(0, 3).join(", ") || r.stderr.trim().slice(0, 120)}`;
+    }
   }
   return null;
 }

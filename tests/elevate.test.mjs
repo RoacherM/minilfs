@@ -223,6 +223,46 @@ try {
     assert.notEqual(core.indexEntries(readFileSync(join(g, ".git/index"))), before, "staged content change: different entries");
   });
 
+  await step("S11 index entries: an empty index parses as []; a path holding a newline stays one entry with its real oid", async () => {
+    const { execSync } = await import("node:child_process");
+    const { readFileSync } = await import("node:fs");
+    const g = join(dir, "s11");
+    mkdirSync(g, { recursive: true });
+    const git = (c) => execSync(`git ${c}`, { cwd: g, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" } }).trim();
+    git("init -q");
+    git("read-tree --empty");
+    const empty = readFileSync(join(g, ".git/index"));
+    assert.deepEqual(core.parseIndexEntries(empty), []);
+    assert.equal(core.indexEntries(empty), "", "an empty index is not unreadable");
+    assert.match(core.gitSig("index", { data: empty, mode: 0o644 }), /^index:/);
+    const name = `line1\n100644 ${"f".repeat(40)} 0 0 bogus`;
+    writeFileSync(join(g, name), "x\n");
+    git("add -A");
+    const e = core.parseIndexEntries(readFileSync(join(g, ".git/index")));
+    assert.equal(e.length, 1);
+    assert.equal(e[0].path, name);
+    assert.equal(e[0].oid, git("hash-object --stdin <<< x"), "the real blob, not the oid inside the name");
+    assert.notEqual(e[0].oid, "f".repeat(40));
+  });
+
+  await step("S9 gitDirOf: a submodule named a/refs is its own git dir (on disk and by name); a submodule's reflog and odd branch names stay in it", async () => {
+    const { gitDirOf } = await import("../src/gitpaths.ts");
+    const t = join(dir, "s9");
+    for (const d of [".git/modules/a/refs/objects", ".git/modules/a/refs/refs/heads", ".git/modules/x/objects", ".git/modules/x/refs/heads", ".git/modules/x/logs/refs/heads"]) mkdirSync(join(t, d), { recursive: true });
+    writeFileSync(join(t, ".git/modules/a/refs/HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(t, ".git/modules/x/HEAD"), "ref: refs/heads/main\n");
+    assert.equal(gitDirOf(".git/modules/a/refs/refs/heads/main", t), ".git/modules/a/refs");
+    assert.equal(gitDirOf(".git/modules/a/refs/refs/heads/main"), ".git/modules/a/refs");
+    assert.equal(gitDirOf(".git/modules/x/logs/refs/heads/main", t), ".git/modules/x");
+    assert.equal(gitDirOf(".git/modules/x/logs/refs/heads/main"), ".git/modules/x");
+    assert.equal(gitDirOf(".git/modules/x/refs/heads/index"), ".git/modules/x", "a branch named index");
+    assert.equal(gitDirOf(".git/modules/x/refs/heads/main", t), ".git/modules/x");
+    assert.equal(gitDirOf(".git/refs/heads/modules/x"), ".git");
+    assert.equal(gitDirOf("sub/.git/worktrees/w/HEAD"), "sub/.git/worktrees/w");
+    assert.equal(core.gitPathKind(".git/modules/a/refs/index"), "index", "the index of submodule a/refs");
+    assert.equal(core.gitPathKind(".git/modules/x/refs/heads/index"), "ref");
+  });
+
   await step("config: a bad number is a start problem, never NaN; new defaults fit a full-tree import", async () => {
     const { resolveConfig } = await import("../src/config.ts");
     const c = resolveConfig({ MINILFS_INIT_TIMEOUT_MS: "5min", MINILFS_MAX_IMPORT_FILES: "-1" });

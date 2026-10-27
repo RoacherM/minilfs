@@ -1217,6 +1217,64 @@ try {
     assert.equal(spawnSync("git", ["-C", cwd, "fsck", "--no-progress"]).status, 0, "git fsck clean");
   });
 
+  await step("S6 apply checks what refs name: a blob as a branch, a commit whose parent is missing (alternates in the environment do not count), HEAD on a missing branch", async () => {
+    const repo = () => {
+      const cwd = project();
+      const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+      g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+      return { cwd, g, head: g("rev-parse", "HEAD").stdout.trim() };
+    };
+    const fsckOk = (cwd) => spawnSync("git", ["-C", cwd, "fsck", "--no-progress", "--connectivity-only"]).status === 0;
+    // 1. a blob's oid in refs/heads/main
+    let { cwd, g, head } = repo();
+    let s = await open(cwd, "s6a");
+    await s.mutate("1", "write", () => s.writeFile(join(cwd, ".git/refs/heads/main"), `${g("rev-parse", "HEAD:a.txt").stdout.trim()}\n`));
+    let ap = await s.apply();
+    assert.match(ap.warnings.join("\n"), /is a blob, not a commit/, ap.warnings.join("\n"));
+    assert.equal(g("rev-parse", "refs/heads/main").stdout.trim(), head, "host ref unchanged");
+    assert.ok(fsckOk(cwd));
+    // 2. a commit whose parent exists only in another repository, named by the environment's alternates
+    ({ cwd, g, head } = repo());
+    const other = join(base, `s6-other-${n}`);
+    mkdirSync(other, { recursive: true });
+    const go = (...a) => spawnSync("git", ["-C", other, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    go("init", "-q"); go("commit", "-q", "--allow-empty", "-m", "elsewhere");
+    const parent = go("rev-parse", "HEAD").stdout.trim();
+    s = await open(cwd, "s6b");
+    const o = out();
+    await s.mutate("2", "bash", () => s.exec(`t=$(git rev-parse 'HEAD^{tree}') && c=$(printf 'tree %s\\nparent %s\\nauthor t <t@t> 1 +0000\\ncommitter t <t@t> 1 +0000\\n\\norphan\\n' $t ${parent} | git hash-object -t commit -w --stdin) && git update-ref refs/heads/main $c && echo $c`, cwd, o));
+    assert.match(o.text().trim(), /^[0-9a-f]{40}$/, o.text());
+    process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES = join(other, ".git/objects");
+    try { ap = await s.apply(); } finally { delete process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES; }
+    assert.match(ap.warnings.join("\n"), /missing reachable objects/, ap.warnings.join("\n"));
+    assert.equal(g("rev-parse", "refs/heads/main").stdout.trim(), head, "host ref unchanged");
+    assert.ok(fsckOk(cwd));
+    // 3. HEAD on a branch that does not exist
+    ({ cwd, g, head } = repo());
+    s = await open(cwd, "s6c");
+    await s.mutate("3", "write", () => s.writeFile(join(cwd, ".git/HEAD"), "ref: refs/heads/no-such-branch\n"));
+    ap = await s.apply();
+    assert.match(ap.warnings.join("\n"), /no-such-branch, which does not exist/, ap.warnings.join("\n"));
+    assert.equal(readFileSync(join(cwd, ".git/HEAD"), "utf8"), "ref: refs/heads/main\n", "host HEAD unchanged");
+    assert.ok(fsckOk(cwd));
+  });
+
+  await step("S11 apply takes an empty index (git rm --cached -r .) and an index entry whose path holds a newline", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+    const s = await open(cwd, "s11");
+    await s.mutate("1", "bash", () => s.exec("git rm -r -q --cached .", cwd, out()));
+    let ap = await s.apply();
+    assert.deepEqual(ap.warnings, [], ap.warnings.join("; "));
+    assert.equal(g("ls-files").stdout, "", "the folder's index is empty");
+    const name = `line1\n100644 ${"f".repeat(40)} 0 0 bogus`;
+    await s.mutate("2", "bash", () => s.exec(`printf x > "$(printf 'line1\\n100644 ${"f".repeat(40)} 0 0 bogus')" && git add -A`, cwd, out()));
+    ap = await s.apply();
+    assert.deepEqual(ap.warnings, [], ap.warnings.join("; "));
+    assert.ok(g("ls-files", "-z").stdout.split("\0").includes(name), "the entry reached the folder's index");
+  });
+
   await step("too-large first import is refused before copying, naming the largest folders", async () => {
     const cwd = project();
     mkdirSync(join(cwd, "big"));
