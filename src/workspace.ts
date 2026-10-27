@@ -166,6 +166,26 @@ const OUTSIDE_SECRET_PATTERNS = [
   ".netrc", ".git-credentials", ".npmrc", ".pypirc", ".pi/agent/auth.json", ".epi/pi/auth.json", "auth.json",
 ];
 const sha = (b: Buffer | string) => createHash("sha256").update(b).digest("hex");
+/**
+ * The outside-read helper (run under sandbox-exec): `<op> <path>`; prints the bytes, `1`/`0`, or
+ * NUL-separated names; on failure prints `<ERRNO>:<message>` to stderr. sysopen needs
+ * file-read-data (unlike stat), so Seatbelt's denial applies to directories too; O_NONBLOCK: a FIFO
+ * never hangs the call.
+ */
+const OUTSIDE_READ_PL = String.raw`
+use Fcntl qw(O_RDONLY O_NONBLOCK);
+my ($op, $p) = @ARGV;
+sub fail { my ($c) = grep { $!{$_} } keys %!; print STDERR (($c || "EACCES") . ":$!\n"); exit 1 }
+binmode(STDOUT);
+if ($op eq "readdir") { opendir(my $d, $p) or fail(); print join("\0", sort grep { $_ ne "." && $_ ne ".." } readdir($d)); exit 0 }
+sysopen(my $f, $p, O_RDONLY | O_NONBLOCK) or fail();
+if ($op eq "isDir") { print((-d $f) ? "1" : "0"); exit 0 }
+if ($op eq "read") {
+  if (-d $f) { print STDERR "EISDIR:Is a directory\n"; exit 1 }
+  binmode($f); local $/; my $d = <$f>; fail() if !defined $d; print $d;
+}
+exit 0;
+`;
 
 /**
  * Native LayerFS v1.1.0 Session (official @layerfs/agent, pure sandbox model):
@@ -1248,9 +1268,36 @@ export class LayerfsSession {
     return real;
   }
 
+  /** Seatbelt profile for outside reads: minilfs's root and the bundle denied whole (nothing re-allowed), secrets as for bash. */
+  private outsideReadProfile(): string {
+    this._outsideReadProfile ??= buildSeatbeltProfile({
+      wsPath: "/dev/null", hostCwd: this.cwd, scratchDir: "/dev/null", configRoot: this.config.root, extraDenyRoots: [this.config.bundle],
+      excludes: this.config.excludes, outsideSecrets: OUTSIDE_SECRET_PATTERNS, network: "deny",
+    });
+    return this._outsideReadProfile;
+  }
+  private _outsideReadProfile: string | null = null;
+
+  /**
+   * Does one outside read in a short-lived process under Seatbelt. resolveOutsideRead alone is
+   * check-then-use: an ancestor swapped for a symlink between the check and the open would carry
+   * the read into minilfs's root; the kernel checks the path it actually opens.
+   */
+  private async runOutsideRead(op: "read" | "access" | "isDir" | "readdir", hostPath: string): Promise<Buffer> {
+    await this.resolveOutsideRead(hostPath); // fast refusal, also for paths that do not exist yet
+    const abs = resolve(this.cwd, hostPath); // not the realpath: the kernel resolves symlinks at open
+    const r = await run("/usr/bin/sandbox-exec", ["-p", this.outsideReadProfile(), "/usr/bin/perl", "-e", OUTSIDE_READ_PL, op, abs], {
+      env: { PATH: "/usr/bin:/bin", LANG: "C" }, timeoutMs: 120_000,
+    });
+    if (r.code === 0) return r.stdout;
+    const m = /^([A-Z][A-Z0-9]*):(.*)$/m.exec(r.stderr);
+    const code = m ? (m[1] === "EPERM" ? "EACCES" : m[1]) : "EIO";
+    throw Object.assign(new Error(`${code}: ${m ? m[2] : r.stderr.trim().slice(0, 200) || `exit ${r.code}`} (${hostPath})`), { code });
+  }
+
   async readFile(hostPath: string): Promise<Buffer> {
     const sp = this.toStorePath(hostPath);
-    if (!sp) return fsp.readFile(await this.resolveOutsideRead(hostPath));
+    if (!sp) return this.runOutsideRead("read", hostPath);
     return this.readBytesAtRef(this.workBranch, sp, hostPath);
   }
 
@@ -1258,7 +1305,8 @@ export class LayerfsSession {
     const sp = this.toStorePath(hostPath);
     if (!sp) {
       if (write) this.mustStorePath(hostPath);
-      return fsp.access(await this.resolveOutsideRead(hostPath), fsc.R_OK);
+      await this.runOutsideRead("access", hostPath);
+      return;
     }
     const rel = sp.replace(/^\/+/, "");
     if (rel && isExcludedPath(rel, this.config.excludes)) throw enoent(hostPath, "not accessible");
@@ -1279,8 +1327,7 @@ export class LayerfsSession {
     const sp = this.toStorePath(hostPath);
     if (!sp) {
       // a denied path does not exist for the agent (no EACCES that would confirm it is there)
-      const real = await this.resolveOutsideRead(hostPath).catch(() => null);
-      return real !== null && fsp.access(real).then(() => true, () => false);
+      return this.access(hostPath, false).then(() => true, () => false);
     }
     const rel = sp.replace(/^\/+/, "");
     if (rel && isExcludedPath(rel, this.config.excludes)) return false;
@@ -1298,7 +1345,7 @@ export class LayerfsSession {
 
   async isDirectory(hostPath: string): Promise<boolean> {
     const sp = this.toStorePath(hostPath);
-    if (!sp) return (await fsp.stat(await this.resolveOutsideRead(hostPath))).isDirectory();
+    if (!sp) return (await this.runOutsideRead("isDir", hostPath)).toString() === "1";
     const rel = sp.replace(/^\/+/, "");
     if (rel && isExcludedPath(rel, this.config.excludes)) throw enoent(hostPath, "no such file or directory");
     const st = await this.lfs.fs.stat(this.workBranch, sp).catch(() => null);
@@ -1316,7 +1363,10 @@ export class LayerfsSession {
 
   async readdir(hostPath: string): Promise<string[]> {
     const sp = this.toStorePath(hostPath);
-    if (!sp) return fsp.readdir(await this.resolveOutsideRead(hostPath));
+    if (!sp) {
+      const b = await this.runOutsideRead("readdir", hostPath);
+      return b.length ? b.toString("utf8").split("\0") : [];
+    }
     try {
       const names: string[] = [];
       for (let pos = 0; ; ) {

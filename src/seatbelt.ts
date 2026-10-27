@@ -8,6 +8,8 @@ export interface SeatbeltOptions {
   hostCwd: string;
   scratchDir: string;
   configRoot?: string;
+  /** more folders denied like configRoot (read and write), e.g. the bundle for the file tools' outside reads */
+  extraDenyRoots?: string[];
   excludes: string[];
   outsideSecrets: string[];
   network: "allow" | "localhost" | "deny";
@@ -149,13 +151,14 @@ function escapeLiteral(s: string): string {
  *    directory metadata traversal allowed.
  */
 export function buildSeatbeltProfile(options: SeatbeltOptions): string {
-  const { wsPath, hostCwd, scratchDir, configRoot, excludes, outsideSecrets, network, logTag } = options;
+  const { wsPath, hostCwd, scratchDir, configRoot, extraDenyRoots, excludes, outsideSecrets, network, logTag } = options;
 
   const wsSpellings = bothSpellings(wsPath);
   const hostSpellings = bothSpellings(hostCwd);
   const scratchSpellings = bothSpellings(scratchDir);
   const homeSpellings = bothSpellings(homedir());
   const configSpellings = configRoot ? bothSpellings(configRoot) : [];
+  const denyRootSpellings = [...configSpellings, ...(extraDenyRoots ?? []).filter(Boolean).flatMap((d) => bothSpellings(d))];
 
   const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -192,15 +195,15 @@ export function buildSeatbeltProfile(options: SeatbeltOptions): string {
   }
   lines.push("");
 
-  // 2. If configRoot: (deny file-read* file-write* (subpath configRoot))
-  if (configSpellings.length > 0) {
+  // 2. If configRoot (or extraDenyRoots): (deny file-read* file-write* (subpath configRoot))
+  if (denyRootSpellings.length > 0) {
     lines.push(";; 2. Deny read & write on configRoot");
-    const denies = configSpellings.map((r) => `  (subpath "${escapeLiteral(r)}")`);
+    const denies = denyRootSpellings.map((r) => `  (subpath "${escapeLiteral(r)}")`);
     lines.push(`(deny file-read* file-write*\n${denies.join("\n")}\n)`);
   }
 
   // 3. (allow file-read* (subpath wsPath) (subpath scratchDir))
-  if (configSpellings.length > 0) {
+  if (denyRootSpellings.length > 0) {
     lines.push(";; 3. Re-allow file-read* for wsPath and scratchDir inside configRoot");
     const readAllows: string[] = [];
     for (const w of wsSpellings) readAllows.push(`  (subpath "${escapeLiteral(w)}")`);
@@ -371,7 +374,7 @@ export function buildSeatbeltProfile(options: SeatbeltOptions): string {
     if (!rx) continue;
     const anchored = pat.startsWith("/") || pat.includes("/");
     // outside the project: still never inside minilfs state (other projects' Workspaces) or home secrets
-    const guard = [...configSpellings, ...homeSecretDenies.length ? homeSpellings.flatMap((h) => outsideSecrets.map((sec) => join(h, sec))) : []]
+    const guard = [...denyRootSpellings, ...homeSecretDenies.length ? homeSpellings.flatMap((h) => outsideSecrets.map((sec) => join(h, sec))) : []]
       .map((d) => `(require-not (subpath "${escapeLiteral(d)}"))`).join(" ");
     if (!anchored) reRead.push(guard ? `  (require-all (regex #"^/(.*/)?${rx}$") ${guard})` : `  (regex #"^/(.*/)?${rx}$")`);
     for (const base of [...new Set([...hostSpellings, ...wsSpellings])]) {

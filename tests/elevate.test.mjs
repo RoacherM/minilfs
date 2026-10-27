@@ -417,6 +417,64 @@ try {
       assert.equal(await s.exists(join(t, "link-to-endpoint")), false);
       assert.equal((await s.readFile(join(t, "notes.md"))).toString(), "ok\n", "other outside files stay readable");
       assert.equal(await s.exists(join(t, "notes.md")), true);
+      // S2: APFS is case-insensitive; a case variant of the root (or a missing child under one) is the root
+      const upRoot = join(t, "ROOT");
+      for (const p of [endpoint.replace("/worker/", "/WORKER/"), join(upRoot, "worker", "b1", "endpoint.json"), join(upRoot, "worker", "nope", "endpoint.json")]) {
+        await assert.rejects(s.readFile(p), denied, p);
+        await assert.rejects(s.access(p), denied, p);
+        assert.equal(await s.exists(p), false, p);
+      }
+      for (const p of [join(upRoot, "WORKER"), join(root, "Worker")]) {
+        await assert.rejects(s.readdir(p), denied, p);
+        await assert.rejects(s.isDirectory(p), denied, p);
+      }
+    } finally { rmSync(t, { recursive: true, force: true }); }
+  });
+  await step("S1 outside reads are checked by the kernel: an ancestor swapped for a symlink to the root (or ~/.ssh) after the check is refused", async () => {
+    const { resolveConfig } = await import("../src/config.ts");
+    const { symlinkSync } = await import("node:fs");
+    const { homedir } = await import("node:os");
+    const t = `/tmp/minilfs-s1-${Date.now().toString(36)}`;
+    const root = join(t, "root"), wdir = join(root, "worker", "b1");
+    mkdirSync(wdir, { recursive: true }); mkdirSync(join(t, "proj")); writeFileSync(join(wdir, "endpoint.json"), '{"secret":"s"}');
+    const flip = join(t, "flip");
+    try {
+      const s = new ws.LayerfsSession(join(t, "proj"), "s1", { ...resolveConfig({}), root });
+      // the race, made deterministic: `flip` is a harmless folder while the path is checked, and a
+      // symlink to `to` right after (an agent's bash can do this between the check and the read)
+      let to = wdir;
+      const check = s.resolveOutsideRead.bind(s);
+      s.resolveOutsideRead = async (p) => {
+        const r = await check(p);
+        rmSync(flip, { recursive: true, force: true });
+        symlinkSync(to, flip);
+        return r;
+      };
+      const arm = (target) => {
+        to = target;
+        rmSync(flip, { recursive: true, force: true });
+        mkdirSync(flip);
+        writeFileSync(join(flip, "endpoint.json"), "harmless");
+      };
+      const denied = (e) => e.code === "EACCES";
+      arm(wdir); await assert.rejects(s.readFile(join(flip, "endpoint.json")), denied, "readFile");
+      arm(wdir); await assert.rejects(s.access(join(flip, "endpoint.json")), denied, "access");
+      arm(wdir); assert.equal(await s.exists(join(flip, "endpoint.json")), false, "exists");
+      arm(join(root, "worker")); await assert.rejects(s.readdir(flip), denied, "readdir");
+      arm(join(root, "worker")); await assert.rejects(s.isDirectory(flip), denied, "isDirectory");
+      if (existsSync(join(homedir(), ".ssh"))) { arm(join(homedir(), ".ssh")); await assert.rejects(s.readdir(flip), denied, "readdir ~/.ssh"); }
+      // unhooked: ordinary outside reads still work through the kernel-checked path
+      s.resolveOutsideRead = check;
+      arm(wdir);
+      assert.equal((await s.readFile(join(flip, "endpoint.json"))).toString(), "harmless");
+      assert.deepEqual(await s.readdir(flip), ["endpoint.json"]);
+      assert.equal(await s.isDirectory(flip), true);
+      assert.equal(await s.isDirectory(join(flip, "endpoint.json")), false);
+      assert.equal(await s.exists(join(flip, "nope")), false);
+      await assert.rejects(s.readFile(join(flip, "nope")), (e) => e.code === "ENOENT");
+      await assert.rejects(s.readFile(flip), (e) => e.code === "EISDIR");
+      writeFileSync(join(t, "empty"), "");
+      assert.equal((await s.readFile(join(t, "empty"))).length, 0);
     } finally { rmSync(t, { recursive: true, force: true }); }
   });
   await step("R14 prelude timeout: 124 only when the limit fired, a command's own SIGTERM exit stays 143", async () => {
