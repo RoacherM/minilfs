@@ -187,3 +187,35 @@ cli 4/4, rpc 6/6, pi 15/15, scale PASS, worker-mount smoke PASS; nothing left ru
 
 Next: a new Quarry run (`examples/quarry-pi/new.sh`), compared in `docs/replay/` with this one:
 expect merge commits on main ≈ number of worker merges (was 1), no hung call, Store contention 0.
+
+## 6. Review of the committed change (b162c9b..68296c9), 2026-10-27
+
+Reviewers: deepseek-v4.1-flash (high thinking) and gpt-6.1-sol (high thinking), independently.
+Both read the source only (no shell). Each finding below was re-checked against the code here;
+"checked" says what was verified.
+
+| # | Finding | From | Checked | Severity |
+| --- | --- | --- | --- | --- |
+| R1 | File tools read paths outside the project with only `isOutsideSecret`: an agent can `read` `<root>/worker/<build>/endpoint.json` (the store worker's secret) and then call any Store method on any Branch. Seatbelt denies the root to bash, not to the in-process file tools. Same for `access`/`exists`/`isDirectory`/`readdir` | GPT | `workspace.ts` readFile/access/exists/readdir `if (!sp)` branches read the host directly | **Blocker** |
+| R2 | Retry resends a delivered non-idempotent call: (a) `isWorkerGone` matches "connection is closed" but the SDK says that only for unsent calls, OK; (b) after a lost reply the outcome check runs before `revive`, fails against the dead worker, is taken as "not landed", then the write is resent; also writes proceed when the first head read failed | DeepSeek (M1), GPT (#3) | (a) SDK `worker_client.js:85` "the call was not sent": not a bug; (b) `client.ts` retryBusy: `onUncertain().catch(() => undefined)` before `revive`: real | **Major** |
+| R3 | Leftover reaping uses the project-shared `sharedCacheDir` as a root: one call can kill another session's detached process; `startedSec - 1` slack | both | `driver.ts` roots include `sharedCacheDir`; `proc-scan.ts` rule | **Major** |
+| R4 | Stuck-worker replacement SIGKILLs after a 1 s ping miss (a busy worker) and trusts the endpoint pid (pid reuse) | both | `worker.ts` `pingWorker(…, 1000)`, `alive(stale.pid)` → SIGKILL | **Major** |
+| R5 | Join leaves a half state if `reset` fails after `update-ref` | DeepSeek | `gitjoin.ts` update-ref then reset, no rollback | **Major** |
+| R6 | `tr '\0' '\n'` undoes `-z`: a newline in a conflicting filename splits the path | both | `gitjoin.ts` | Minor |
+| R7 | `minilfs_apply` is registered by the role at load time; an Epi task found later (session file) keeps it; the handler does not re-check | GPT | `index.ts` registers when `role.role === "lead"` at load; role re-resolved at session_start; no check in the handler | **Major** |
+| R8 | Alias resolution prefers a session with a commit over a newer one: `lead` resolves to the dead previous lead's Branch | GPT | `workspace.ts` resolveBranchName sort | Major |
+| R9 | `publish` result read as `pub.layer`; the SDK field is `publishedLayer` (main ref not recorded after apply / sync) | GPT | SDK `branch.md:162`; `workspace.ts` two places | Minor (pre-existing) |
+| R10 | Apply writes refs without git's lock protocol: a host commit between the final check and the rename is overwritten | GPT | `applyLocked` checks `hostState` then `rename`; no `.lock` | Major |
+| R11 | Apply can install a ref to an object the folder does not have (a ref written by a file tool, objects never added) | GPT | decideGitPath accepts any ref content; no object check | Major |
+| R12 | `keepLosingGitRefs` keeps only `refs/heads/*`: earlier `refs/minilfs/*` rescues, tags and a detached HEAD of the losing side are dropped by a later merge | GPT | walks only `/.git/refs/heads` | Major |
+| R13 | Join runs `update-index --add` with the Branch's `.gitattributes`: a clean filter from the imported config runs (inside Seatbelt) | DeepSeek | `gitjoin.ts` `g()` sets hooksPath/fsmonitor only | Minor (sandboxed) |
+| R14 | Prelude `timeout` maps a command's own 143/137 to 124 | DeepSeek | prelude | Minor |
+| R15 | Pipe cut after 2 s may drop the tail for a slow consumer | DeepSeek | by design; onData is synchronous here | Nit |
+| R16 | `bundle.json` still pins the 833acf7 prebuilt: fresh installs get a clear "not published yet" refusal | GPT | known; CI publishes on merge | Release blocker (known) |
+| R17 | `revive` cannot rebind an existing client | DeepSeek (M5) | SDK `workerClient` re-reads the endpoint file on every send: **not a bug** | — |
+| R18 | `activeKills` map written but never read | DeepSeek | dead state | Nit |
+
+Tests the reviewers would add first: an Epi-worker boundary test (endpoint not readable through
+file tools, no apply); a lost-reply write (worker killed after commit, before the reply, first
+verification fails): exactly one Commit; host commit racing apply: host commit stays reachable,
+`git fsck` clean; a second call's orphan under the shared cache survives another call's reap.
