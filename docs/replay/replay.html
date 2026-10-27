@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Quarry on minilfs — commit replay</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --line: #30363d; --text: #e6edf3; --dim: #8b949e;
+    --main: #e6edf3; --lead: #f0b429; --apply: #3fb950; --merge: #a371f7; --bad: #f85149;
+    --P: #58a6ff; --X: #ff7b72; --S: #3fb950; --C: #d2a8ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif; }
+  header { padding: 16px 22px 8px; display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--dim); }
+  .controls { display: flex; align-items: center; gap: 10px; padding: 6px 22px 10px; flex-wrap: wrap; }
+  button { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 11px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--dim); }
+  button.on { border-color: var(--lead); color: var(--lead); }
+  #scrub { flex: 1; min-width: 260px; accent-color: var(--lead); }
+  #clock { font-variant-numeric: tabular-nums; min-width: 132px; color: var(--lead); font-weight: 600; }
+  .wrap { display: grid; grid-template-columns: 1fr 330px; gap: 0; border-top: 1px solid var(--line); height: calc(100vh - 112px); min-height: 520px; }
+  #stage { position: relative; overflow: hidden; }
+  svg { width: 100%; height: 100%; display: block; }
+  aside { border-left: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line); border-bottom: 1px solid var(--line); }
+  .stat { background: var(--panel); padding: 9px 10px; }
+  .stat b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--dim); font-size: 11px; }
+  #phase { padding: 10px 12px; border-bottom: 1px solid var(--line); color: var(--lead); font-weight: 600; min-height: 40px; }
+  #log { flex: 1; overflow-y: auto; padding: 6px 0; margin: 0; list-style: none; }
+  #log li { padding: 4px 12px; border-left: 3px solid transparent; color: var(--dim); }
+  #log li.new { color: var(--text); }
+  #log li .t { font-variant-numeric: tabular-nums; color: var(--dim); margin-right: 6px; }
+  #log li.apply { border-color: var(--apply); }
+  #log li.merge { border-color: var(--merge); }
+  #log li.spawn { border-color: var(--lead); }
+  #log li.commit { border-color: var(--line); }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; padding: 8px 12px; border-top: 1px solid var(--line); color: var(--dim); font-size: 11px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; vertical-align: -1px; }
+  .tip { position: absolute; pointer-events: none; background: #1f242c; border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; max-width: 360px; font-size: 12px; display: none; z-index: 5; }
+  text { fill: var(--text); font-size: 11px; }
+  .lane-label { fill: var(--dim); font-size: 11px; font-weight: 600; }
+  .axis { fill: var(--dim); font-size: 10px; }
+  .now { stroke: var(--lead); stroke-width: 1.2; stroke-dasharray: 3 3; }
+  .round-band { fill: #ffffff; opacity: 0.025; }
+  .round-label { fill: var(--dim); font-size: 10px; }
+  .kinds { display: flex; gap: 10px; flex-wrap: wrap; padding: 0 12px 8px; color: var(--dim); font-size: 11px; }
+  .kinds label { cursor: pointer; user-select: none; }
+  .kinds input { vertical-align: -2px; margin: 0 3px 0 0; }
+  .kinds i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 3px; }
+  #detail { border-top: 1px solid var(--line); padding: 8px 12px; flex: 1.4; min-height: 0; overflow-y: auto; display: none; }
+  #log { min-height: 80px; }
+  #detail h3 { margin: 0 0 6px; font-size: 13px; }
+  #detail .files { columns: 1; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+  #detail .files div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #detail .files b { color: var(--lead); font-weight: 600; margin-right: 4px; }
+  #detail .files .shared { color: var(--bad); }
+  #detail .acts { margin-top: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--dim); }
+  #detail .acts div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .lane-label { cursor: pointer; }
+  .lane-hit { fill: transparent; cursor: pointer; }
+  .lane-hit:hover { fill: #ffffff08; }
+  .lane-sel { fill: #f0b42912; }
+  @media (max-width: 900px) { .wrap { grid-template-columns: 1fr; height: auto; } aside { border-left: 0; border-top: 1px solid var(--line); max-height: 360px; } #stage { height: 560px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Quarry on minilfs · commit replay</h1>
+  <span class="sub" id="sub"></span>
+</header>
+<div class="controls">
+  <button id="play">▶ 播放</button>
+  <button id="restart">⟲ 重来</button>
+  <span>速度</span>
+  <button data-speed="60">1 分钟/秒</button>
+  <button data-speed="300" class="on">5 分钟/秒</button>
+  <button data-speed="900">15 分钟/秒</button>
+  <input id="scrub" type="range" min="0" max="1000" value="0">
+  <span id="clock">--:--:--</span>
+  <span class="sub" style="color:var(--dim)">点泳道名看该 Branch 的文件与动作</span>
+</div>
+<div class="wrap">
+  <div id="stage"><svg id="svg"></svg><div class="tip" id="tip"></div></div>
+  <aside>
+    <div class="stats">
+      <div class="stat"><b id="sCommits">0</b><span>git commits</span></div>
+      <div class="stat"><b id="sWorkers">0</b><span>运行中 worker</span></div>
+      <div class="stat"><b id="sMerges">0</b><span>minilfs merge</span></div>
+      <div class="stat"><b id="sConflicts">0</b><span>冲突</span></div>
+      <div class="stat"><b id="sApplies">0</b><span>apply</span></div>
+      <div class="stat"><b id="sJoined">0</b><span>真合并 (2 父)</span></div>
+    </div>
+    <div id="phase"></div>
+    <div class="kinds" id="kinds"></div>
+    <ul id="log"></ul>
+    <div id="detail"></div>
+    <div class="legend">
+      <span><i style="background:var(--main)"></i>main / lead</span>
+      <span><i style="background:var(--P)"></i>sql P1–P3</span>
+      <span><i style="background:var(--X)"></i>exec X1–X2</span>
+      <span><i style="background:var(--S)"></i>store S1–S2</span>
+      <span><i style="background:var(--C)"></i>corpus C</span>
+      <span><i style="background:var(--apply)"></i>apply</span>
+      <span><i style="background:var(--merge)"></i>merge</span>
+    </div>
+  </aside>
+</div>
+<script src="data.js"></script>
+<script>
+(() => {
+  const D = window.REPLAY;
+  const $ = (id) => document.getElementById(id);
+  const svg = $("svg"), tip = $("tip");
+  const NS = "http://www.w3.org/2000/svg";
+  const fmt = (t) => new Date(t * 1000).toLocaleTimeString("zh-CN", { hour12: false });
+  const short = (s, n = 64) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
+
+  // ---------- model: lanes, who made each commit, which lane it sits on
+  const LANES = ["main", "P1", "P2", "P3", "X1", "X2", "S1", "S2", "C"];
+  const color = (lane) => (lane === "main" ? "var(--main)" : `var(--${lane[0]})`);
+  const roleByBranch = {};
+  for (const w of D.workers) if (w.branch) roleByBranch[w.branch.replace(/-\d+$/, "")] = w.role;
+  // refs/minilfs/<branch>/heads/main: a worker's head kept after a merge
+  const refRole = {};
+  for (const [ref, oid] of Object.entries(D.refs)) {
+    const m = /^refs\/minilfs\/(s-[0-9a-f]{10})/.exec(ref);
+    if (m && roleByBranch[m[1]]) refRole[oid] = roleByBranch[m[1]];
+  }
+  const byId = Object.fromEntries(D.commits.map((c) => [c.id, c]));
+  // a commit's lane: its author when it is a worker name, else the lane of the ref that holds it
+  const laneOf = {};
+  const authorLane = (a) => {
+    const m = /^(P[123]|X[12]|S[12])\b/.exec(a);
+    if (m) return m[1];
+    if (/corpus|RoacherM/i.test(a)) return "C";
+    return null;
+  };
+  // walk back from each worker ref until main's first-parent chain
+  const mainChain = new Set();
+  for (let c = byId[(D.refs["refs/heads/main"] || "").slice(0, 7)] || D.commits[D.commits.length - 1]; c; c = byId[c.parents[0]]) mainChain.add(c.id);
+  for (const c of D.commits) laneOf[c.id] = mainChain.has(c.id) ? "main" : (authorLane(c.author) || null);
+  for (const [oid, role] of Object.entries(refRole)) {
+    for (let c = byId[oid]; c && !mainChain.has(c.id); c = byId[c.parents[0]]) laneOf[c.id] = laneOf[c.id] || role;
+  }
+  for (const c of D.commits) laneOf[c.id] = laneOf[c.id] || "main";
+
+  // ---------- actions: what each Branch did (tool calls), drawn as ticks under its lane
+  const KINDS = {
+    write:   { label: "写/改文件", color: "#f0b429" },
+    edit:    { label: "edit",      color: "#ffd166" },
+    read:    { label: "读",        color: "#6e7681" },
+    build:   { label: "cargo build", color: "#58a6ff" },
+    test:    { label: "测试",      color: "#3fb950" },
+    lint:    { label: "fmt/clippy", color: "#2ea043" },
+    git:     { label: "git 写",    color: "#a371f7" },
+    gitread: { label: "git 读",    color: "#8957e5" },
+    minilfs: { label: "minilfs",   color: "#ff7b72" },
+    shell:   { label: "其他 shell", color: "#30363d" },
+  };
+  const shown = new Set(["write", "edit", "build", "test", "lint", "git", "minilfs"]);
+  // every Branch's actions, by lane; the lead's on main
+  const laneActs = Object.fromEntries(LANES.map((l) => [l, []]));
+  for (const w of D.workers) for (const a of w.actions) laneActs[w.role].push({ ...a, who: w });
+  for (const a of (D.lead?.actions || [])) laneActs.main.push({ ...a, who: null });
+  // which roles wrote each file (a file two Branches wrote is a merge risk)
+  const writers = {};
+  for (const w of D.workers) for (const f of Object.keys(w.files || {})) (writers[f] = writers[f] || new Set()).add(w.role);
+  for (const a of laneActs.main) if ((a.kind === "write" || a.kind === "edit") && a.path) (writers[a.path] = writers[a.path] || new Set()).add("lead");
+  let selected = null;
+
+  // ---------- time window and layout
+  const tEnd = Math.max(D.ended || 0, ...D.commits.map((c) => c.t), ...D.events.map((e) => e.t), ...D.workers.map((w) => w.end));
+  // the run's own window: commits made before it (the setup commit) sit at the left edge
+  const tStart = D.started - 60;
+  const T = (t) => Math.max(t, tStart);
+  let W = 0, H = 0;
+  const pad = { l: 64, r: 26, t: 34, b: 34 };
+  const X = (t) => pad.l + ((t - tStart) / (tEnd - tStart)) * (W - pad.l - pad.r);
+  const Y = (lane) => pad.t + (LANES.indexOf(lane) + 0.5) * ((H - pad.t - pad.b) / LANES.length);
+  const el = (tag, attrs, parent = svg) => {
+    const n = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+    parent.appendChild(n);
+    return n;
+  };
+
+  // rounds: spans between spawn bursts (one band per round of workers)
+  const spawnTimes = D.events.filter((e) => e.kind === "spawn").map((e) => e.t);
+  const rounds = [];
+  for (const t of spawnTimes) if (!rounds.length || t - rounds[rounds.length - 1].start > 120) rounds.push({ start: t, end: t });
+  rounds.forEach((r, i) => {
+    const ws = D.workers.filter((w) => Math.abs(w.start - r.start) < 180);
+    r.end = Math.max(r.start, ...ws.map((w) => w.end));
+    r.label = `M${i + 1} workers`;
+  });
+
+  let nodes = []; // { t, draw(visible, now) }
+  function build() {
+    const box = $("stage").getBoundingClientRect();
+    W = box.width; H = box.height;
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    svg.innerHTML = "";
+    nodes = [];
+    // round bands
+    for (const r of rounds) {
+      el("rect", { x: X(r.start), y: pad.t - 14, width: Math.max(2, X(r.end) - X(r.start)), height: H - pad.t - pad.b + 14, class: "round-band" });
+      el("text", { x: X(r.start) + 4, y: pad.t - 4, class: "round-label" }).textContent = r.label;
+    }
+    // lanes
+    for (const lane of LANES) {
+      el("line", { x1: pad.l, x2: W - pad.r, y1: Y(lane), y2: Y(lane), stroke: "var(--line)", "stroke-width": lane === "main" ? 1.4 : 0.7 });
+      const lbl = el("text", { x: 12, y: Y(lane) + 4, class: "lane-label", fill: color(lane) });
+      lbl.textContent = lane === "main" ? "main" : lane;
+      lbl.addEventListener("click", () => select(selected === lane ? null : lane));
+    }
+    // axis ticks every 10 minutes
+    const step = 600;
+    for (let t = Math.ceil(tStart / step) * step; t <= tEnd; t += step) {
+      el("line", { x1: X(t), x2: X(t), y1: H - pad.b, y2: H - pad.b + 4, stroke: "var(--line)" });
+      el("text", { x: X(t) - 14, y: H - pad.b + 16, class: "axis" }).textContent = fmt(t).slice(0, 5);
+    }
+    const layer = { sel: el("g", {}), ticks: el("g", {}), bars: el("g", {}), edges: el("g", {}), dots: el("g", {}), marks: el("g", {}) };
+    const laneH = (H - pad.t - pad.b) / LANES.length;
+    // lane hit areas: click selects the Branch
+    for (const lane of LANES) {
+      const hit = el("rect", { x: 0, y: Y(lane) - laneH / 2, width: W, height: laneH, class: selected === lane ? "lane-hit lane-sel" : "lane-hit" }, layer.sel);
+      hit.addEventListener("click", () => select(selected === lane ? null : lane));
+    }
+    // action ticks: a short bar below the lane line, one per tool call, colored by kind
+    for (const lane of LANES) {
+      for (const a of laneActs[lane]) {
+        if (!shown.has(a.kind)) continue;
+        const k = KINDS[a.kind] || KINDS.shell;
+        const tk = el("rect", { x: X(a.t) - 0.8, y: Y(lane) + 7, width: 1.6, height: 0, fill: a.ok === false ? "var(--bad)" : k.color, opacity: 0.85 }, layer.ticks);
+        tk.dataset.tip = `${lane === "main" ? "lead" : lane} · ${fmt(a.t)} · ${k.label}${a.ok === false ? " · 失败" : ""}\n${a.path || a.cmd || ""}`;
+        nodes.push({ t: a.t, draw: (vis) => tk.setAttribute("height", vis ? 12 : 0) });
+      }
+    }
+
+    // worker activity bars (start -> end on their lane)
+    for (const w of D.workers) {
+      const y = Y(w.role);
+      const bar = el("rect", { x: X(w.start), y: y - 5, height: 10, width: 0, rx: 5, fill: color(w.role), opacity: 0.22 }, layer.bars);
+      const spawn = el("line", { x1: X(w.start), y1: Y("main"), x2: X(w.start), y2: Y("main"), stroke: color(w.role), "stroke-width": 1, "stroke-dasharray": "2 3", opacity: 0.55 }, layer.edges);
+      nodes.push({ t: w.start, draw: (vis, now) => {
+        const end = Math.min(now, w.end);
+        bar.setAttribute("width", vis ? Math.max(0, X(end) - X(w.start)) : 0);
+        spawn.setAttribute("y2", vis ? y : Y("main"));
+        bar.dataset.tip = `${w.role} · ${w.branch || "?"}\n${fmt(w.start)} → ${fmt(w.end)} · ${w.tools} 次工具调用 · ${w.gitCommits} 次 git commit`;
+      } });
+    }
+    // commits: edges to parents, then the dot
+    for (const c of D.commits) {
+      const lane = laneOf[c.id];
+      const x = X(T(c.t)), y = Y(lane);
+      const edges = c.parents.map((p, i) => {
+        const pc = byId[p];
+        if (!pc) return null;
+        const px = X(Math.max(pc.t, tStart)), py = Y(laneOf[p]);
+        const mid = (px + x) / 2;
+        return el("path", { d: `M${px},${py} C${mid},${py} ${mid},${y} ${x},${y}`, fill: "none", stroke: i === 0 ? color(lane) : "var(--merge)", "stroke-width": i === 0 ? 1.6 : 2, opacity: 0 }, layer.edges);
+      }).filter(Boolean);
+      const two = c.parents.length > 1;
+      const dot = el("circle", { cx: x, cy: y, r: 0, fill: two ? "var(--merge)" : color(lane), stroke: "var(--bg)", "stroke-width": 1.5 }, layer.dots);
+      dot.dataset.tip = `${c.id} · ${fmt(c.t)} · ${c.author}${two ? " · 合并 (2 父)" : ""}\n${short(c.subject, 120)}`;
+      nodes.push({ t: T(c.t), commit: c, draw: (vis) => {
+        dot.setAttribute("r", vis ? (two ? 6 : 4.2) : 0);
+        for (const e of edges) e.setAttribute("opacity", vis ? 0.9 : 0);
+      } });
+    }
+    // minilfs events on main: apply (green ring), merge (purple diamond from the worker lane)
+    for (const e of D.events) {
+      if (e.kind === "apply") {
+        const ring = el("circle", { cx: X(e.t), cy: Y("main"), r: 0, fill: "none", stroke: "var(--apply)", "stroke-width": 2 }, layer.marks);
+        ring.dataset.tip = `minilfs_apply · ${fmt(e.t)} · ${e.files} 个文件\n${e.git || ""}`;
+        nodes.push({ t: e.t, draw: (vis) => ring.setAttribute("r", vis ? 8 : 0) });
+      } else if (e.kind === "merge") {
+        const role = roleByBranch[(e.branch || "").replace(/-\d+$/, "")] || "main";
+        const x = X(e.t);
+        const arc = el("path", { d: `M${x},${Y(role)} L${x},${Y("main")}`, stroke: e.conflict ? "var(--bad)" : "var(--merge)", "stroke-width": 1.4, opacity: 0, "marker-end": "" }, layer.marks);
+        const dia = el("rect", { x: x - 4, y: Y("main") - 4, width: 8, height: 8, transform: `rotate(45 ${x} ${Y("main")})`, fill: e.conflict ? "var(--bad)" : "var(--merge)", opacity: 0 }, layer.marks);
+        dia.dataset.tip = `minilfs merge ${e.branch} (${role}) · ${fmt(e.t)}\n${e.conflict ? "冲突" : "无冲突"}${e.gitNote ? " · 两边都有 git commit：对方 head 保存为 refs/minilfs/…" : ""}`;
+        nodes.push({ t: e.t, draw: (vis) => { arc.setAttribute("opacity", vis ? 0.75 : 0); dia.setAttribute("opacity", vis ? 1 : 0); } });
+      }
+    }
+    // the now line
+    nowLine = el("line", { y1: pad.t - 14, y2: H - pad.b, class: "now" });
+    render(true);
+  }
+  let nowLine;
+
+  // ---------- event log (side panel)
+  const logItems = [];
+  for (const c of D.commits) logItems.push({ t: T(c.t), cls: "commit", text: `<b style="color:${color(laneOf[c.id])}">${laneOf[c.id]}</b> ${c.id} ${short(c.subject)}${c.parents.length > 1 ? " <b style='color:var(--merge)'>⑂</b>" : ""}` });
+  for (const e of D.events) {
+    if (e.kind === "apply") logItems.push({ t: e.t, cls: "apply", text: `<b style="color:var(--apply)">apply</b> ${e.files} 个文件 → 宿主机 + main` });
+    if (e.kind === "merge") logItems.push({ t: e.t, cls: "merge", text: `<b style="color:var(--merge)">merge</b> ${roleByBranch[(e.branch || "").replace(/-\d+$/, "")] || ""} ${e.branch} ${e.conflict ? "<b style='color:var(--bad)'>冲突</b>" : "无冲突"}` });
+    if (e.kind === "spawn") logItems.push({ t: e.t, cls: "spawn", text: `<b style="color:var(--lead)">spawn</b> worker ${e.role}（async，自己的 Branch）` });
+  }
+  logItems.sort((a, b) => a.t - b.t);
+  const logEl = $("log");
+  let shownLog = -1;
+  function renderLog(now) {
+    let last = -1;
+    for (let i = 0; i < logItems.length && logItems[i].t <= now; i++) last = i;
+    if (last === shownLog) return;
+    if (last < shownLog) { logEl.innerHTML = ""; shownLog = -1; }
+    for (let i = shownLog + 1; i <= last; i++) {
+      const li = document.createElement("li");
+      li.className = `${logItems[i].cls} new`;
+      li.innerHTML = `<span class="t">${fmt(logItems[i].t).slice(0, 8)}</span>${logItems[i].text}`;
+      logEl.prepend(li);
+      setTimeout(() => li.classList.remove("new"), 1200);
+    }
+    shownLog = last;
+  }
+
+  // ---------- branch detail: files written and recent actions up to `now`
+  const esc = (x) => String(x).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
+  function select(lane) { selected = lane; build(); renderDetail(true); }
+  let detailKey = "";
+  function renderDetail(force) {
+    const box = $("detail");
+    if (!selected) { box.style.display = "none"; return; }
+    box.style.display = "block";
+    const acts = laneActs[selected].filter((a) => a.t <= now);
+    const key = `${selected}:${acts.length}`;
+    if (!force && key === detailKey) return;
+    detailKey = key;
+    const files = {};
+    for (const a of acts) if ((a.kind === "write" || a.kind === "edit") && a.path) files[a.path] = (files[a.path] || 0) + 1;
+    const sess = selected === "main" ? [] : D.workers.filter((w) => w.role === selected && w.start <= now);
+    const branches = sess.map((w) => `${w.branch || "?"} (${fmt(w.start).slice(0, 5)}–${fmt(Math.min(w.end, now)).slice(0, 5)})`).join(", ");
+    const counts = {};
+    for (const a of acts) counts[a.kind] = (counts[a.kind] || 0) + 1;
+    box.innerHTML = `<h3 style="color:${color(selected)}">${selected === "main" ? "lead (main)" : selected}</h3>`
+      + `<div style="color:var(--dim);font-size:11px;margin-bottom:6px">${esc(branches || "Branch: lead")}<br>`
+      + Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([k, n]) => `<span style="color:${(KINDS[k] || KINDS.shell).color}">${(KINDS[k] || KINDS.shell).label} ${n}</span>`).join(" · ") + `</div>`
+      + `<div style="font-size:11px;color:var(--dim)">写过的文件（${Object.keys(files).length}；红色 = 其他 Branch 也写过）</div>`
+      + `<div class="files">${Object.entries(files).sort((a, b) => b[1] - a[1]).map(([f, n]) => {
+          const others = [...(writers[f] || [])].filter((r) => r !== (selected === "main" ? "lead" : selected));
+          return `<div class="${others.length ? "shared" : ""}" title="${esc(f)}"><b>${n}×</b>${esc(f)}${others.length ? " ← " + others.join(",") : ""}</div>`;
+        }).join("") || "<div>—</div>"}</div>`
+      + `<div class="acts">${acts.slice(-14).reverse().map((a) => `<div><span style="color:${a.ok === false ? "var(--bad)" : (KINDS[a.kind] || KINDS.shell).color}">${fmt(a.t).slice(0, 8)} ${(KINDS[a.kind] || KINDS.shell).label}</span> ${esc(a.path || a.cmd || "")}</div>`).join("")}</div>`;
+  }
+  const kindsEl = $("kinds");
+  for (const [k, v] of Object.entries(KINDS)) {
+    const lab = document.createElement("label");
+    lab.innerHTML = `<input type="checkbox" ${shown.has(k) ? "checked" : ""}><i style="background:${v.color}"></i>${v.label}`;
+    lab.querySelector("input").onchange = (e) => { if (e.target.checked) shown.add(k); else shown.delete(k); build(); };
+    kindsEl.appendChild(lab);
+  }
+
+  // ---------- playback
+  let now = tStart, playing = false, speed = 300, lastFrame = 0;
+  function phaseAt(t) {
+    const r = rounds.findIndex((r) => t >= r.start && t <= r.end);
+    if (r >= 0) return `${rounds[r].label}：${D.workers.filter((w) => w.start <= t && w.end >= t).map((w) => w.role).join(" · ")} 并行`;
+    const prev = rounds.filter((r) => r.end < t).length;
+    if (prev === 0) return "Round 0：lead 搭骨架";
+    return `M${prev} 集成：lead 逐个 merge、跑门禁、修集成 bug、apply`;
+  }
+  function render(force) {
+    for (const n of nodes) {
+      const vis = n.t <= now;
+      if (force || n.vis !== vis || (!n.commit && vis)) { n.draw(vis, now); n.vis = vis; }
+    }
+    if (nowLine) { nowLine.setAttribute("x1", X(now)); nowLine.setAttribute("x2", X(now)); }
+    $("clock").textContent = fmt(now);
+    $("scrub").value = Math.round(((now - tStart) / (tEnd - tStart)) * 1000);
+    const cs = D.commits.filter((c) => T(c.t) <= now);
+    $("sCommits").textContent = cs.length;
+    $("sJoined").textContent = cs.filter((c) => c.parents.length > 1).length;
+    $("sWorkers").textContent = D.workers.filter((w) => w.start <= now && w.end >= now).length;
+    const ev = D.events.filter((e) => e.t <= now);
+    $("sMerges").textContent = ev.filter((e) => e.kind === "merge").length;
+    $("sConflicts").textContent = ev.filter((e) => e.kind === "merge" && e.conflict).length;
+    $("sApplies").textContent = ev.filter((e) => e.kind === "apply").length;
+    $("phase").textContent = phaseAt(now);
+    renderLog(now);
+    renderDetail(false);
+  }
+  function frame(ts) {
+    if (!playing) return;
+    const dt = lastFrame ? (ts - lastFrame) / 1000 : 0;
+    lastFrame = ts;
+    now = Math.min(tEnd, now + dt * speed);
+    render(false);
+    if (now >= tEnd) { setPlaying(false); return; }
+    requestAnimationFrame(frame);
+  }
+  function setPlaying(p) {
+    playing = p;
+    $("play").textContent = p ? "❚❚ 暂停" : "▶ 播放";
+    if (p) { if (now >= tEnd) now = tStart; lastFrame = 0; requestAnimationFrame(frame); }
+  }
+  $("play").onclick = () => setPlaying(!playing);
+  $("restart").onclick = () => { now = tStart; render(true); setPlaying(true); };
+  $("scrub").oninput = (e) => { now = tStart + (e.target.value / 1000) * (tEnd - tStart); render(false); };
+  document.querySelectorAll("[data-speed]").forEach((b) => b.onclick = () => {
+    speed = Number(b.dataset.speed);
+    document.querySelectorAll("[data-speed]").forEach((x) => x.classList.toggle("on", x === b));
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.code === "Space") { e.preventDefault(); setPlaying(!playing); }
+    if (e.code === "ArrowRight") { now = Math.min(tEnd, now + 60); render(false); }
+    if (e.code === "ArrowLeft") { now = Math.max(tStart, now - 60); render(false); }
+  });
+  svg.addEventListener("mousemove", (e) => {
+    const t = e.target.dataset?.tip;
+    if (!t) { tip.style.display = "none"; return; }
+    const box = $("stage").getBoundingClientRect();
+    tip.style.display = "block";
+    tip.innerText = t;
+    tip.style.left = Math.min(box.width - 370, e.clientX - box.left + 12) + "px";
+    tip.style.top = e.clientY - box.top + 12 + "px";
+  });
+  svg.addEventListener("mouseleave", () => (tip.style.display = "none"));
+  window.addEventListener("resize", build);
+
+  $("sub").textContent = `${fmt(tStart)} → ${fmt(tEnd)}${D.ended ? "" : "（运行中，数据截至 " + fmt(D.generatedAt) + "）"} · ${D.workers.length} 个 worker 会话 · ${D.commits.length} 个 commit`;
+  build();
+  setPlaying(true);
+})();
+</script>
+</body>
+</html>
