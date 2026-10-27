@@ -3,6 +3,7 @@
 // import these directly from `@roacherm/minilfs/core` with zero Pi dependencies.
 import path from "node:path";
 import { hiddenPath } from "../history.ts";
+import { gitChangeSummary } from "../gitpaths.ts";
 import { isExcludedPath, type LayerfsSession, type MergeResult } from "../workspace.ts";
 
 const IMAGE_TYPES: Record<string, string> = {
@@ -19,7 +20,7 @@ export const LAYERFS_TOOL_DESCRIPTION = [
   "action=diff [branch=<name>] [base=<name>]: files changed on your branch or between specified branches (build output is counted, not listed).",
   "action=branches: active branches of the project (with aliases).",
   "action=sync [branch=<name>] [strategy=ours|theirs]: merge trunk (main) or a specified branch (e.g. branch='lead') into your branch.",
-  "action=merge branch=<name> [strategy=ours|theirs]: merge another branch into yours. On conflict nothing changes and conflicts are listed.",
+  "action=merge branch=<name> [strategy=ours|theirs]: merge another branch into yours (LayerFS branch.merge: three-way, .lww rules). On conflict nothing changes and conflicts are listed; strategy picks the side that wins on conflicting files.",
   "action=show branch=<name> path=<file> [offset=1] [limit=N]: print a file (or list directory) from another branch (supports pagination).",
   "action=ls [branch=<name>] [path=/]: list directory entries on a branch.",
   "action=checkout branch=<name> (path=<file>|paths=[...]): copy files or directories from another branch into your branch.",
@@ -132,6 +133,7 @@ export async function executeLayerfsAction(
       `branch: ${s.workBranch} (alias: ${s.logicalBranch})`,
       `head: ${s.headCommit ?? "none (no changes yet)"}`,
       `unapplied changes: ${s.unapplied ? "yes" : "no"}`,
+      unappliedMergesNote(s),
       s.blocked ? `BLOCKED: ${s.blocked.reason}` : "",
     ].filter(Boolean).join("\n");
   }
@@ -165,12 +167,16 @@ export async function executeLayerfsAction(
       if (other) lines.push(`(+${other} branch-only/build files, never applied)`);
       return lines.length ? lines.join("\n") : `No changes between ${resolvedBase} and ${resolvedBranch}.`;
     }
-    const all = (await s.diff()).filter((i) => i.type !== "dir" && !hiddenPath(i.path));
+    const raw = (await s.diff()).filter((i) => i.type !== "dir");
+    const all = raw.filter((i) => !hiddenPath(i.path));
     const d = all.filter((i) => s.isApplicable(i.path));
     const lines = d.slice(0, 300).map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`);
     if (d.length > 300) lines.push(`… ${d.length - 300} more`);
     const other = all.length - d.length;
     if (other) lines.push(`(+${other} branch-only/build files, never applied)`);
+    // .git is hidden above; one line says what apply would do to the folder's git
+    const git = gitChangeSummary(raw.filter((i) => s.isApplicable(i.path)).map((i) => i.path));
+    if (git) lines.push(git);
     return lines.length ? lines.join("\n") : "No changes on this branch.";
   }
   if (action === "branches") {
@@ -185,7 +191,7 @@ export async function executeLayerfsAction(
     if (!b || !rawPath) throw new Error("action=show needs branch=<name> and path=<file>");
     const resolvedBranch = await s.resolveBranchName(b);
     const rel = cleanRelPath(s, rawPath);
-    if (rel && !s.isApplicable(rel) && rel !== ".lww") throw new Error(`${rel} is not readable here (secret, git metadata or build output)`);
+    if (rel && !s.isApplicable(rel) && rel !== ".lww" && !rel.startsWith(".git/")) throw new Error(`${rel} is not readable here (secret or branch-only output)`);
     const storePath = rel ? `/${rel}` : "/";
     const st = await s.lfs.fs.stat(resolvedBranch, storePath).catch(() => null);
     if (!st) throw new Error(`ENOENT: ${rawPath} does not exist on branch ${resolvedBranch}`);
@@ -240,7 +246,7 @@ export async function executeLayerfsAction(
     const b = params?.branch ? await s.resolveBranchName(params.branch) : s.workBranch;
     const rawPath = String(params?.path ?? "/").trim();
     const rel = cleanRelPath(s, rawPath);
-    if (rel && !s.isApplicable(rel)) throw new Error(`${rel} is not readable here (secret, git metadata or build output)`);
+    if (rel && !s.isApplicable(rel) && !rel.startsWith(".git/")) throw new Error(`${rel} is not readable here (secret or branch-only output)`);
     const storePath = rel ? `/${rel}` : "/";
     const entries: string[] = [];
     for (let pos = 0; ; ) {
@@ -289,14 +295,14 @@ export async function executeLayerfsAction(
 
       for (const targetPath of rawPaths) {
         const rel = cleanRelPath(s, targetPath);
-        if (rel && !s.isApplicable(rel)) throw new Error(`${rel} cannot be checked out (secret, git metadata or build output)`);
+        if (rel && !s.isApplicable(rel)) throw new Error(`${rel} cannot be checked out (secret, protected git file or branch-only output)`);
         const storePath = rel ? `/${rel}` : "/";
         const st = await s.lfs.fs.stat(resolvedBranch, storePath).catch(() => null);
         if (!st) throw new Error(`action=checkout: "${targetPath}" does not exist on branch ${resolvedBranch}`);
         if (st.type === "dir") {
           const dirFiles = await collectFiles(storePath);
           for (const fileRel of dirFiles) {
-            if (fileRel && !s.isApplicable(fileRel)) throw new Error(`${fileRel} cannot be checked out (secret, git metadata or build output)`);
+            if (fileRel && !s.isApplicable(fileRel)) throw new Error(`${fileRel} cannot be checked out (secret, protected git file or branch-only output)`);
             const bytes = await s.readBytesAtRef(resolvedBranch, "/" + fileRel, fileRel);
             await s.writeFile(path.join(s.cwd, fileRel), bytes);
             copied.push({ path: fileRel, size: bytes.length });
@@ -345,8 +351,10 @@ export async function executeLayerfsAction(
         "Conflicting files:",
         ...r.conflicts.map((c) => `  ${c.path}${c.kind ? ` (${c.kind})` : ""}`),
         "How to resolve (LayerFS merges three-way, so editing only your side keeps conflicting):",
-        `  1. Run with strategy: action="merge" branch="${target}" strategy="theirs" (or strategy="ours");`,
-        `  2. Or inspect with action=show branch=${other} path=<file>, checkout files with action=checkout branch=${other} path=<file>, or edit your files.`,
+        `  1. One side wins: action="merge" branch="${target}" strategy="theirs" (or strategy="ours") copies that side's conflicting files, then merges again;`,
+        `  2. Both changes matter: read both with action=show branch=${other} path=<file>, write the combined file, copy it to the other branch's side with action=checkout, then merge again;`,
+        "  3. Generated files (lockfiles, build output): add them to /.lww, then merge again.",
+        "  You can also inspect with git inside bash (the Branch has its own .git; .git itself never conflicts: it is taken whole from one side).",
       ].join("\n");
     }
     hooks?.onMerged?.(other, r);
@@ -355,14 +363,24 @@ export async function executeLayerfsAction(
         ? ` (${r.lww} generated file(s) took the newer side: ${r.lwwPaths.slice(0, 5).join(", ")}${r.lwwPaths.length > 5 ? ", …" : ""})`
         : ` (${r.lww} generated file(s) took the newer side)`
       : "";
-    const fallbackInfo = r.fallback ? " (via path-wise merge)" : "";
-    return `${driftNote}Merged ${other}${fallbackInfo}. You are now on ${r.branch}${lwwInfo}.`;
+    const resolvedInfo = r.resolved?.length ? ` (${strategy} on ${r.resolved.length} conflicting file(s): ${r.resolved.slice(0, 5).join(", ")}${r.resolved.length > 5 ? ", …" : ""})` : "";
+    const pending = unappliedMergesNote(s);
+    return `${driftNote}Merged ${other}${resolvedInfo}. You are now on ${r.branch}${lwwInfo}.${r.gitNote ? `\nGit: ${r.gitNote}.` : ""}${pending ? `\n${pending}` : ""}`;
   }
   if (action === "clean") {
     const res = await s.cleanScratch();
     return `Cleaned scratch build caches at ${res.removedPath}.`;
   }
   throw new Error(`unknown action ${action}`);
+}
+
+/** One line when merged Branches are not in main yet: sub-agents started now would not see them. */
+export function unappliedMergesNote(s: LayerfsSession): string {
+  const n = s.mergedSinceApply?.length ?? 0;
+  if (!n) return "";
+  const at = s.mainUpdatedAt;
+  const when = at ? new Date(at).toTimeString().slice(0, 5) : "the last apply";
+  return `Note: ${n} merged branch(es) are not in main yet (main last updated ${when}). Sub-agents started now fork from main and will not see them: run minilfs_apply first.`;
 }
 
 /**
@@ -387,6 +405,7 @@ export async function executeLayerfsApply(
   }
   return [
     r.applied.length ? `Applied ${r.applied.length} file(s) to ${s.cwd}; main now includes your branch.` : "No source changes to write; main now includes your branch.",
+    ...(r.git ? [`Git: ${r.git}`] : []),
     ...r.warnings.map((w) => `Warning: ${w}`),
   ].join("\n");
 }

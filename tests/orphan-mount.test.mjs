@@ -15,7 +15,7 @@ const base = join(homedir(), ".cache/minilfs-test", `orphan-${id}`);
 const cwd = join(base, "project");
 mkdirSync(cwd, { recursive: true });
 writeFileSync(join(cwd, "a.txt"), "a\n");
-const config = { ...resolveConfig({}), root: join(base, "root"), prefix: `minilfs-orphan-${id}-`, killGraceMs: 500 };
+const config = { ...resolveConfig({ MINILFS_BUNDLE: process.env.MINILFS_BUNDLE }), root: join(base, "root"), prefix: `minilfs-orphan-${id}-`, killGraceMs: 500 };
 const leaseDir = join(config.root, "state", "mounts");
 const mountsUnderBase = () => spawnSync("/sbin/mount", [], { encoding: "utf8" }).stdout.split("\n").filter((l) => l.includes(base));
 const leases = () => { try { return readdirSync(leaseDir).filter((f) => f.endsWith(".json")); } catch { return []; } };

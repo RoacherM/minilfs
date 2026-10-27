@@ -27,7 +27,10 @@ export interface HistoryView {
 
 const FILES_PER_ROW = 8;
 
-/** Paths never shown in history: LayerFS merge rules and git internals (apply never writes them either). */
+/**
+ * Paths not listed in history/diff views: LayerFS merge rules and git internals. `.git` is real Branch
+ * state (in-sandbox git commits are applied to the folder); it is hidden only to keep views readable.
+ */
 export function hiddenPath(path: string): boolean {
   const p = String(path).replace(/^\/+/, "");
   return p === ".lww" || p === ".git" || p.startsWith(".git/");

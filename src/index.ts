@@ -1,11 +1,12 @@
 /**
- * minilfs: every agent works on an isolated LayerFS Branch in a shared Project Store.
- * - The main agent (top-level session) may run single bash commands "elevated" on the real folder
- *   (default policy: auto). Sub-agents never elevate; their work reaches the folder through the main
- *   agent (merge, then apply).
+ * minilfs: every agent works on an isolated LayerFS Branch in a shared Project Store (official
+ * LayerFS v1.1.0, pure sandbox model: nothing runs on the real folder outside the sandbox).
+ * - The full project, `.git` included, is in each Branch: git status/diff/add/commit/merge, builds and
+ *   tests run inside the sandboxed `bash`. Sub-agents report their branch; the main agent merges
+ *   branches and applies the result to the folder.
  * - File tools (`read`, `write`, `edit`, `ls`, `find`, `grep`) go directly to the Store
  *   with automatic byte-exact Workspace fallback for binary, symlinks and >48KB lines.
- * - `bash` and `!cmd` mount a Workspace on demand, stream output, and unmount immediately.
+ * - `bash` and the user's `!cmd` mount a Workspace on demand (1 call = 1 Commit), stream output, and unmount.
  * - `/resume`, `/tree` and `/fork` restore or branch the file state alongside the conversation.
  * - The host folder is written only by `/minilfs apply` (with three-way conflict detection).
  */
@@ -19,12 +20,9 @@ import {
   executeLayerfsAction,
   executeLayerfsApply,
   formatHistory,
+  gitChangeSummary,
   hiddenPath,
-  ELEVATE_PARAM_DESCRIPTIONS,
-  elevateAllowed,
-  elevatePolicy,
   resolveRole,
-  type ElevatePolicy,
   type RoleInfo,
   LAYERFS_APPLY_TOOL_DESCRIPTION,
   LAYERFS_APPLY_TOOL_SCHEMA,
@@ -38,21 +36,15 @@ import {
 
 export const CHECKPOINT_ENTRY = "minilfs-checkpoint";
 export const SESSION_ENTRY = "minilfs-session";
-export const POLICY_ENTRY = "minilfs-policy";
 
 export default function minilfsExtension(pi: ExtensionAPI) {
   pi.registerFlag("no-minilfs", { description: "Disable minilfs isolation for this run (tools act on the host folder)", type: "boolean", default: false });
-  pi.registerFlag("minilfs-elevate", { description: "Elevated bash for the main agent: auto (default, no confirmation) | ask | never", type: "string", default: "" });
 
   let session: LayerfsSession | null = null;
   let ready: Promise<LayerfsSession> | null = null;
   let disabled = false;
-  /** decided once at load: sub-agents get a Branch but no apply and no elevation */
+  /** decided once at load: sub-agents get a Branch but no apply */
   let role: RoleInfo = resolveRole();
-  /** --minilfs-elevate / MINILFS_ELEVATE; /minilfs elevate changes it; saved in the conversation */
-  let policy: ElevatePolicy = elevatePolicy();
-  /** command prefixes the user allowed for this session ("always allow" in the ask dialog) */
-  const allowedPrefixes: string[] = [];
   let startError: Error | null = null;
   let pendingForkRef: string | null = null;
 
@@ -91,9 +83,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
 
   async function need(): Promise<LayerfsSession> {
     if (disabled) throw new Error("minilfs is disabled for this run");
-    const hint = role.role === "lead"
-      ? "Fix the cause and run /minilfs retry. A single bash command can still run on the folder with elevated: true."
-      : "Fix the cause and run /minilfs retry.";
+    const hint = "Fix the cause and run /minilfs retry. Nothing was written to the folder.";
     if (startError) throw new Error(`minilfs failed to start: ${startError.message}. ${hint}`);
     if (!ready) throw new Error("minilfs has not started (no session)");
     return ready.catch((e) => { throw new Error(`minilfs failed to start: ${e.message}. ${hint}`); });
@@ -114,6 +104,8 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     recordSession(s);
   };
   const applicableDiff = async (s: LayerfsSession) => (await s.diff()).filter((i) => i.type !== "dir" && !hiddenPath(i.path) && s.isApplicable(i.path));
+  /** the git metadata among the Branch's changes, as one line (`.git` itself is hidden in views) */
+  const gitLine = async (s: LayerfsSession) => gitChangeSummary((await s.diff()).filter((i) => i.type !== "dir" && s.isApplicable(i.path)).map((i) => i.path));
 
   const withNote = (result: any, note: string) =>
     note ? { ...result, content: [...(result.content ?? []), { type: "text", text: note }] } : result;
@@ -145,83 +137,15 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     } as any);
   }
 
-  // bash: on the Branch inside the sandbox; the main agent may run one command elevated (real folder).
-  const leadBashParams = {
-    ...(local.bash.parameters as any),
-    properties: {
-      ...(local.bash.parameters as any).properties,
-      elevated: { type: "boolean", description: ELEVATE_PARAM_DESCRIPTIONS.elevated },
-      reason: { type: "string", description: ELEVATE_PARAM_DESCRIPTIONS.reason },
-    },
-  };
-  const BLOCKED_HINT = "\n[minilfs] The sandbox blocked this. If the step must run on the real folder, retry with elevated: true and a reason.";
-  // sandboxed git reads the folder's repository but may not write it (see LayerfsSession.attachHostGit)
-  const GIT_WRITE = /unable to index file|cannot lock ref|Cannot save the current index state|insufficient permission for adding an object|(?:\.git|\/branches\/[^\s'\/]+\/git)\/[^\s']*': Operation not permitted|unable to create temporary file: Operation not permitted/;
-  const GIT_HINT = "\n[minilfs] In the sandbox git reads your folder's real repository but cannot change it: run git add, commit, reset, checkout/switch, stash, merge, rebase, pull and push with elevated: true. Apply (or the elevated command itself) writes the Branch's files first.";
-
-  /** asks the user under the `ask` policy; true = run */
-  async function approveElevation(command: string, reason: string, ctx: ExtensionContext | undefined, s: LayerfsSession | null): Promise<string | null> {
-    if (policy === "never") return "Refused: elevated commands are disabled (/minilfs elevate never). Tell the user what needs to run on the real folder.";
-    if (policy === "auto" || elevateAllowed(command, process.env, allowedPrefixes)) return null;
-    if (!ctx?.hasUI) return "Refused: elevated commands need the user's approval (policy ask) and there is no UI.";
-    const pending = s && s.unapplied ? await applicableDiff(s).catch(() => []) : [];
-    const first = command.trim().split(/\s+/)[0] ?? command;
-    const choice = await ctx.ui.select(
-      `Run on your real folder (outside the minilfs sandbox)?\n\n$ ${command}\n\nReason: ${reason}${pending.length ? `\n\nFirst, these Branch changes are written to your folder:\n${pending.slice(0, 15).map((i) => `  ${i.kind} ${i.path.replace(/^\//, "")}`).join("\n")}` : ""}`,
-      ["Run", `Always allow "${first} …" this session`, "Deny"],
-    );
-    if (choice === "Run") return null;
-    if (choice?.startsWith("Always")) { allowedPrefixes.push(`${first} *`); return null; }
-    return "The user denied this elevated command. Continue on the Branch or ask the user.";
-  }
-
-  /** the shared elevated path (agent tool and the user's !cmd); returns the tool result */
-  async function runElevatedBash(id: string, params: any, signal: any, onUpdate: any, ctx: ExtensionContext | undefined) {
-    const s = await need().catch(() => null);
-    const hostTool = createBashTool(hostCwd);
-    const runIt = () => hostTool.execute(id, { command: params.command, timeout: params.timeout }, signal, onUpdate);
-    if (!s) return runIt(); // minilfs not running: nothing to converge; the command still runs
-    status(ctx, `minilfs elevated: ${String(params.command).slice(0, 40)}`);
-    try {
-      const r = await s.runElevated(runIt, { reason: params.reason || "user command" });
-      if (r.checkpoint) pi.appendEntry(CHECKPOINT_ENTRY, { ...r.checkpoint, project: s.project, branch: s.workBranch });
-      recordSession(s);
-      const notes = [
-        r.applied.length ? `[minilfs] Applied ${r.applied.length} Branch change(s) to your folder before running.` : "",
-        r.synced.length ? `[minilfs] Brought ${r.synced.length} changed file(s) from your folder back into the Branch.` : "",
-        r.note,
-      ].filter(Boolean).join("\n");
-      return withNote(r.value, notes ? `\n${notes}` : "");
-    } catch (e: any) {
-      if (e?.minilfsNote) e.message = `${e.message}${e.minilfsNote}`;
-      throw e;
-    } finally {
-      status(ctx, describe(s));
-    }
-  }
-
+  // bash: always on the Branch inside the sandbox (pure sandbox model; same schema as Pi's bash)
   pi.registerTool({
     ...local.bash,
-    ...(role.role === "lead" ? { parameters: leadBashParams } : {}),
     async execute(id: string, params: any, signal: any, onUpdate: any, ctx: ExtensionContext) {
       if (disabled) return onHost("bash", id, { command: params.command, timeout: params.timeout }, signal, onUpdate);
-      if (params.elevated) {
-        if (role.role !== "lead") throw new Error("Refused: sub-agents cannot run elevated commands. Write in your result which step must run on the real folder; the main agent will run it.");
-        const reason = String(params.reason ?? "").trim();
-        if (!reason) throw new Error("elevated: true needs a reason (one sentence on why this must run on the real folder).");
-        const s0 = await need().catch(() => null);
-        const refusal = await approveElevation(String(params.command ?? ""), reason, ctx, s0);
-        if (refusal) throw new Error(refusal);
-        return runElevatedBash(id, { ...params, reason }, signal, onUpdate, ctx);
-      }
       const s = await need();
       const tool: any = createBashTool(s.cwd, { operations: ops(s).bash });
       const r = await s.mutate(id, "bash", () => tool.execute(id, { command: params.command, timeout: params.timeout }, signal, onUpdate));
-      const out = withNote(r.value, report(ctx, s, r));
-      const text = (out.content ?? []).map((c: any) => c.text ?? "").join("");
-      if (role.role !== "lead" || policy === "never") return out;
-      if (GIT_WRITE.test(text)) return withNote(out, GIT_HINT);
-      return /Operation not permitted/.test(text) ? withNote(out, BLOCKED_HINT) : out;
+      return withNote(r.value, report(ctx, s, r));
     },
   } as any);
 
@@ -296,8 +220,8 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     }
   }
 
-  // the user's !cmd runs on the real folder (the user is the highest authority), with the same
-  // converge -> run -> sync-back steps as an elevated agent command, so the Branch stays in step
+  // the user's !cmd runs on the Branch too (same sandbox and checkpoint as the agent's bash), so the
+  // conversation's file state stays one line of Commits; the folder changes only on apply
   pi.on("user_bash", async (_event, ctx) => {
     if (disabled) return undefined;
     const s = await need().catch(() => null);
@@ -305,32 +229,11 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     return {
       operations: {
         exec: async (cmd: string, cwd: string, o: any) => {
-          const hostCwdOf = cwd && cwd.startsWith(s.cwd) ? cwd : hostCwd;
-          const { spawn } = await import("node:child_process");
-          const runIt = () => new Promise<{ exitCode: number | null }>((done, fail) => {
-            const child = spawn(process.env.SHELL || "/bin/bash", ["-c", cmd], { cwd: hostCwdOf, env: o.env ?? process.env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
-            const kill = () => { try { process.kill(-child.pid!, "SIGKILL"); } catch { child.kill("SIGKILL"); } };
-            o.signal?.addEventListener("abort", kill, { once: true });
-            const timer = o.timeout ? setTimeout(kill, o.timeout * 1000) : undefined;
-            child.stdout.on("data", o.onData);
-            child.stderr.on("data", o.onData);
-            child.on("error", fail);
-            child.on("close", (code) => { if (timer) clearTimeout(timer); done({ exitCode: code }); });
-          });
-          try {
-            const r = await s.runElevated(runIt, { reason: "user command" });
-            if (r.checkpoint) pi.appendEntry(CHECKPOINT_ENTRY, { ...r.checkpoint, project: s.project, branch: s.workBranch });
-            recordSession(s);
-            const notes = [
-              r.applied.length ? `[minilfs] applied ${r.applied.length} Branch change(s) to your folder first` : "",
-              r.synced.length ? `[minilfs] brought ${r.synced.length} changed file(s) back into the Branch` : "",
-              r.note.trim(),
-            ].filter(Boolean);
-            if (notes.length) o.onData(Buffer.from(`\n${notes.join("\n")}\n`));
-            return r.value;
-          } finally {
-            status(ctx, describe(s));
-          }
+          const runCwd = cwd && s.toRel(cwd) !== null ? cwd : s.cwd;
+          const r = await s.mutate("user_bash", "bash", () => s.exec(cmd, runCwd, o));
+          const note = report(ctx, s, r);
+          if (note) o.onData(Buffer.from(`${note}\n`));
+          return r.value;
         },
       },
     };
@@ -401,8 +304,6 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     }
     const branchEntries = ctx.sessionManager.getBranch();
     role = resolveRole({ sessionFile: ctx.sessionManager.getSessionFile?.() });
-    const lastPolicy = [...branchEntries].reverse().find((e: any) => e.type === "custom" && e.customType === POLICY_ENTRY) as any;
-    policy = lastPolicy?.data?.policy ?? elevatePolicy(process.env, pi.getFlag("minilfs-elevate"));
     const branchInfo = inspectBranchEntries(branchEntries);
     const forkRef = event.reason === "fork" ? (pendingForkRef ?? branchInfo.headCommit ?? branchInfo.baseRef ?? null) : null;
     pendingForkRef = null;
@@ -476,18 +377,17 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     const lead = role.role === "lead";
     const note = [
       "",
-      "File tools and bash run on an isolated minilfs Branch of this project.",
-      `Paths under ${session?.cwd ?? "the working directory"} refer to that Branch; edits there do NOT reach the user's folder until ${lead ? "minilfs_apply (or an elevated command, which applies first)" : "the main agent merges your branch"}.`,
-      "Files outside the working directory are read-only. Secret files such as .env are not imported.",
-      "Each sandboxed bash call runs on its own: background processes (`cmd &`, dev servers) end when that call ends.",
+      "minilfs (LayerFS sandbox): file tools (read, write, edit, ls, find, grep) and bash run on an isolated LayerFS Branch of this project; every call that changes files is one Commit (1 call = 1 Commit).",
+      `Paths under ${session?.cwd ?? "the working directory"} refer to that Branch; edits there do NOT reach the user's folder until ${lead ? "you run minilfs_apply" : "the main agent merges your branch and applies it"}.`,
+      "The full project is in the Branch, including .git and dependencies: git status, diff, log, add, commit, branch and merge, builds and tests all work directly inside bash. Everything runs in the sandbox; there is no way to run commands on the real folder.",
+      "Git in the sandbox: only git's data (objects, refs, logs, HEAD, index) is writable. Config, hooks and similar files cannot be changed, so `git config`, `git remote add`, `git submodule add` and hook installs fail; ask the user to run those. Pushing needs credentials the sandbox does not have.",
+      "When a merge combines two Branches that both committed, minilfs records a git merge commit of both sides' heads on the checked-out branch itself (the merge result's `Git:` line says so): `git log` shows both sides' commits, nothing to do. Do not run `git merge` for it.",
+      "On apply, the folder's git gets the Branch's commits only if its refs did not move meanwhile; otherwise the files are applied and the changes show as uncommitted there.",
+      "Files outside the working directory are read-only. Secret files such as .env are not imported. .lww and protected .git files cannot be written.",
+      "Each bash call runs on its own: background processes (`cmd &`, dev servers) end when that call ends.",
       lead
-        ? (policy === "never"
-          ? "Elevated commands are disabled: if a step needs the real folder (git commit/push, Docker, mounts), tell the user."
-          : `If a step cannot run in the sandbox (Docker, mounts, setuid tools, long-running services, "Operation not permitted"), run that one bash command with elevated: true and a reason${policy === "ask" ? "; the user approves each one" : ""}. In the sandbox, git reads the user's real repository (log, status, diff, show are current) but cannot change it: git add, commit, push, pull, checkout/switch, branch, stash, reset, merge and rebase need elevated: true. Keep other work on the Branch.`)
-        : "You are a sub-agent: work only on your branch. You cannot write the user's folder or run elevated commands; if a step needs the real machine, say so in your result for the main agent. Do not run git commit/checkout/reset.",
-      lead
-        ? "The `minilfs` tool merges sub-agent branches into yours (merge, diff, show, ls, branches); `minilfs_apply` writes your branch to the user's folder."
-        : "The `minilfs` tool: status, diff, sync (bring the latest trunk into your branch).",
+        ? "Sub-agents work on their own branches and report their branch name. Combine them with the `minilfs` tool (action=\"merge\" branch=<name>; also diff, show, ls, branches, sync), then publish to main and the user's folder with `minilfs_apply`."
+        : "You are a sub-agent: work only on your branch and report your branch name (`minilfs` action=status) in your result; the main agent merges it and applies it to the user's folder. The `minilfs` tool: status, diff, sync (bring the latest main into your branch).",
     ].join("\n");
     return { systemPrompt: `${event.systemPrompt}\n${note}` };
   });
@@ -504,11 +404,10 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     ["merge", "把另一个分支（如子 agent 的分支）合并进本会话：merge <branch>"],
     ["retry", "checkpoint 失败被锁住后重试；启动失败（如目录太大）后重新启动"],
     ["clean", "清理本项目的 scratch 构建缓存目录"],
-    ["elevate", "主 agent 的单条提权：auto（默认，不问）| ask（每条确认）| never；不带参数查看"],
   ];
 
   pi.registerCommand("minilfs", {
-    description: "minilfs workspace: status | diff | history | apply | merge | retry | sync | branches | clean | elevate",
+    description: "minilfs workspace: status | diff | history | apply | merge | retry | sync | branches | clean",
     getArgumentCompletions: (prefix: string) => {
       const typed = prefix.trim();
       if (SUBCOMMANDS.some(([n]) => n === typed || typed.startsWith(`${n} `))) return null;
@@ -520,14 +419,6 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       const sub = argv[0] || "status";
       const say = (t: string, level: "info" | "warning" | "error" = "info") => (ctx.hasUI ? ctx.ui.notify(t, level) : console.log(t));
       if (disabled) return say("minilfs is off for this run.", "warning");
-      if (sub === "elevate") {
-        const v = argv[1];
-        if (!v) return say(`Elevated commands: ${policy} (auto | ask | never). Role: ${role.role} (${role.source}).`);
-        if (!["auto", "ask", "never"].includes(v)) return say("用法：/minilfs elevate auto|ask|never", "warning");
-        policy = v as ElevatePolicy;
-        pi.appendEntry(POLICY_ENTRY, { policy, at: Date.now() });
-        return say(`Elevated commands: ${policy}.`);
-      }
       if (sub === "retry" && startError && restart) {
         say("Restarting minilfs…");
         restart();
@@ -539,7 +430,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       if (sub === "status") {
         return say([
           describe(s),
-          `role ${role.role} (${role.source}) · elevated commands: ${role.role === "lead" ? policy : "not allowed"}`,
+          `role ${role.role} (${role.source}) · pure sandbox (no elevated commands)`,
           `project ${s.project} · volume ${s.volume}`,
           `branch ${s.workBranch} (alias: ${s.logicalBranch}, base ${s.baseBranch} @ ${s.baseRef.slice(0, 12)}) · head ${(s.headCommit ?? "none").slice(0, 12)}`,
           s.blocked ? `blocked: ${s.blocked.reason}` : "",
@@ -593,7 +484,9 @@ export default function minilfsExtension(pi: ExtensionAPI) {
           return say(d.length ? d.map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`).join("\n") : `No changes between ${baseBranch} and ${targetBranch}.`);
         }
         const d = await applicableDiff(s);
-        return say(d.length ? d.map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`).join("\n") : "No changes in the minilfs workspace.");
+        const git = await gitLine(s);
+        const lines = [...d.map((i) => `${i.kind.padEnd(8)} ${i.path.replace(/^\//, "")}`), ...(git ? [git] : [])];
+        return say(lines.length ? lines.join("\n") : "No changes in the minilfs workspace.");
       }
       if (sub === "sync") {
         const res = await s.syncHostDriftIntoMain({ full: argv.includes("--full") });
@@ -611,8 +504,10 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       if (sub === "apply") {
         const allowRevert = argv.includes("--revert");
         const d = await applicableDiff(s);
-        if (!d.length) return say("Nothing to apply.");
-        if (ctx.hasUI && !(await ctx.ui.confirm("Apply minilfs changes to your folder?", d.map((i) => `${i.kind} ${i.path}`).slice(0, 40).join("\n")))) return say("Apply cancelled.");
+        const git = await gitLine(s);
+        if (!d.length && !git) return say("Nothing to apply.");
+        const preview = [...d.map((i) => `${i.kind} ${i.path}`).slice(0, 40), ...(git ? [`${git} (refs and HEAD only when your folder's git did not move)`] : [])];
+        if (ctx.hasUI && !(await ctx.ui.confirm("Apply minilfs changes to your folder?", preview.join("\n")))) return say("Apply cancelled.");
         let r;
         try {
           r = await s.apply({ allowRevert });
@@ -630,7 +525,8 @@ export default function minilfsExtension(pi: ExtensionAPI) {
         status(ctx, describe(s));
         return say([
           `Applied ${r.applied.length} change(s) to ${s.cwd}.`,
-          r.skipped.length ? `Skipped (never applied): ${r.skipped.filter((p) => !hiddenPath(p)).join(", ") || "git metadata"}` : "",
+          r.git ? `Git: ${r.git}` : "",
+          r.skipped.filter((p) => !hiddenPath(p)).length ? `Skipped (never applied): ${r.skipped.filter((p) => !hiddenPath(p)).join(", ")}` : "",
           ...r.warnings.map((w) => `Warning: ${w}`),
           s.unapplied ? "Changes made while applying are still pending: run /minilfs apply again." : "",
         ].filter(Boolean).join("\n"), r.warnings.length ? "warning" : "info");

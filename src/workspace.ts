@@ -1,21 +1,28 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { constants as fsc, createReadStream, existsSync, mkdtempSync, promises as fsp, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { constants as fsc, createReadStream, promises as fsp, realpathSync } from "node:fs";
+import { homedir, hostname } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
-import { IgnoreRules } from "./ignore.ts";
 import { ensureBundle, missingBundleFiles } from "./bundle.ts";
 import { BindingStore, type HostEntry, type HostIndex, type ProjectRecord, type SessionBinding } from "./bindings.ts";
 import type { LayerfsConfig } from "./config.ts";
-import { createProjectClient, ensureNativeDirs, type NativeSpec } from "./core/client.ts";
+import { createProjectClient, ensureNativeDirs, initProjectClient, type NativeSpec, type ProjectClient } from "./core/client.ts";
 import { resolveExecutionDriver, type ExecutionDriver } from "./core/driver.ts";
 import { run } from "./core/exec-helper.ts";
 import { bothSpellings, buildSeatbeltProfile } from "./seatbelt.ts";
+import { decideGitPath, GIT_APPLY_ORDER, GIT_JOIN_HINT, gitChangeSummary, gitPathKind, gitSig, isProtectedPath, isSafeRefName, MERGE_UNITS, type GitPathKind } from "./gitpaths.ts";
 import { isOrphan, MountLeases } from "./mount-leases.ts";
+import { GIT_JOIN_SCRIPT, parseJoin, symbolicHead, type JoinResult } from "./gitjoin.ts";
+import { stopWorkers } from "./core/worker.ts";
+import { alive } from "./lock.ts";
 
 export interface Workspace { sandbox: string; path: string; image?: string }
 export interface Checkpoint { origins: string[]; label: string; commit: string | null; branch: string; changed: boolean; at: number }
-export interface ApplyResult { applied: string[]; skipped: string[]; conflicts: string[]; unchanged: string[]; warnings: string[] }
+export interface ApplyResult {
+  applied: string[]; skipped: string[]; conflicts: string[]; unchanged: string[]; warnings: string[];
+  /** what apply did to the folder's git metadata (views hide `.git`), e.g. ".git: 1 ref(s): refs/heads/main, HEAD, index, 3 object file(s)" */
+  git?: string;
+}
 export interface UserBranch { name: string; base: string; head: string | null; logicalBranch: string; isYours: boolean }
 export interface MergeResult {
   merged: boolean;
@@ -24,7 +31,24 @@ export interface MergeResult {
   conflicts: Array<{ path: string; kind?: string }>;
   lww: number;
   lwwPaths?: string[];
-  fallback?: boolean;
+  /** conflicting paths decided by `strategy` (copied from the chosen side before merging again) */
+  resolved?: string[];
+  /**
+   * Both sides ran git: the merged `.git` (refs, HEAD, index) is one side's whole; the other side's
+   * branch heads are kept as refs under `refs/minilfs/<branch>/` (their objects are merged), so its
+   * commits stay reachable. Says which side was kept and how to combine them.
+   */
+  gitNote?: string;
+}
+export interface MergeOptions {
+  /**
+   * On a Conflict, the side whose version wins on the conflicting paths. LayerFS branch.merge has no
+   * force; this follows the official recipe (resolving conflicts, scenario 9): copy the chosen side's
+   * files onto a working fork of the other side, then merge again; identical files merge cleanly.
+   */
+  strategy?: "ours" | "theirs";
+  /** official LayerFS merge units (branch.merge's `units`) */
+  units?: Array<string | { name: string; patterns: string[] }>;
 }
 export interface OpenOptions {
   /** reports the current start phase (shown in the status bar while starting) */
@@ -32,6 +56,37 @@ export interface OpenOptions {
   reason?: "startup" | "reload" | "new" | "resume" | "fork";
   resumeBinding?: { project?: string; baseBranch?: string; workBranch?: string; baseRef?: string; headCommit?: string | null; seq?: number; alignedRef?: string | null };
   forkFromRef?: string | null;
+}
+
+/**
+ * Refuses a write whose real destination (symlinks resolved: every parent, and the final node when
+ * `followFinal`, as fs.writeFile does) is a protected path of `root` (src/gitpaths.ts), so a link
+ * such as `x -> .git/hooks` cannot carry a write into `.git/hooks/pre-commit`.
+ */
+export async function assertNotProtectedTarget(root: string, candidate: string, followFinal: boolean): Promise<void> {
+  let probe = candidate;
+  const rest: string[] = [];
+  if (!followFinal) { rest.unshift(basename(probe)); probe = dirname(probe); }
+  for (let i = 0; i < 4096; i++) {
+    const real = await fsp.realpath(probe).catch(() => null);
+    if (real) {
+      const full = rest.length ? join(real, ...rest) : real;
+      for (const r of bothSpellings(root)) {
+        if (full !== r && !full.startsWith(`${r}/`)) continue;
+        const rel = full.slice(r.length + 1);
+        if (isProtectedPath(rel)) {
+          const err = new Error(`writes to ${rel} are refused for security (reached through a symlink)`);
+          (err as any).code = "EACCES";
+          throw err;
+        }
+      }
+      return;
+    }
+    rest.unshift(basename(probe));
+    const up = dirname(probe);
+    if (up === probe) return;
+    probe = up;
+  }
 }
 
 export async function assertInsideWorkspace(wsReal: string, candidate: string, allowFinalSymlink = false): Promise<string> {
@@ -95,7 +150,14 @@ export class LayerfsError extends Error {
 }
 
 type Log = (msg: string) => void;
-const LWW_DEFAULT = "%include .gitignore\n";
+/**
+ * The project's initial `/.lww` (LayerFS merge rules) when the folder has none: git-ignored output
+ * merges last-writer-wins. `.git` and `node_modules` are not here: every merge passes them as merge
+ * units (MERGE_UNITS, src/gitpaths.ts), each taken whole from one side, never mixed file by file.
+ */
+export const LWW_DEFAULT = "%include .gitignore\n";
+/** Workspaces one LayerFS Sandbox holds (workspace.mount answers Capacity beyond it). */
+const SANDBOX_CAPACITY = 16;
 const HOMES = [...new Set([homedir(), (() => { try { return realpathSync(homedir()); } catch { return homedir(); } })()])];
 /** Extra secrets never readable outside the project, on top of config.excludes. */
 const OUTSIDE_SECRET_PATTERNS = [
@@ -105,13 +167,17 @@ const OUTSIDE_SECRET_PATTERNS = [
 const sha = (b: Buffer | string) => createHash("sha256").update(b).digest("hex");
 
 /**
- * Native LayerFS Session:
- * - Shares one persistent APFS Project Store per host folder across sessions/agents (`BindingStore`)
+ * Native LayerFS v1.1.0 Session (official @layerfs/agent, pure sandbox model):
+ * - Shares one persistent Project Store per host folder across sessions/agents (`BindingStore`)
+ * - Imports the full tree (`.git`, ignored files, dependencies, symlinks, caches, output); only
+ *   secrets (`config.excludes`) and explicit `config.branchOnly` patterns stay out
  * - Syncs external host edits into `"main"` on session start
  * - Routes `read / write / edit / ls / find / grep` through `lfs.fs.*` directly on the Store,
  *   with automatic byte-exact Workspace fallback for binary, symlinks or >48KB lines
- * - Mounts a Workspace on demand per `bash` call via native NFSv3 loopback + Seatbelt (`sandbox-exec`)
- * - Diffs and applies against this session's own `baseBranch` anchor and merges before publishing `"main"`
+ * - Runs each `bash` call in a Workspace: `sandbox.create` / `workspace.mount(sandbox, branch)`,
+ *   native NFSv3 loopback + Seatbelt (`sandbox-exec`), `workspace.commit`, `workspace.unmount`
+ * - Merges Branches with `branch.merge`, applies against this session's `baseBranch` anchor and
+ *   publishes `"main"`
  * - Supports `/resume`, `/tree` and `/fork` time-travel via `switchToRef()`
  */
 export class LayerfsSession {
@@ -134,7 +200,6 @@ export class LayerfsSession {
   get boxSpec(): NativeSpec { return this.spec; }
   projectRecord!: ProjectRecord;
   lfs: any;
-  operator: any;
   LayerFSError: any;
 
   baseBranch = "";
@@ -146,10 +211,16 @@ export class LayerfsSession {
   blocked: { reason: string; heldWs?: Workspace } | null = null;
   /**
    * A Commit of the work branch that holds everything in the base (set when the base moves: apply,
-   * elevated, merging main). While the work branch still descends from it, the base..branch diff is the
+   * sync, merging main). While the work branch still descends from it, the base..branch diff is the
    * Branch's own work, so apply cannot revert anything: no guessing. null: unknown, apply guesses.
    */
   alignedRef: string | null = null;
+  /** When main last moved (apply or host sync), from the project record; null if unknown. */
+  get mainUpdatedAt(): number | null {
+    return this.bindings?.byName(this.projectRecord?.name)?.updatedAt ?? null;
+  }
+  /** Branches merged into this one since the last apply (main, and new sub-agents, do not have them yet). */
+  mergedSinceApply: string[] = [];
   pendingOrigins: string[] = [];
   checkpoints: Checkpoint[] = [];
   unapplied = false;
@@ -164,11 +235,8 @@ export class LayerfsSession {
   private mutex: Promise<unknown> = Promise.resolve();
   private closed = false;
   private openAborted = false;
-  /**
-   * Git ignore rules (+ `.minilfsignore`): ignored paths are not imported, not synced, never applied,
-   * like branch-only paths. Agents may still create them inside their branch.
-   */
-  readonly ignore: IgnoreRules;
+  /** the Sandbox this session mounts its Workspaces in (a number such as "1"), once known */
+  private sandboxId: string | null = null;
   /** set by open() when a resumed conversation's file state could not be restored */
   resumeLost: string | null = null;
 
@@ -183,7 +251,6 @@ export class LayerfsSession {
     this.shortId = createHash("sha256").update(`${sessionId}:${randomBytes(8).toString("hex")}`).digest("hex").slice(0, 10);
     this.logicalBranch = config.branchName || (config.team && process.env.PI_SUBAGENT_CHILD !== "1" ? "lead" : `s-${this.shortId}`);
     this.config = config;
-    this.ignore = new IgnoreRules(this.cwd);
     this.driver = driver ?? resolveExecutionDriver(config.driver ?? "native");
     this.log = log;
   }
@@ -200,8 +267,11 @@ export class LayerfsSession {
     // first start on a new Mac: fetch the prebuilt bundle instead of failing
     const fetchProblem = await ensureBundle(config.bundle, (m) => onPhase?.(m)).catch((e) => `installing the LayerFS bundle failed: ${e?.message ?? e}`);
     for (const f of await missingBundleFiles(config.bundle)) problems.push(`missing ${f}`);
-    if (fetchProblem && problems.length) problems.push(fetchProblem);
-    for (const bin of ["/sbin/mount_nfs", "/usr/bin/sandbox-exec"]) {
+    // a missing file reports the download problem too; a complete bundle of another LayerFS commit is a problem by itself
+    if (fetchProblem && (problems.length || /needs [0-9a-f]{12}/.test(fetchProblem))) problems.push(fetchProblem);
+    problems.push(...(config.problems ?? []));
+    const mountBin = config.nfsMount ? config.nfsMount.trim().split(/\s+/)[0] : "/sbin/mount_nfs";
+    for (const bin of [mountBin, "/usr/bin/sandbox-exec"]) {
       try { await fsp.access(bin, fsc.X_OK); } catch { problems.push(`missing or non-executable ${bin}`); }
     }
     if (problems.length) throw new LayerfsError("Preflight", `LayerFS is not available: ${problems.join("; ")}`);
@@ -214,7 +284,6 @@ export class LayerfsSession {
     this.spec = ensureNativeDirs(this.config);
     this.bindings = new BindingStore(join(this.config.root, "state"));
     this.leases = new MountLeases(join(this.config.root, "state", "mounts"));
-    await this.ignore.load();
 
     const phase = (p: string) => {
       if (this.openAborted) throw new LayerfsError("Aborted", "session closed while minilfs was starting");
@@ -227,10 +296,7 @@ export class LayerfsSession {
       this.projectRecord = await this.initProjectForFolder();
     } else {
       this.projectRecord = existing!;
-      const client = await createProjectClient(this.spec, this.projectRecord);
-      this.lfs = client.lfs;
-      this.operator = client.operator;
-      this.LayerFSError = client.LayerFSError;
+      this.useClient(await createProjectClient(this.spec, this.projectRecord));
       const hasPriorSession =
         Boolean(options.resumeBinding?.workBranch) ||
         Boolean(this.bindings.session(this.sessionId)?.project === this.projectRecord.name) ||
@@ -254,6 +320,11 @@ export class LayerfsSession {
     this.log(`ready in ${Date.now() - t0} ms (project=${this.project} base=${this.baseBranch} work=${this.workBranch})`);
   }
 
+  private useClient(client: ProjectClient): void {
+    this.lfs = client.lfs;
+    this.LayerFSError = client.LayerFSError;
+  }
+
   private async isProjectAlive(p: ProjectRecord): Promise<boolean> {
     const homeEntry = join(this.spec.home, p.name);
     const hasHome = await fsp.access(homeEntry).then(() => true, () => false);
@@ -268,10 +339,7 @@ export class LayerfsSession {
     return this.bindings.withProjectLock(folderLock, async () => {
       const again = this.bindings.byFolder(this.cwd);
       if (again && (await this.isProjectAlive(again))) {
-        const client = await createProjectClient(this.spec, again);
-        this.lfs = client.lfs;
-        this.operator = client.operator;
-        this.LayerFSError = client.LayerFSError;
+        this.useClient(await createProjectClient(this.spec, again));
         return again;
       }
       const reserved = this.bindings.reserveProjectName(this.cwd, this.spec.home);
@@ -297,24 +365,31 @@ export class LayerfsSession {
         const lwwPath = join(staged, ".lww");
         const hadLww = await fsp.access(lwwPath).then(() => true, () => false);
         if (!hadLww) await fsp.writeFile(lwwPath, LWW_DEFAULT + this.config.branchOnly.map((p) => `${p}\n`).join(""));
+        // the Branch's own git should not list .lww as untracked: one local exclude line in the staged
+        // copy's .git (after the host index was taken, so host sync does not see it as drift)
+        const stagedExclude = join(staged, ".git", "info", "exclude");
+        if ((await fsp.lstat(join(staged, ".git")).catch(() => null))?.isDirectory()) {
+          const text = await fsp.readFile(stagedExclude, "utf8").catch(() => "");
+          if (!text.split("\n").includes("/.lww")) {
+            await fsp.mkdir(dirname(stagedExclude), { recursive: true });
+            await fsp.writeFile(stagedExclude, `${text}${text.length && !text.endsWith("\n") ? "\n" : ""}/.lww\n`);
+          }
+        }
 
         await fsp.mkdir(join(this.spec.stores, volume), { recursive: true, mode: 0o700 });
         const record: ProjectRecord = { name, source: this.cwd, volume, mainRef: "", created, updatedAt: created };
-        const client = await createProjectClient(this.spec, record);
-        this.lfs = client.lfs;
-        this.operator = client.operator;
-        this.LayerFSError = client.LayerFSError;
         try {
-          const initRes = await this.lfs.project.init(staged);
-          record.mainRef = initRes.layer;
+          // official @layerfs/agent: one Init from the staged copy, then the client is open
+          this.useClient(await initProjectClient(this.spec, record, staged, this.config.initTimeoutMs));
+          record.mainRef = this.lfs.created?.layer ?? "";
         } catch (e: any) {
           await fsp.rm(join(this.spec.stores, volume), { recursive: true, force: true }).catch(() => {});
           await fsp.rm(join(this.spec.home, name), { recursive: true, force: true }).catch(() => {});
           if (/Deadline/.test(String(e?.message ?? e))) {
             const mb = Math.round(Object.values(hostIndex).reduce((s, x) => s + (x.size ?? 0), 0) / 1024 / 1024);
             throw new LayerfsError("InitDeadline",
-              `importing ${Object.keys(hostIndex).length} files (${mb} MB) took longer than LayerFS's fixed 60 s Init limit; nothing was kept. ` +
-              `Ignore large folders agents need not edit (data, build output) in .gitignore or ${join(this.cwd, ".minilfsignore")}, then run /minilfs retry.`, e);
+              `importing ${Object.keys(hostIndex).length} files (${mb} MB) took longer than the LayerFS Init limit (${Math.round((this.config.initTimeoutMs ?? 300_000) / 1000)} s); nothing was kept. ` +
+              `Raise MINILFS_INIT_TIMEOUT_MS, or keep large folders agents need not edit out with MINILFS_BRANCH_ONLY (e.g. "data/"), then run /minilfs retry.`, e);
           }
           throw e;
         }
@@ -331,9 +406,8 @@ export class LayerfsSession {
   /**
    * Detects host edits made outside Pi (editor, git pull) and syncs them into "main" before forking.
    */
-  async syncHostDriftIntoMain(options: { full?: boolean; limitToImport?: boolean } = {}): Promise<{ synced: string[] }> {
+  async syncHostDriftIntoMain(options: { full?: boolean } = {}): Promise<{ synced: string[] }> {
     return this.bindings.withProjectLock(this.projectRecord.name, async (guard) => {
-      await this.ignore.load(); // .gitignore / tracked files may have changed since the last session
       const full = options.full || Boolean(this.bindings.byName(this.projectRecord.name)?.mainStale);
       const prev = full ? await this.mainIndex() : this.bindings.readHostIndex(this.projectRecord.name);
       const scanned = await scanHostDirectory(this.cwd, this.hostSkip, full ? {} : prev, true);
@@ -344,20 +418,18 @@ export class LayerfsSession {
         const old = prev[rel];
         if (!old || !sameSig(old, ent)) changed.push(rel);
       }
-      // a path that is now ignored is branch-only: sync leaves it in main (projects imported before
-      // ignore rules applied keep their node_modules etc. instead of a mass delete)
+      // a path that is now secret or branch-only stays in main (never a mass delete)
       const skip = this.hostSkip;
       for (const rel of Object.keys(prev)) if (!curr[rel] && !skip(rel, false)) removed.push(rel);
-      if (options.limitToImport && changed.length) {
-        // after an elevated command: refuse to pull a huge new tree into memory and the Store
+      if (changed.length) {
+        // never pull a huge new tree into memory and the Store unasked (e.g. the first start after an
+        // upgrade that imports .git and dependencies: the old host index lacks them)
         const bytes = changed.reduce((n, rel) => n + (curr[rel]?.size ?? 0), 0);
         if (changed.length > this.config.maxImportFiles || bytes > this.config.maxImportBytes) {
-          throw new LayerfsError("TooLarge", `${changed.length} changed file(s), ${Math.round(bytes / 1048576)} MB in your folder exceed the import limit; ignore large output folders in .gitignore or .minilfsignore`);
+          throw new LayerfsError("TooLarge", `${changed.length} changed file(s), ${Math.round(bytes / 1048576)} MB in your folder exceed the import limit (${this.config.maxImportFiles} files / ${Math.round(this.config.maxImportBytes / 1048576)} MB). Raise MINILFS_MAX_IMPORT_FILES / MINILFS_MAX_IMPORT_MB, or keep large data folders out with MINILFS_BRANCH_ONLY; then /minilfs retry.`);
         }
       }
-      // projects imported by older versions hold a frozen copy of .git in main: drop it once
-      const legacyGit = Boolean(await this.lfs.fs.stat("main", "/.git").catch(() => null));
-      if (!changed.length && !removed.length && !legacyGit) {
+      if (!changed.length && !removed.length) {
         this.bindings.writeHostIndex(this.projectRecord.name, curr);
         if (full) this.bindings.setMainStale(this.projectRecord.name, false);
         return { synced: [] };
@@ -365,43 +437,31 @@ export class LayerfsSession {
 
       const syncBranch = `sync-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
       await this.lfs.branch.fork(syncBranch, "main");
-      const storeOps: any[] = [];
-      const mountJobs: Array<{ rel: string; entry: HostEntry }> = [];
-      if (legacyGit) storeOps.push({ op: "rm", path: "/.git", recursive: true });
-      for (const rel of removed) storeOps.push({ op: "rm", path: `/${rel}` });
-      for (const rel of changed) {
+      const changedBytes = changed.reduce((n, rel) => n + (curr[rel]?.size ?? 0), 0);
+      const special = (rel: string) => {
         const ent = curr[rel];
         const prevEnt = prev[rel];
         const exec = ((ent.mode ?? 0o644) & 0o111) !== 0;
-        if (ent.kind === "symlink" || prevEnt?.kind === "symlink" || exec || (prevEnt?.mode !== undefined && ((prevEnt.mode ^ (ent.mode ?? 0o644)) & 0o111))) {
-          mountJobs.push({ rel, entry: ent });
-        } else {
+        const execFlip = prevEnt?.mode !== undefined && ((prevEnt.mode ^ (ent.mode ?? 0o644)) & 0o111) !== 0;
+        return ent.kind === "symlink" || prevEnt?.kind === "symlink" || exec || execFlip;
+      };
+      const viaStore = changed.length + removed.length <= SYNC_STORE_MAX_FILES && changedBytes <= SYNC_STORE_BATCH_BYTES;
+      if (viaStore) {
+        // small drift (the usual case): one Store Commit, no mount, plus one mount for symlinks and modes
+        const storeOps: any[] = [];
+        const mountJobs: string[] = [];
+        for (const rel of removed) storeOps.push({ op: "rm", path: `/${rel}` });
+        for (const rel of changed) {
+          if (special(rel)) { mountJobs.push(rel); continue; }
           const dir = posix.dirname(`/${rel}`);
           if (dir !== "/") storeOps.push({ op: "mkdir", path: dir });
           storeOps.push({ op: "write", path: `/${rel}`, bytes: scanned.bytes.get(rel) ?? (await fsp.readFile(join(this.cwd, rel))) });
         }
-      }
-      if (storeOps.length) {
-        await this.lfs.fs.apply(syncBranch, storeOps, "sync host drift");
-      }
-      if (mountJobs.length) {
-        await this.withMountedBranch(syncBranch, true, "sync host special files", async (wsPath) => {
-          for (const { rel, entry } of mountJobs) {
-            const dst = posix.join(wsPath, rel);
-            await this.assertInsideWs(wsPath, dst, true);
-            await fsp.mkdir(dirname(dst), { recursive: true });
-            await fsp.rm(dst, { force: true });
-            if (entry.kind === "symlink") {
-              const target = entry.sig.slice("link:".length);
-              await fsp.symlink(target, dst);
-            } else {
-              const bytes = scanned.bytes.get(rel) ?? (await fsp.readFile(join(this.cwd, rel)));
-              const mode = (entry.mode ?? 0o644) & 0o7777;
-              await fsp.writeFile(dst, bytes);
-              await fsp.chmod(dst, mode);
-            }
-          }
-        });
+        if (storeOps.length) await this.lfs.fs.apply(syncBranch, storeOps, "sync host drift");
+        if (mountJobs.length) await this.copyHostIntoBranch(syncBranch, mountJobs, [], curr, "sync host special files");
+      } else {
+        // large drift: one mount, files copied from the folder one by one (bounded memory, one Commit)
+        await this.copyHostIntoBranch(syncBranch, changed, removed, curr, "sync host drift");
       }
       guard();
       const pub = await this.lfs.branch.publish(syncBranch);
@@ -410,6 +470,30 @@ export class LayerfsSession {
       this.bindings.writeHostIndex(this.projectRecord.name, curr);
       if (full) this.bindings.setMainStale(this.projectRecord.name, false);
       return { synced: [...changed, ...removed] };
+    });
+  }
+
+  /** Copies `changed` paths from the folder into `branch` and removes `removed`, in one mount and one Commit. */
+  private async copyHostIntoBranch(branch: string, changed: string[], removed: string[], curr: HostIndex, message: string): Promise<void> {
+    await this.withMountedBranch(branch, true, message, async (wsPath) => {
+      for (const rel of removed) {
+        const dst = posix.join(wsPath, rel);
+        await this.assertInsideWs(wsPath, dst, true);
+        await fsp.rm(dst, { force: true });
+      }
+      for (const rel of changed) {
+        const entry = curr[rel];
+        const dst = posix.join(wsPath, rel);
+        await this.assertInsideWs(wsPath, dst, true);
+        await fsp.mkdir(dirname(dst), { recursive: true });
+        await fsp.rm(dst, { recursive: true, force: true });
+        if (entry.kind === "symlink") {
+          await fsp.symlink(entry.sig.slice("link:".length), dst);
+        } else {
+          await fsp.copyFile(join(this.cwd, rel), dst);
+          await fsp.chmod(dst, (entry.mode ?? 0o644) & 0o7777);
+        }
+      }
     });
   }
 
@@ -422,10 +506,14 @@ export class LayerfsSession {
     });
   }
 
-  /** Host paths never imported or synced: secrets, branch-only patterns, git-ignored paths. */
+  /**
+   * Host paths never imported or synced: secrets (`config.excludes`) and explicit `config.branchOnly`
+   * patterns only. Official LayerFS model: `.git` (with its index), ignored files, dependencies,
+   * symlinks, caches and output are all project state; git ignore rules do not filter it.
+   */
   private get hostSkip(): Skip {
     const patterns = [...this.config.excludes, ...this.config.branchOnly];
-    return (rel, isDir) => isExcludedPath(rel, patterns) || (isDir && isExcludedPath(`${rel}/x`, patterns)) || this.ignore.isIgnored(rel, isDir);
+    return (rel, isDir) => isExcludedPath(rel, patterns) || (isDir && isExcludedPath(`${rel}/x`, patterns));
   }
 
   private async setupBranches(options: OpenOptions): Promise<void> {
@@ -461,7 +549,7 @@ export class LayerfsSession {
         this.logicalBranch = saved.logicalBranch;
       }
       const branches = await this.listAllBranches();
-      // The saved seq can lag: a session entry in the conversation log has no seq, and apply/elevated
+      // The saved seq can lag: a session entry in the conversation log has no seq, and apply/sync
       // advance seq without renaming the work branch. Never reuse a name this session already made.
       this.seq = Math.max(this.seq, highestSeq(branches, this.shortId));
       this.alignedRef = saved.alignedRef ?? null;
@@ -493,8 +581,10 @@ export class LayerfsSession {
     }
 
     if (!this.config.branchName && this.logicalBranch === "lead") {
+      // `lead` is taken only by a session whose process still runs: a finished run (or a crashed
+      // one) keeps its branch, but not the alias
       const existingLead = Object.entries(this.bindings.data.sessions).find(
-        ([sid, s]) => s.project === this.projectRecord.name && sid !== this.sessionId && s.logicalBranch === "lead",
+        ([sid, s]) => s.project === this.projectRecord.name && sid !== this.sessionId && s.logicalBranch === "lead" && sessionAlive(s),
       );
       if (existingLead) {
         this.logicalBranch = `s-${this.shortId}`;
@@ -511,60 +601,6 @@ export class LayerfsSession {
     this.baseRef = fb.head ?? fb.base;
     this.headCommit = fw.head ?? (fromRef !== "main" && fromRef !== this.baseRef ? fromRef : null);
     this.unapplied = fromRef !== "main" ? (await this.diff()).filter((i) => i.type !== "dir").length > 0 : false;
-  }
-
-  /**
-   * Runs one command on the real project folder, outside the Branch and its sandbox ("elevated").
-   * The session mutex is held for all three steps so tool calls of this session do not interleave;
-   * the cross-process project lock is held only inside steps 1 and 3, never while the command runs.
-   *   1. converge: apply pending Branch changes to the folder (refused on conflict / WouldRevert)
-   *   2. run the command in the folder
-   *   3. sync the folder into main, move the base to the new main, merge main into the work branch
-   *      (main wins: the folder is the authority right after the command); keeps branch-only output
-   * Step 3 runs even when the command fails or is cancelled, since it may already have changed files.
-   */
-  async runElevated<T>(
-    run: () => Promise<T>,
-    options: { reason: string },
-  ): Promise<{ value: T; applied: string[]; synced: string[]; checkpoint: Checkpoint | null; note: string }> {
-    const job = this.mutex.then(async () => {
-      if (this.blocked) throw new Error(`minilfs checkpoint failed earlier (${this.blocked.reason}); run /minilfs retry before an elevated command`);
-      // 1. converge
-      let applied: string[] = [];
-      if (this.unapplied && !(await this.pendingAlreadyOnHost().catch(() => false))) {
-        const r = await this.applyLocked({});
-        if (r.conflicts.length) {
-          throw new LayerfsError("ElevateConflict", `not run: applying this Branch's changes to your folder first conflicts on ${r.conflicts.join(", ")} (changed in the folder meanwhile). Resolve them (e.g. apply after checking the files) and retry.`);
-        }
-        applied = r.applied;
-      }
-      // 2. run
-      let value: T | undefined;
-      let runError: unknown = null;
-      try { value = await run(); } catch (e) { runError = e; }
-      // 3. sync back
-      let synced: string[] = [];
-      let checkpoint: Checkpoint | null = null;
-      let note = "";
-      try {
-        synced = (await this.syncHostDriftIntoMain({ limitToImport: true })).synced;
-        // Also when this command changed nothing but main moved (another session applied): the base moves
-        // to main, so the Branch must take main's changes first or the next apply would revert them.
-        const force = synced.length > 0;
-        const m = await this.adoptMainLocked(force);
-        if (m?.head) {
-          checkpoint = { origins: [`host: ${options.reason}`.slice(0, 200)], label: "host", commit: m.head, branch: m.branch, changed: true, at: Date.now() };
-          this.checkpoints.push(checkpoint);
-        }
-      } catch (e: any) {
-        this.bindings.setMainStale(this.projectRecord.name, true);
-        note = `\n[minilfs] The command ran in your folder, but bringing its changes back into the Branch failed (${e?.code ?? "Error"}: ${String(e?.message ?? e).slice(0, 200)}). The Branch does not have them yet; the next start resyncs main from your folder.`;
-      }
-      if (runError) throw Object.assign(runError as object, { minilfsNote: note });
-      return { value: value as T, applied, synced, checkpoint, note };
-    });
-    this.mutex = job.catch(() => {});
-    return job;
   }
 
   /**
@@ -632,27 +668,24 @@ export class LayerfsSession {
   }
 
   /**
-   * Merges another Branch of this project into this session's work branch.
+   * Merges another Branch of this project into this session's work branch with the official
+   * `branch.merge(work, other, target, message, units)`: three-way, `/.lww` rules of the work branch,
+   * both parents recorded. On a Conflict nothing changes and the conflicts are returned, unless
+   * `options.strategy` names the side that wins on the conflicting paths (see MergeOptions).
    */
-  async mergeBranch(
-    other: string,
-    options?: { strategy?: "ours" | "theirs"; resolve?: Record<string, "ours" | "theirs"> }
-  ): Promise<MergeResult> {
+  async mergeBranch(other: string, options?: MergeOptions): Promise<MergeResult> {
     const job = this.mutex.then(() => this.mergeBranchLocked(other, options));
     this.mutex = job.catch(() => {});
     return job;
   }
 
   /** mergeBranch body; the caller holds the session mutex. */
-  private async mergeBranchLocked(
-    other: string,
-    options?: { strategy?: "ours" | "theirs"; resolve?: Record<string, "ours" | "theirs"> }
-  ): Promise<MergeResult> {
+  private async mergeBranchLocked(other: string, options: MergeOptions = {}): Promise<MergeResult> {
     {
       if (this.blocked) throw new Error(`cannot merge while a checkpoint is pending (${this.blocked.reason}); run /minilfs retry`);
       let resolvedOther = await this.resolveBranchName(other);
       if (resolvedOther === "main") {
-        // "main" is the trunk layer, not a Branch: LayerFS merge needs a Branch, so pin a snapshot of it
+        // "main" is published, not a Branch: LayerFS merge needs a Branch, so pin a snapshot of it
         resolvedOther = `h-main-${this.shortId}-${Date.now().toString(36)}`; // does not consume seq: work-branch names stay -1, -2, …
         await this.lfs.branch.fork(resolvedOther, "main");
       } else {
@@ -660,13 +693,52 @@ export class LayerfsSession {
         if (!branches.some((b) => b.name === resolvedOther)) throw new LayerfsError("NoSuchBranch", `no LayerFS branch named ${other} (see /minilfs branches)`);
       }
 
-      // Native merge first, also with a strategy: it records both parents, so later merges and apply
-      // know what this Branch already holds. The path-wise fallback (no lineage) runs only on conflict.
-      this.seq++;
-      const target = `s-${this.shortId}-${this.seq}`;
       const priorWork = this.workBranch;
+      const message = `merge ${resolvedOther} into ${this.workBranch}`;
+      let ours = this.workBranch;
+      let theirs = resolvedOther;
+      let resolved: string[] = [];
+      let m: any;
+      this.seq++;
+      let target = `s-${this.shortId}-${this.seq}`;
+      const units = mergeUnits(options.units);
       try {
-        const m = await this.lfs.branch.merge(this.workBranch, resolvedOther, target, `merge ${resolvedOther} into ${this.workBranch}`);
+        m = await this.lfs.branch.merge(ours, theirs, target, message, units);
+      } catch (e: any) {
+        if (e?.code !== "Conflict") throw e;
+        const conflicts = conflictList(e);
+        if (!options.strategy || !conflicts.length) return { merged: false, branch: this.workBranch, head: this.headCommit, conflicts, lww: 0 };
+        // official recipe (no force on branch.merge): copy the winning side's version of each
+        // conflicting path onto a working fork of the losing side, then merge again
+        const stamp = `${this.shortId}-${Date.now().toString(36)}`;
+        if (options.strategy === "theirs") {
+          ours = `c-${stamp}-o`;
+          await this.lfs.branch.fork(ours, this.workBranch);
+          await this.copyPaths(resolvedOther, ours, conflicts, `take ${resolvedOther}'s side of conflicting files`);
+        } else {
+          theirs = `c-${stamp}-t`;
+          await this.lfs.branch.fork(theirs, resolvedOther);
+          await this.copyPaths(this.workBranch, theirs, conflicts, `keep ${this.workBranch}'s side of conflicting files`);
+        }
+        resolved = conflicts.map((c) => c.path);
+        this.seq++;
+        target = `s-${this.shortId}-${this.seq}`;
+        try {
+          m = await this.lfs.branch.merge(ours, theirs, target, `${message} (${options.strategy} on ${resolved.length} conflicting file(s))`, units);
+        } catch (e2: any) {
+          if (e2?.code !== "Conflict") throw e2;
+          return { merged: false, branch: this.workBranch, head: this.headCommit, conflicts: conflictList(e2), lww: 0 };
+        }
+      }
+      {
+        // both sides ran git: keep the losing side's branch heads reachable (objects are a union)
+        const gitNote = await this.keepLosingGitRefs(m, target, ours, theirs, resolvedOther).catch(async (e: any) => {
+          this.log(`keeping the other side's git refs failed: ${e?.message ?? e}`);
+          // it may have committed part of its work: the branch head is what the Store says now
+          const b = (await this.listAllBranches()).find((x) => x.name === target);
+          return { note: `both sides ran git; keeping the other side's commits failed (${e?.code ?? "Error"}), so .git is one side's only`, head: b?.head ?? null };
+        });
+        if (gitNote?.head) m = { ...m, head: gitNote.head };
         this.workBranch = target;
         // A fast-forward onto a branch with no Commit (a snapshot of main) answers no head: the branch is
         // then that Layer. Never keep the old head here: apply would snapshot it and revert the merge.
@@ -679,6 +751,7 @@ export class LayerfsSession {
         this.unapplied = await this.hasApplicable();
         this.persistSessionBinding();
         if (head) this.checkpoints.push({ origins: [`merge:${resolvedOther}`], label: "merge", commit: head, branch: target, changed: true, at: Date.now() });
+        if (!resolvedOther.startsWith("h-main-")) this.mergedSinceApply.push(resolvedOther);
 
         const diffItems: any[] = [];
         for (let pos = 0; ; ) {
@@ -704,194 +777,191 @@ export class LayerfsSession {
           }
         }
 
-        return { merged: true, branch: target, head, conflicts: [], lww: (m.lww ?? []).length, lwwPaths };
-      } catch (e: any) {
-        if (e?.code === "Conflict") {
-          if (options?.strategy || options?.resolve) {
-            return await this.fallbackMergeBranch(resolvedOther, options);
-          }
-          const conflicts = (e.detail?.conflicts ?? []).map((c: any) => ({ path: String(c.path).replace(/^\/+/, ""), kind: c.kind }));
-          return { merged: false, branch: this.workBranch, head: this.headCommit, conflicts, lww: 0 };
-        }
-        if (e?.code === "NoSuchBranch") throw e;
-        const isRecordFailure = /invalid record|binding kind/i.test(String(e?.message ?? "")) || e?.code === "InvalidRecord";
-        if (options?.strategy || options?.resolve || isRecordFailure) {
-          return await this.fallbackMergeBranch(resolvedOther, options);
-        }
-        throw e;
+        return { merged: true, branch: target, head, conflicts: [], lww: (m.lww ?? []).length, lwwPaths, ...(resolved.length ? { resolved } : {}), ...(gitNote?.note ? { gitNote: gitNote.note } : {}) };
       }
     }
   }
 
-  private async fallbackMergeBranch(
-    resolvedOther: string,
-    options?: { strategy?: "ours" | "theirs"; resolve?: Record<string, "ours" | "theirs"> }
-  ): Promise<MergeResult> {
-    const theirDiff: any[] = [];
-    for (let pos = 0; ; ) {
-      const page = await this.lfs.branch.diff_branches(this.baseBranch, resolvedOther, 1000, pos, { hunks: false }).catch(() => null);
-      for (const it of page?.items ?? []) theirDiff.push(it);
-      if (!page?.hasMore || !(page?.items ?? []).length) break;
-      pos = page.nextPagePos ?? (pos + page.items.length);
-    }
-
-    const ourDiff: any[] = [];
-    for (let pos = 0; ; ) {
-      const page = await this.lfs.branch.diff_branches(this.baseBranch, this.workBranch, 1000, pos, { hunks: false }).catch(() => null);
-      for (const it of page?.items ?? []) ourDiff.push(it);
-      if (!page?.hasMore || !(page?.items ?? []).length) break;
-      pos = page.nextPagePos ?? (pos + page.items.length);
-    }
-
-    const ourMap = new Map<string, any>();
-    for (const it of ourDiff) ourMap.set(it.path, it);
-
-    const ops: any[] = [];
-    const mountJobs: Array<{ rel: string; entry: HostEntry; bytes?: Buffer }> = [];
-    const conflicts: Array<{ path: string; kind?: string }> = [];
-
-    for (const theirItem of theirDiff) {
-      const p = theirItem.path;
-      if (p === "/.lww" || !p || theirItem.type === "dir" || !this.isApplicable(p)) continue;
-      const rel = p.replace(/^\/+/, "");
-      const ourItem = ourMap.get(p);
-
-      const fileResolution = options?.resolve?.[rel] || options?.strategy;
-
-      if (!ourItem) {
-        if (theirItem.kind === "Removed") {
-          ops.push({ op: "rm", path: p });
-        } else {
-          const theirSig = await this.readSigAtBranch(resolvedOther, rel);
-          if (theirSig?.kind === "symlink") {
-            mountJobs.push({ rel, entry: theirSig });
-          } else {
-            const bytes = await readRefBytes(this, resolvedOther, p);
-            if (bytes !== null) {
-              const dir = posix.dirname(p);
-              if (dir !== "/") ops.push({ op: "mkdir", path: dir });
-              ops.push({ op: "write", path: p, bytes });
-              if (theirSig && (((theirSig.mode ?? 0o644) & 0o111) !== 0 || (theirSig.mode !== undefined && (theirSig.mode & 0o7777) !== 0o644))) {
-                mountJobs.push({ rel, entry: theirSig, bytes });
-              }
-            }
-          }
-        }
-        continue;
-      }
-
-      // both sides changed the path: merge three-way; a strategy decides only real conflicts
-      let conflictKind: string;
-      if (ourItem.kind === "Removed" && theirItem.kind === "Removed") continue;
-      if (ourItem.kind === "Removed" || theirItem.kind === "Removed") {
-        conflictKind = "DeleteEditConflict";
-      } else {
-        const ourBytes = await readRefBytes(this, this.workBranch, p);
-        const theirBytes = await readRefBytes(this, resolvedOther, p);
-        const baseBytes = await readRefBytes(this, this.baseBranch, p);
-        if (ourBytes && theirBytes && ourBytes.equals(theirBytes)) continue;
-        if (!ourBytes || !theirBytes || isBinary(ourBytes) || isBinary(theirBytes) || (baseBytes && isBinary(baseBytes))) {
-          conflictKind = "BinaryConflict";
-        } else {
-          const mergeRes = threeWayMerge(ourBytes, baseBytes, theirBytes);
-          if ("merged" in mergeRes) {
-            const dir = posix.dirname(p);
-            if (dir !== "/") ops.push({ op: "mkdir", path: dir });
-            ops.push({ op: "write", path: p, bytes: mergeRes.merged });
-            const theirSig = await this.readSigAtBranch(resolvedOther, rel);
-            if (theirSig && (((theirSig.mode ?? 0o644) & 0o111) !== 0 || (theirSig.mode !== undefined && (theirSig.mode & 0o7777) !== 0o644))) {
-              mountJobs.push({ rel, entry: theirSig, bytes: mergeRes.merged });
-            }
-            continue;
-          }
-          conflictKind = "ContentConflict";
-        }
-      }
-      if (fileResolution === "ours") continue;
-      if (fileResolution === "theirs") {
-        if (theirItem.kind === "Removed") {
-          ops.push({ op: "rm", path: p });
-        } else {
-          const theirSig = await this.readSigAtBranch(resolvedOther, rel);
-          if (theirSig?.kind === "symlink") {
-            mountJobs.push({ rel, entry: theirSig });
-          } else {
-            const bytes = await readRefBytes(this, resolvedOther, p);
-            if (bytes !== null) {
-              const dir = posix.dirname(p);
-              if (dir !== "/") ops.push({ op: "mkdir", path: dir });
-              ops.push({ op: "write", path: p, bytes });
-              if (theirSig && (((theirSig.mode ?? 0o644) & 0o111) !== 0 || (theirSig.mode !== undefined && (theirSig.mode & 0o7777) !== 0o644))) {
-                mountJobs.push({ rel, entry: theirSig, bytes });
-              }
-            }
-          }
-        }
-        continue;
-      }
-      conflicts.push({ path: rel, kind: conflictKind });
-    }
-
-    if (conflicts.length > 0) {
-      return {
-        merged: false,
-        branch: this.workBranch,
-        head: this.headCommit,
-        conflicts,
-        lww: 0,
-      };
-    }
-
-    this.seq++;
-    const target = `s-${this.shortId}-${this.seq}`;
-    await this.lfs.branch.fork(target, this.workBranch);
-    if (ops.length > 0) {
-      const res = await this.lfs.fs.apply(target, ops, `merge ${resolvedOther} into ${this.workBranch} (fallback)`);
-      this.headCommit = res.commit?.id ?? res.head ?? this.headCommit;
-    }
-    if (mountJobs.length > 0) {
-      await this.withMountedBranch(target, true, `merge special files from ${resolvedOther}`, async (wsPath) => {
-        for (const { rel, entry, bytes } of mountJobs) {
-          const dst = posix.join(wsPath, rel);
-          await this.assertInsideWs(wsPath, dst, true);
+  /**
+   * Copies `paths` from branch `from` onto branch `to` as one Commit: both mounted once, each path
+   * replaced whole (file, symlink or directory tree, with modes); a path missing on `from` is removed.
+   * One Workspace commit, so it is atomic and has no request size limit.
+   */
+  private async copyPaths(from: string, to: string, paths: Array<{ path: string }>, message: string): Promise<void> {
+    await this.withMountedBranch(from, false, "merge read", async (srcWs) => {
+      await this.withMountedBranch(to, true, message, async (dstWs) => {
+        for (const { path: rel } of paths) {
+          const src = posix.join(srcWs, rel);
+          const dst = posix.join(dstWs, rel);
+          await this.assertInsideWs(srcWs, src, true);
+          await this.assertInsideWs(dstWs, dst, true);
+          await assertNotProtectedTarget(dstWs, dst, false);
+          await fsp.rm(dst, { recursive: true, force: true });
+          if (!(await fsp.lstat(src).catch(() => null))) continue;
           await fsp.mkdir(dirname(dst), { recursive: true });
-          await fsp.rm(dst, { force: true });
-          if (entry.kind === "symlink") {
-            const target = entry.sig.slice("link:".length);
-            await fsp.symlink(target, dst);
-          } else {
-            const mode = (entry.mode ?? 0o644) & 0o7777;
-            await fsp.writeFile(dst, bytes ?? Buffer.alloc(0));
-            await fsp.chmod(dst, mode);
-          }
+          await fsp.cp(src, dst, { recursive: true, verbatimSymlinks: true, preserveTimestamps: true, force: true, errorOnExist: false });
         }
       });
-      this.headCommit = this.lastStoreCommit?.head ?? this.headCommit;
-    }
-    this.workBranch = target;
-    this.unapplied = await this.hasApplicable();
-    this.persistSessionBinding();
-    if (this.headCommit) {
-      this.checkpoints.push({ origins: [`merge:${resolvedOther}`], label: "merge", commit: this.headCommit, branch: target, changed: ops.length > 0 || mountJobs.length > 0, at: Date.now() });
-    }
+    });
+  }
 
-    const mergedAt = Date.now();
-    for (const it of theirDiff) {
-      if (this.isApplicable(it.path) && it.type !== "dir") {
-        const rel = it.path.replace(/^\/+/, "");
-        this.touchPathsOnNextExec.add(rel);
-        this.mergedFileMtimes.set(rel, mergedAt);
+  /**
+   * After a merge in which both sides changed the `git` unit: the merged `.git` is the kept side's
+   * whole (consistent refs, HEAD and index). The losing side's branch heads (loose refs and
+   * packed-refs under refs/heads) are written as `refs/minilfs/<label>/heads/<name>` in the merged
+   * Branch: its commits stay reachable (gc keeps them). The files are already merged by LayerFS, so
+   * the histories join with `git merge -s ours --no-commit <ref> && git add -A && git commit`
+   * (verified: both parents recorded, tree = the merged files, fsck clean).
+   */
+  private async keepLosingGitRefs(m: any, target: string, ours: string, theirs: string, label: string): Promise<{ note: string; head: string | null } | undefined> {
+    const unit = (m?.units ?? []).find((u: any) => u.unit === "git");
+    if (!unit || !(unit.changedOurs > 0 && unit.changedTheirs > 0)) return undefined;
+    // objects merge as a union, but a side that ran `git gc --prune` deleted objects the other side
+    // may still name: put back every object either side has and the merge dropped
+    const dropped = new Map<string, string>();
+    for (const side of [ours, theirs]) {
+      for (let pos = 0; ; ) {
+        const page = await this.lfs.branch.diff_branches(side, target, 1000, pos, { hunks: false });
+        for (const it of page.items ?? []) {
+          const rel = String(it.path).replace(/^\/+/, "");
+          if (it.kind === "Removed" && it.type !== "dir" && gitPathKind(rel) === "object" && !dropped.has(rel)) dropped.set(rel, side);
+        }
+        if (!page.hasMore || !(page.items ?? []).length) break;
+        pos = page.nextPagePos ?? (pos + page.items.length);
       }
     }
-
-    return {
-      merged: true,
-      branch: target,
-      head: this.headCommit,
-      conflicts: [],
-      lww: 0,
-      fallback: true,
+    let head: string | null = null;
+    for (const side of [ours, theirs]) {
+      const paths = [...dropped].filter(([, s]) => s === side).map(([path]) => ({ path }));
+      if (paths.length) {
+        await this.copyPaths(side, target, paths, `keep git objects ${side === ours ? "this Branch" : label} still names`);
+        head = this.lastStoreCommit?.head ?? head;
+      }
+    }
+    const losing = unit.kept === "ours" ? theirs : ours;
+    const keptName = unit.kept === "ours" ? "this Branch" : label;
+    const lostName = unit.kept === "ours" ? label : "this Branch";
+    const heads = new Map<string, string>();
+    // packed-refs can exceed one fs.read window (2000 lines / 48 KiB): page through it
+    let packed = "";
+    for (let line = 1; line > 0; ) {
+      const r: any = await this.lfs.fs.read(losing, "/.git/packed-refs", line).catch(() => null);
+      if (!r) break;
+      packed += String(r.text ?? "");
+      line = r.truncated && r.endLine ? r.endLine + 1 : 0;
+    }
+    for (const line of packed.split("\n")) {
+      const mm = /^([0-9a-f]{40,64}) refs\/heads\/(.+)$/.exec(line.trim());
+      if (mm) heads.set(mm[2], mm[1]);
+    }
+    const walk = async (dir: string, prefix: string) => {
+      for (let pos = 0; ; ) {
+        const page = await this.lfs.fs.list(losing, dir, 1000, pos).catch(() => null);
+        for (const it of page?.items ?? []) {
+          const sp = `${dir}/${it.name}`;
+          if (it.type === "dir") await walk(sp, `${prefix}${it.name}/`);
+          else if (it.type === "file") {
+            const oid = await this.lfs.fs.read(losing, sp).then((r: any) => String(r.text ?? "").trim(), () => "");
+            if (/^[0-9a-f]{40,64}$/.test(oid)) heads.set(`${prefix}${it.name}`, oid);
+          }
+        }
+        if (!page?.hasMore || !(page?.items ?? []).length) break;
+        pos = page.nextPagePos ?? (pos + page.items.length);
+      }
     };
+    await walk("/.git/refs/heads", "");
+    // only heads that differ from the merged result's own refs
+    const ops: any[] = [];
+    // the refs are named after the side they come from: the other Branch, or this session (the work branch before the merge)
+    const safeLabel = (unit.kept === "ours" ? label : this.workBranch).replace(/[^A-Za-z0-9._-]/g, "-");
+    const kept: string[] = [];
+    for (const [name, oid] of heads) {
+      // a branch name comes from the other side's .git: only plain git ref names (it is shown in a command)
+      if (!isSafeRefName(name)) continue;
+      const mine = (await this.gitRefOid(target, `refs/heads/${name}`)) ?? "";
+      if (mine === oid) continue;
+      const refPath = `/.git/refs/minilfs/${safeLabel}/heads/${name}`;
+      ops.push({ op: "mkdir", path: posix.dirname(refPath) }, { op: "write", path: refPath, bytes: Buffer.from(`${oid}\n`) });
+      kept.push(`refs/minilfs/${safeLabel}/heads/${name}`);
+    }
+    if (ops.length) {
+      const res = await this.lfs.fs.apply(target, ops, `keep ${lostName}'s git branch heads`);
+      head = res.commit?.id ?? res.head ?? head;
+    }
+
+    // Join the checked-out branch's histories: one commit with both sides' heads as parents (the lead
+    // side first), so `git log` of the branch shows both sides' commits. LayerFS merged the files;
+    // git plumbing records it without touching the work tree (src/gitjoin.ts).
+    const joined = await this.joinGitHistories(target, ours, theirs, label).catch((e: any) => {
+      this.log(`joining git histories failed: ${e?.message ?? e}`);
+      return null;
+    });
+    if (joined?.head) head = joined.head;
+    const keptRefs = kept.length ? ` Its other branch heads are kept as ${kept.slice(0, 3).join(", ")}${kept.length > 3 ? ", …" : ""}.` : "";
+    const what = joined?.result;
+    if (what && (what.mode === "merged" || what.mode === "worktree")) {
+      return { head, note: `both sides ran git; ${joined!.branch} now has a merge commit ${what.commit!.slice(0, 7)} with both sides' commits as parents${what.mode === "worktree" ? " (git saw conflicts; the commit records LayerFS's merged files)" : ""}.${keptRefs}` };
+    }
+    if (what && (what.mode === "ff" || what.mode === "uptodate")) {
+      return { head, note: `both sides ran git; ${joined!.branch} ${what.mode === "ff" ? `moved forward to ${lostName}'s commits` : `already held ${lostName}'s commits`}.${keptRefs}` };
+    }
+    const why = what?.why ? ` (${what.why})` : "";
+    if (!kept.length) return { note: `both sides ran git; .git (refs, HEAD, index) is ${keptName}'s, ${lostName}'s branch heads were already in it${why}`, head };
+    return {
+      head,
+      note: `both sides ran git; .git (refs, HEAD, index) is ${keptName}'s; the histories could not be joined automatically${why}.${keptRefs} Join them in bash with \`${GIT_JOIN_HINT(kept[0])}\``,
+    };
+  }
+
+  /** A git ref's commit on `branch` (loose ref, else packed-refs), or null. */
+  private async gitRefOid(branch: string, ref: string): Promise<string | null> {
+    const loose = await this.lfs.fs.read(branch, `/.git/${ref}`).then((r: any) => String(r.text ?? "").trim(), () => "");
+    if (/^[0-9a-f]{40,64}$/.test(loose)) return loose;
+    for (let line = 1; line > 0; ) {
+      const r: any = await this.lfs.fs.read(branch, "/.git/packed-refs", line).catch(() => null);
+      if (!r) break;
+      for (const l of String(r.text ?? "").split("\n")) {
+        const m = /^([0-9a-f]{40,64}) (\S+)$/.exec(l.trim());
+        if (m && m[2] === ref) return m[1];
+      }
+      line = r.truncated && r.endLine ? r.endLine + 1 : 0;
+    }
+    return null;
+  }
+
+  /**
+   * Records a merge commit of both sides' checked-out branch heads in `target`'s git (src/gitjoin.ts),
+   * in one mounted step under the session's Seatbelt profile; the result is one LayerFS Commit.
+   * Skips when the sides have HEAD on different branches or detached.
+   */
+  private async joinGitHistories(target: string, ours: string, theirs: string, label: string): Promise<{ result: JoinResult; head: string | null; branch: string } | null> {
+    const headOf = async (b: string) => symbolicHead(await this.lfs.fs.read(b, "/.git/HEAD").then((r: any) => String(r.text ?? ""), () => ""));
+    const refOid = (b: string, ref: string) => this.gitRefOid(b, ref);
+    const [hOurs, hTheirs] = await Promise.all([headOf(ours), headOf(theirs)]);
+    if (!hOurs || hOurs !== hTheirs) return { result: { mode: "skip", why: hOurs ? `the other side has ${hTheirs ?? "a detached HEAD"} checked out, not ${hOurs}` : "detached HEAD" }, head: null, branch: hOurs ?? "HEAD" };
+    const [oOurs, oTheirs] = await Promise.all([refOid(ours, hOurs), refOid(theirs, hOurs)]);
+    if (!oOurs || !oTheirs) return { result: { mode: "skip", why: "a side has no commit on the branch" }, head: null, branch: hOurs };
+    if (oOurs === oTheirs) return { result: { mode: "uptodate", commit: oOurs }, head: null, branch: hOurs };
+    const branchName = hOurs.replace(/^refs\/heads\//, "");
+    const message = `Merge ${label} into ${branchName} (minilfs: LayerFS merged the files)`;
+    let result: JoinResult = { mode: "fail", why: "not run" };
+    await this.withMountedBranch(target, true, `git: join ${label} into ${branchName}`, async (wsPath) => {
+      const scratchDir = join(this.config.root, "scratch", this.projectRecord.name, "join");
+      await fsp.mkdir(scratchDir, { recursive: true });
+      const profile = buildSeatbeltProfile({
+        wsPath, hostCwd: this.cwd, scratchDir, configRoot: this.config.root,
+        excludes: this.config.excludes, outsideSecrets: OUTSIDE_SECRET_PATTERNS, network: "deny",
+      });
+      const env: NodeJS.ProcessEnv = {
+        PATH: process.env.PATH, HOME: scratchDir, TMPDIR: "/private/tmp", LANG: "C",
+        GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0",
+        GIT_AUTHOR_NAME: "minilfs", GIT_AUTHOR_EMAIL: "minilfs@localhost", GIT_COMMITTER_NAME: "minilfs", GIT_COMMITTER_EMAIL: "minilfs@localhost",
+      };
+      const r = await run("/usr/bin/sandbox-exec", ["-p", profile, "/bin/sh", "-c", GIT_JOIN_SCRIPT, "minilfs-join", oOurs, oTheirs, hOurs, message], { cwd: wsPath, env, timeoutMs: 120_000 });
+      result = parseJoin(r.stdout.toString());
+      if (result.mode === "fail") this.log(`git join: ${r.stdout.toString().slice(-300)} ${r.stderr.slice(-300)}`);
+    });
+    return { result, head: this.lastStoreCommit?.head ?? null, branch: branchName };
   }
 
   private persistSessionBinding(): void {
@@ -908,6 +978,8 @@ export class LayerfsSession {
       updatedAt: Date.now(),
       logicalBranch: this.logicalBranch,
       alignedRef: this.alignedRef,
+      pid: this.closed ? undefined : process.pid,
+      host: hostname(),
     });
   }
 
@@ -1059,8 +1131,7 @@ export class LayerfsSession {
     const sp = this.toStorePath(hostPath);
     if (!sp) throw new Error(`${hostPath} is outside the LayerFS workspace (${this.cwd}); writes there are refused`);
     const rel = sp.replace(/^\/+/, "");
-    const relNorm = rel.toLowerCase();
-    if (relNorm === ".lww" || relNorm === ".git" || relNorm.startsWith(".git/")) {
+    if (isProtectedPath(rel)) {
       const err = new Error(`writes to ${rel} are refused for security`);
       (err as any).code = "EACCES";
       throw err;
@@ -1263,6 +1334,7 @@ export class LayerfsSession {
     await this.withMountedBranch(this.workBranch, true, `pi write [${this.pendingOrigins.join(",") || "write"}]`, async (wsPath) => {
       const p = posix.join(wsPath, rel);
       await this.assertInsideWs(wsPath, p, false);
+      await assertNotProtectedTarget(wsPath, p, true);
       await fsp.mkdir(dirname(p), { recursive: true });
       await fsp.writeFile(p, bytes);
     });
@@ -1383,11 +1455,68 @@ export class LayerfsSession {
   }
 
   /**
-   * Mounts a Workspace of `branch` and records it twice: in `this.mounts` (released by `close()`)
-   * and as a lease file (reclaimed by the next session if this process dies without cleanup).
+   * The Sandbox this session mounts in (official v1.1.0: `workspace.mount(sandbox, branch)` names its
+   * Sandbox and never starts one). Picks a running Sandbox of the project with room
+   * (`project.list_sandboxes`, < 16 Workspaces), else `sandbox.create()` under the project's
+   * sandbox lock, so concurrent sessions share Sandboxes instead of each starting one.
+   */
+  async ensureSandbox(options: { avoid?: string | null } = {}): Promise<{ sandbox: string; created: boolean }> {
+    const avoid = options.avoid ?? null;
+    if (this.sandboxId && this.sandboxId !== avoid) return { sandbox: this.sandboxId, created: false };
+    // a running Sandbox of the project with room, fewest Workspaces first; never the one that refused
+    const pick = async (): Promise<string | null> => {
+      const page = await this.lfs.project.list_sandboxes(100, 0);
+      const ok = (page.items ?? []).filter((s: any) => s.sandbox !== avoid && (s.workspaces ?? 0) < SANDBOX_CAPACITY);
+      ok.sort((a: any, b: any) => (a.workspaces ?? 0) - (b.workspaces ?? 0) || Number(a.sandbox) - Number(b.sandbox));
+      return ok[0]?.sandbox ?? null;
+    };
+    let id = await pick();
+    let created = false;
+    if (!id) {
+      ({ id, created } = await this.bindings.withProjectLock(`_sandbox-${this.projectRecord.name}`, async () => {
+        // another session may have created one while we waited for the lock
+        const again = await pick();
+        if (again) return { id: again, created: false };
+        try {
+          return { id: (await this.lfs.sandbox.create()).sandbox as string, created: true };
+        } catch (e: any) {
+          if (e?.code !== "Busy") throw e;
+          await new Promise((r) => setTimeout(r, 300)); // Busy: another create of this project runs; once
+          return { id: (await this.lfs.sandbox.create()).sandbox as string, created: true };
+        }
+      }, 120_000));
+    }
+    this.sandboxId = id;
+    return { sandbox: id!, created };
+  }
+
+  /**
+   * Mounts a Workspace of `branch` (`workspace.mount(sandbox, branch)`) and records it twice: in
+   * `this.mounts` (released by `close()`) and as a lease file (reclaimed by the next session if this
+   * process dies without cleanup). A Sandbox that closed itself (NoSuchSandbox) or is full (Capacity)
+   * is replaced once by another (or a new) Sandbox.
    */
   private async mountWorkspace(branch: string): Promise<{ ws: Workspace; wsReal: string }> {
-    const ws: Workspace = await this.lfs.workspace.mount(branch);
+    let ws: Workspace;
+    let box = await this.ensureSandbox();
+    try {
+      ws = await this.lfs.workspace.mount(box.sandbox, branch);
+    } catch (e: any) {
+      if (e?.code !== "NoSuchSandbox" && e?.code !== "Capacity") throw e;
+      // a Sandbox closes itself 2 min after its last Workspace: take another running one, else a new one
+      this.log(`Sandbox ${box.sandbox} refused the mount (${e.code}); using another Sandbox`);
+      box = await this.ensureSandbox({ avoid: box.sandbox });
+      try {
+        ws = await this.lfs.workspace.mount(box.sandbox, branch);
+      } catch (e2) {
+        // a Sandbox this call started and could not use: stop it now instead of waiting for its idle timer
+        if (box.created) {
+          await this.lfs.sandbox.close(box.sandbox).catch(() => {});
+          if (this.sandboxId === box.sandbox) this.sandboxId = null;
+        }
+        throw e2;
+      }
+    }
     // synchronous until the lease is on disk: a reused slot path must not look orphaned meanwhile
     const wsReal = (() => { try { return realpathSync(ws.path); } catch { return ws.path; } })();
     this.mounts.set(ws.path, { ws, wsReal });
@@ -1471,14 +1600,19 @@ export class LayerfsSession {
       const value = await fn(wsPath, ws);
       if (commitAfter) {
         const res = await this.lfs.workspace.commit(ws, message.slice(0, 4000));
-        this.recordStoreCommit({ kind: res.kind, head: res.commit?.id ?? res.head ?? null }, message);
+        const rec = { kind: res.kind, head: res.commit?.id ?? res.head ?? null };
+        // a commit on another branch (a merge fork, a sync branch) is no checkpoint of this session
+        if (branch === this.workBranch) this.recordStoreCommit(rec, message);
+        else this.lastStoreCommit = rec;
       }
       return value;
     } catch (e) {
       if (commitAfter) {
         try {
           const res = await this.lfs.workspace.commit(ws, `${message} (failed)`.slice(0, 4000));
-          this.recordStoreCommit({ kind: res.kind, head: res.commit?.id ?? res.head ?? null }, message);
+          const rec = { kind: res.kind, head: res.commit?.id ?? res.head ?? null };
+          if (branch === this.workBranch) this.recordStoreCommit(rec, message);
+          else this.lastStoreCommit = rec;
         } catch (ce: any) {
           keepMounted = true;
           this.blocked = { reason: `${ce?.code ?? "Error"}: ${String(ce?.message ?? ce).slice(0, 200)}`, heldWs: ws };
@@ -1528,7 +1662,6 @@ export class LayerfsSession {
     let execErr: unknown = null;
     try {
       await this.restoreMergedMtimes(wsReal);
-      const gitAdmin = await this.attachHostGit(wsReal).catch((e) => { this.log(`attaching the folder's git failed: ${e?.message ?? e}`); return null; });
 
       const scratchDir = join(this.config.root, "scratch");
       const branchScratchDir = join(scratchDir, this.projectRecord.name, "branches", this.logicalBranch);
@@ -1554,14 +1687,15 @@ export class LayerfsSession {
           lwwContent,
           command,
           options,
-          gitAdmin: gitAdmin ?? undefined,
         });
         code = res.exitCode;
       } catch (e) {
         execErr = e;
       }
-      await this.detachHostGit(wsReal).catch(() => {});
 
+      // a command stopped mid-way (timeout, abort) can leave git's lock files: the Branch's git would
+      // refuse every later command ("index.lock exists"). Nothing runs in the Workspace any more.
+      if (execErr || code === 124 || code === null) await removeGitLeftovers(wsReal).catch(() => {});
       const msg = `pi bash (exit ${code ?? "sig"}) [${this.pendingOrigins.join(",") || "bash"}]`.slice(0, 4000);
       try {
         const res = await this.lfs.workspace.commit(ws, msg);
@@ -1613,155 +1747,9 @@ export class LayerfsSession {
     return { removedPath: target };
   }
 
+  /** Kills processes still using the Workspace mount (the driver's reaper, one implementation). */
   private async reapHolders(wsPath: string): Promise<void> {
-    const spellings = bothSpellings(wsPath);
-    for (const p of spellings) {
-      // `lsof <mount point>` lists every process using that file system without walking it;
-      // `+D` walked the whole tree over NFS before every unmount (1 s per 20k files).
-      const r = await run("lsof", ["-t", p], { timeoutMs: 5000 }).catch(() => null);
-      if (r?.stdout && r.stdout.length > 0) {
-        const pids = r.stdout.toString().split(/\s+/).filter(Boolean);
-        for (const pid of pids) {
-          const n = Number(pid);
-          if (n > 0 && n !== process.pid) {
-            try { process.kill(n, "SIGKILL"); } catch {}
-          }
-        }
-      }
-    }
-  }
-
-  /** The folder's git directories: `gitDir` (HEAD, index) and `commonDir` (objects, refs, config). */
-  private async hostGitDirs(): Promise<{ gitDir: string; commonDir: string } | null> {
-    const dotGit = join(this.cwd, ".git");
-    const st = await fsp.lstat(dotGit).catch(() => null);
-    if (!st) return null;
-    let gitDir = dotGit;
-    if (st.isFile()) { // the folder is itself a linked work tree
-      const m = /^gitdir:\s*(.+?)\s*$/m.exec(await fsp.readFile(dotGit, "utf8").catch(() => ""));
-      if (!m) return null;
-      gitDir = resolve(this.cwd, m[1]);
-    } else if (!st.isDirectory()) return null;
-    const common = (await fsp.readFile(join(gitDir, "commondir"), "utf8").catch(() => "")).trim();
-    return { gitDir, commonDir: common ? resolve(gitDir, common) : gitDir };
-  }
-
-  /**
-   * Makes the Workspace a git work tree of the folder's repository, in git's own linked-worktree
-   * layout. `.git` is never imported or stored; for one command the Workspace gets a `.git` file
-   * (`gitdir: <admin>`), and the admin directory, outside the Workspace, holds:
-   * - `commondir`: the folder's repository. Objects, refs and config are read live, so log, status and
-   *   diff are current. The sandbox cannot write there, so add, commit, reset, checkout, stash, merge
-   *   and rebase fail and nothing reaches the repository; they run with elevated.
-   * - `HEAD` (read-only in the sandbox) and `index` (writable, so git can refresh its stat cache),
-   *   copied from the folder; the index only when the folder's index changed.
-   * Returns the admin directory, or null when the folder is not a git repository.
-   */
-  private async attachHostGit(wsReal: string): Promise<string | null> {
-    const wsGit = join(wsReal, ".git");
-    const cur = await fsp.lstat(wsGit).catch(() => null);
-    // a copy imported by older versions: drop it from the Branch (this command's Commit records that)
-    if (cur) await fsp.rm(wsGit, { recursive: true, force: true });
-    const host = await this.hostGitDirs();
-    if (!host) return null;
-    const head = await fsp.readFile(join(host.gitDir, "HEAD")).catch(() => null);
-    if (!head) return null;
-    const admin = join(this.config.root, "scratch", this.projectRecord.name, "branches", this.logicalBranch, "git");
-    await fsp.mkdir(admin, { recursive: true });
-    const writeIfChanged = async (p: string, data: Buffer | string) => {
-      const now = await fsp.readFile(p).catch(() => null);
-      if (!now || !now.equals(Buffer.from(data))) await fsp.writeFile(p, data);
-    };
-    await writeIfChanged(join(admin, "commondir"), `${host.commonDir}\n`);
-    await writeIfChanged(join(admin, "HEAD"), head);
-    const ist = await fsp.stat(join(host.gitDir, "index")).catch(() => null);
-    const sig = ist ? `${ist.ino}:${ist.size}:${ist.mtimeMs}` : "none";
-    const marker = join(admin, "minilfs-host-index");
-    if ((await fsp.readFile(marker, "utf8").catch(() => "")) !== sig) {
-      if (ist) await fsp.copyFile(join(host.gitDir, "index"), join(admin, "index"));
-      else await fsp.rm(join(admin, "index"), { force: true });
-      await fsp.writeFile(marker, sig);
-    }
-    // info/exclude lives in the common directory: hide the Workspace's .lww (LayerFS merge rules).
-    // One local, never-committed line; .lww itself never exists in the folder.
-    const exclude = join(host.commonDir, "info", "exclude");
-    const exSt = await fsp.lstat(exclude).catch(() => null);
-    if (!exSt || exSt.isFile()) {
-      const text = exSt ? await fsp.readFile(exclude, "utf8") : "";
-      if (!text.split("\n").includes("/.lww")) {
-        await fsp.mkdir(dirname(exclude), { recursive: true });
-        await fsp.appendFile(exclude, `${text.length && !text.endsWith("\n") ? "\n" : ""}/.lww\n`);
-      }
-    }
-    await fsp.writeFile(wsGit, `gitdir: ${admin}\n`);
-    await this.markSkippedSecrets(wsReal);
-    return admin;
-  }
-
-  /** Removes the Workspace's `.git` pointer before the Commit: `.git` never enters the Store. */
-  private async detachHostGit(wsReal: string): Promise<void> {
-    const wsGit = join(wsReal, ".git");
-    const st = await fsp.lstat(wsGit).catch(() => null);
-    if (st && !st.isDirectory()) await fsp.rm(wsGit, { force: true });
-  }
-
-  /** Tracked secret files (never imported) are marked skip-worktree, so status does not list them deleted. */
-  private async markSkippedSecrets(wsReal: string): Promise<void> {
-    if (this.config.excludes.length > 0) {
-      const excludesFlat = this.config.excludes.flatMap(expandBraces).map((p) => p.trim()).filter(Boolean);
-      // `!pattern` re-includes become git exclude pathspecs, so templates are not marked skip-worktree
-      const excludeArgs = excludesFlat.flatMap((pat) => pat.startsWith("!")
-        ? [`:(exclude,glob,icase)${pat.slice(1)}`, `:(exclude,glob,icase)**/${pat.slice(1)}`]
-        : [`:(glob,icase)${pat}`, `:(glob,icase)**/${pat}`]);
-      const gitEnv = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
-      const ls = await run("git", ["-C", wsReal, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.quotePath=false", "ls-files", "-v", "--", ...excludeArgs], { env: gitEnv, timeoutMs: 10_000 }).catch(() => null);
-      if (ls?.code === 0 && ls.stdout.length > 0) {
-        const lines = ls.stdout.toString().split("\n");
-        const skipFiles: string[] = [];
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          const [tag, ...rest] = line.split(" ");
-          const f = rest.join(" ");
-          if (tag !== "S" && f) {
-            const exists = await fsp.access(join(wsReal, f)).then(() => true, () => false);
-            if (!exists) skipFiles.push(f);
-          }
-        }
-        if (skipFiles.length > 0) {
-          await run("git", ["-C", wsReal, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "update-index", "--skip-worktree", "--", ...skipFiles], { env: gitEnv, timeoutMs: 10_000 }).catch(() => null);
-        }
-      }
-    }
-  }
-
-  private async killNativeSession(child: ReturnType<typeof spawn>, wsReal: string): Promise<void> {
-    const pid = child.pid;
-    if (!pid) return;
-    try {
-      process.kill(-pid, "SIGTERM");
-    } catch {
-      try { child.kill("SIGTERM"); } catch {}
-    }
-    const grace = Math.max(100, this.config.killGraceMs);
-    const start = Date.now();
-    let alive = true;
-    while (Date.now() - start < grace) {
-      await new Promise((r) => setTimeout(r, 50));
-      try {
-        process.kill(-pid, 0);
-      } catch {
-        alive = false;
-        break;
-      }
-    }
-    if (alive) {
-      try {
-        process.kill(-pid, "SIGKILL");
-      } catch {
-        try { child.kill("SIGKILL"); } catch {}
-      }
-    }
-    await this.reapHolders(wsReal).catch(() => {});
+    await this.driver.reapWorkspaceHolders?.(wsPath);
   }
 
   // ---------------------------------------------------------------- mutation queue & checkpoint gate
@@ -1894,6 +1882,19 @@ export class LayerfsSession {
     });
   }
 
+  /** The content of many paths on `branch`, read in one mount (absent paths map to null). */
+  private async readRawEntriesAtBranch(branch: string, rels: string[]): Promise<Map<string, RawEntry>> {
+    const out = new Map<string, RawEntry>();
+    return this.withMountedBranch(branch, false, "read base", async (wsPath) => {
+      for (const rel of rels) {
+        const p = posix.join(wsPath, rel);
+        await this.assertInsideWs(wsPath, p, true);
+        out.set(rel, await readRawEntry(p));
+      }
+      return out;
+    });
+  }
+
   async apply(options: { allowRevert?: boolean } = {}): Promise<ApplyResult> {
     const job = this.mutex.then(() => this.applyLocked(options));
     this.mutex = job.catch(() => {});
@@ -1930,19 +1931,25 @@ export class LayerfsSession {
       this.seq++;
       const nextBase = `b-${this.shortId}-${this.seq}`;
       const fb = await this.lfs.branch.fork(nextBase, snapRef);
-      if (!items.length && !this.config.branchOnly.length && !this.ignore.active) {
+      if (!items.length && !this.config.branchOnly.length) {
         this.unapplied = false;
         this.persistSessionBinding();
         return result;
       }
 
       type Next = { kind: "file"; data: Buffer; mode: number } | { kind: "symlink"; target: string } | null;
-      const plan: Array<{ rel: string; next: Next; host: HostEntry | null }> = [];
+      const plan: Array<{ rel: string; next: Next; host: HostEntry | null; git: GitPathKind }> = [];
+      const toRaw = (n: Next) => (n ? (n.kind === "file" ? { data: n.data, mode: n.mode } : { target: n.target }) : null);
 
+      // 1. what the Branch has (one mount of the snapshot) and what the folder has now
+      const found: Array<{ rel: string; kind: string; next: Next; host: HostEntry | null; hostRaw: RawEntry; git: GitPathKind }> = [];
       await this.withMountedBranch(snapBranch, false, "apply read", async (wsPath) => {
         for (const it of items) {
           const rel = it.path.replace(/^\/+/, "");
-          if (rel === ".lww" || rel === ".git" || rel.startsWith(".git/") || this.hostSkip(rel, false)) {
+          const git = gitPathKind(rel);
+          // .lww, secrets, branch-only output, protected git files (config, hooks, ...) and git's
+          // transient state (locks, in-progress operations, caches) never reach the folder
+          if (rel === ".lww" || isProtectedPath(rel) || git === "transient" || this.hostSkip(rel, false)) {
             result.skipped.push(rel);
             continue;
           }
@@ -1952,31 +1959,69 @@ export class LayerfsSession {
             await this.assertInsideWs(wsPath, p, true);
             const lst = await fsp.lstat(p).catch(() => null);
             if (!lst) continue;
-            if (lst.isSymbolicLink()) {
-              const target = await fsp.readlink(p);
-              next = { kind: "symlink", target };
-            } else {
-              const data = await fsp.readFile(p);
-              const mode = lst.mode & 0o7777;
-              next = { kind: "file", data, mode };
-            }
+            if (lst.isSymbolicLink()) next = { kind: "symlink", target: await fsp.readlink(p) };
+            else if (lst.isFile()) next = { kind: "file", data: await fsp.readFile(p), mode: lst.mode & 0o7777 };
+            else continue;
           }
-          const host = await hostState(join(this.cwd, rel));
-          if (host === "other") { result.conflicts.push(rel); continue; }
-          const base = it.kind === "Added" ? null : await this.readSigAtBranch(this.baseBranch, rel);
-          const want = next ? (next.kind === "file" ? fileSig(next.data, next.mode) : linkSig(next.target)) : null;
-          if (sameSig(host, want)) { result.unchanged.push(rel); continue; }
-          if (!sameSig(host, base)) { result.conflicts.push(rel); continue; }
-          plan.push({ rel, next, host });
+          const hostRaw = await readRawEntry(join(this.cwd, rel));
+          if (hostRaw === "other") { result.conflicts.push(rel); continue; }
+          const host = hostRaw ? ("target" in hostRaw ? linkSig(hostRaw.target) : fileSig(hostRaw.data, hostRaw.mode)) : null;
+          found.push({ rel, kind: it.kind, next, host, hostRaw, git });
         }
       });
-
       if (result.conflicts.length) return result;
+
+      // 2. the base version of every path the folder may have changed (one mount of the base, not one per file)
+      const needBase = found.filter((f) => f.kind !== "Added" || f.git !== "none").map((f) => f.rel);
+      const baseRaw = needBase.length ? await this.readRawEntriesAtBranch(this.baseBranch, needBase) : new Map<string, RawEntry>();
+
+      // 3. decide. Sources: three-way, any conflict stops the whole apply. Git metadata: objects are
+      //    added, never replaced; refs, HEAD and the index are three-way, and when the folder's git
+      //    moved meanwhile (a commit made there) no ref, HEAD, index or log is written (new objects
+      //    still are, unreferenced): the files still land in the folder, and the folder's own history
+      //    is never overwritten
+      const gitPlan: typeof plan = [];
+      const gitConflicts: string[] = [];
+      /** main (published below) will hold git metadata the folder does not: resync main from the folder next start */
+      let gitDiverged = false;
+      for (const f of found) {
+        const want = f.next ? (f.next.kind === "file" ? fileSig(f.next.data, f.next.mode) : linkSig(f.next.target)) : null;
+        if (f.git === "none") {
+          if (sameSig(f.host, want)) { result.unchanged.push(f.rel); continue; }
+          const b = baseRaw.get(f.rel) ?? null;
+          const base = b && b !== "other" ? ("target" in b ? linkSig(b.target) : fileSig(b.data, b.mode)) : null;
+          if (!sameSig(f.host, base)) { result.conflicts.push(f.rel); continue; }
+          plan.push({ rel: f.rel, next: f.next, host: f.host, git: f.git });
+          continue;
+        }
+        // git never makes symlinks inside its directory: one there could point a later write anywhere
+        if (f.next?.kind === "symlink" || (f.hostRaw && "target" in f.hostRaw)) { result.skipped.push(f.rel); continue; }
+        const b = baseRaw.get(f.rel);
+        const d = decideGitPath(f.git, gitSig(f.git, f.hostRaw as any), gitSig(f.git, b && b !== "other" ? b : null), gitSig(f.git, toRaw(f.next)));
+        if (d === "unchanged") result.unchanged.push(f.rel);
+        else if (d === "skip") { result.skipped.push(f.rel); if (f.git !== "object") gitDiverged = true; }
+        else if (d === "conflict") gitConflicts.push(f.rel);
+        else gitPlan.push({ rel: f.rel, next: f.next, host: f.host, git: f.git });
+      }
+      if (result.conflicts.length) return result;
+      if (gitConflicts.length) {
+        gitDiverged = true;
+        const kept = gitPlan.filter((g) => g.git === "object");
+        result.skipped.push(...gitPlan.filter((g) => g.git !== "object").map((g) => g.rel), ...gitConflicts);
+        gitPlan.length = 0;
+        gitPlan.push(...kept);
+        result.warnings.push(`your folder's git moved since this Branch started (${gitConflicts.slice(0, 4).join(", ")}${gitConflicts.length > 4 ? ", …" : ""}): the files were applied, but no ref, HEAD or index was changed, so the Branch's commits are not on your branches (their objects were added; the changes show as uncommitted). Commit them in your folder, or sync the Branch and apply again.`);
+      }
+      const gitSummary = gitChangeSummary(gitPlan.map((g) => g.rel));
+      if (gitSummary) result.git = gitSummary;
 
       const depth = (r: string) => r.split("/").length;
       const ordered = [
         ...plan.filter((p) => !p.next).sort((a, b) => depth(b.rel) - depth(a.rel)),
         ...plan.filter((p) => p.next).sort((a, b) => depth(a.rel) - depth(b.rel)),
+        // git last, objects before the refs that name them, HEAD and the index at the very end: a stop
+        // midway leaves extra objects, never a ref to a missing object
+        ...gitPlan.sort((a, b) => GIT_APPLY_ORDER[a.git] - GIT_APPLY_ORDER[b.git] || depth(a.rel) - depth(b.rel)),
       ];
       const hostIndex = this.bindings.readHostIndex(this.projectRecord.name);
       const tmps: string[] = [];
@@ -1985,6 +2030,7 @@ export class LayerfsSession {
           guard();
           const target = join(this.cwd, rel);
           await assertInsideWorkspace(this.cwd, target, true);
+          await assertNotProtectedTarget(this.cwd, target, false);
           const now = await hostState(target);
           if (now === "other" || !sameSig(now, host)) {
             result.conflicts.push(rel);
@@ -2031,7 +2077,7 @@ export class LayerfsSession {
         let toPublish: string | null = snap?.head ? snapBranch : null;
         if (toPublish && !mainUnchanged) {
           const merged = `m-${this.shortId}-${(++this.seq)}`;
-          const m = await this.lfs.branch.merge("main", snapBranch, merged, "merge applied session");
+          const m = await this.lfs.branch.merge("main", snapBranch, merged, "merge applied session", mergeUnits());
           if (m?.kind && m.kind !== "Merged" && m.kind !== "FastForward" && m.kind !== "UpToDate") throw new Error(`merge answered ${m.kind}`);
           // UpToDate: main already holds the snapshot; the merge branch has no Commit to publish
           toPublish = m?.kind === "UpToDate" ? null : merged;
@@ -2045,11 +2091,13 @@ export class LayerfsSession {
         result.warnings.push(`your folder is updated, but LayerFS main could not be updated (${e?.code ?? "Error"}: ${String(e?.message ?? e).slice(0, 160)}); the next session will resync main from your folder`);
       }
 
+      if (gitDiverged) this.bindings.setMainStale(this.projectRecord.name, true);
       this.baseBranch = nextBase;
       this.baseRef = fb.head ?? fb.base;
       // the folder now matches snapRef (the work branch's head, pinned under the mutex)
       if (this.headCommit) this.alignedRef = this.headCommit;
       this.unapplied = this.headCommit !== snapRef;
+      this.mergedSinceApply = [];
       this.persistSessionBinding();
       return result;
     });
@@ -2106,29 +2154,32 @@ export class LayerfsSession {
   private async mergeAddsNothing(targetBranch: string, otherBranch: string): Promise<boolean> {
     const testMerge = `test-merge-${this.shortId}-${(++this.seq)}`;
     try {
-      await this.lfs.branch.merge(targetBranch, otherBranch, testMerge, "test merge");
+      await this.lfs.branch.merge(targetBranch, otherBranch, testMerge, "test merge", mergeUnits());
       const d = await this.lfs.branch.diff_branches(targetBranch, testMerge, 1, 0, { hunks: false });
       return (d.items ?? []).length === 0;
     } catch {
       return false;
-    } finally {
-      await this.lfs.branch.delete?.(testMerge).catch(() => {});
     }
   }
 
-  /** Paths that apply writes to the host and diff/history show: not secret, not branch-only, not git-ignored. */
+  /**
+   * Paths that apply may write to the host: everything in the Branch (sources, `.git` data, ignored
+   * output, dependencies) except secrets, explicit branch-only patterns, protected git paths (config,
+   * hooks, ...: src/gitpaths.ts) and git's transient state. Git data has its own rules in apply.
+   */
   isApplicable(path: string): boolean {
     const p = String(path ?? "").replace(/^\/+/, "");
-    if (p === ".git" || p.startsWith(".git/")) return false; // git state comes from the folder, never applied
+    if (isProtectedPath(p)) return false;
+    if (gitPathKind(p) === "transient") return false; // locks and in-progress git state stay in the Branch
     if (this.isBranchOnly(p)) return false;
     return !isExcludedPath(p, this.config.excludes);
   }
 
-  /** Lives only in branches (MINILFS_BRANCH_ONLY or git-ignored): never applied, never synced. */
+  /** Lives only in branches (explicit MINILFS_BRANCH_ONLY patterns): never applied, never synced. */
   isBranchOnly(path: string): boolean {
     const p = String(path ?? "").replace(/^\/+/, "");
     if (!p || p === ".lww") return false;
-    return (this.config.branchOnly.length > 0 && isExcludedPath(p, this.config.branchOnly)) || this.ignore.isIgnored(p);
+    return this.config.branchOnly.length > 0 && isExcludedPath(p, this.config.branchOnly);
   }
 
   /** true when every applicable change on the Branch already has identical bytes in the host folder */
@@ -2201,45 +2252,45 @@ export class LayerfsSession {
 
 // ---------------------------------------------------------------- helpers
 
-async function readRefBytes(s: LayerfsSession, ref: string, sp: string): Promise<Buffer | null> {
-  try {
-    return await s.readBytesAtRef(ref, sp);
-  } catch (e: any) {
-    if (e?.code === "ENOENT" || e?.code === "NoSuchPath" || /not found|does not exist/i.test(e?.message)) {
-      return null;
-    }
-    throw e;
-  }
+/**
+ * true while the process that holds `s` runs. No pid (a closed session, or one written by an older
+ * version): gone. Another host's pid cannot be checked: assume it runs.
+ */
+function sessionAlive(s: SessionBinding): boolean {
+  if (!s.pid) return false;
+  if (s.host && s.host !== hostname()) return true;
+  return s.pid === process.pid || alive(s.pid);
 }
 
-function isBinary(buf: Buffer): boolean {
-  const len = Math.min(buf.length, 8000);
-  for (let i = 0; i < len; i++) {
-    if (buf[i] === 0) return true;
+/** Removes git's lock and temp files (`*.lock`, `*.new`, `tmp_*`) left in a Workspace's `.git` by a killed command. */
+async function removeGitLeftovers(wsReal: string): Promise<void> {
+  const gitDir = join(wsReal, ".git");
+  const top = await fsp.readdir(gitDir).catch(() => [] as string[]);
+  const victims = top.filter((n) => /\.(lock|new)$/.test(n)).map((n) => join(gitDir, n));
+  for (const sub of ["refs", "objects/pack", "objects/info"]) {
+    const walk = async (d: string): Promise<void> => {
+      for (const e of await fsp.readdir(d, { withFileTypes: true }).catch(() => [] as any[])) {
+        const p = join(d, e.name);
+        if (e.isDirectory()) await walk(p);
+        else if (/\.(lock|new)$|^tmp_/.test(e.name)) victims.push(p);
+      }
+    };
+    await walk(join(gitDir, sub));
   }
-  return false;
+  for (const v of victims) await fsp.rm(v, { force: true }).catch(() => {});
 }
 
-function threeWayMerge(ours: Buffer, base: Buffer | null, theirs: Buffer): { merged: Buffer } | { conflict: true } {
-  const tmpDir = mkdtempSync(join(tmpdir(), "lfs-merge-"));
-  const fOurs = join(tmpDir, "ours");
-  const fBase = join(tmpDir, "base");
-  const fTheirs = join(tmpDir, "theirs");
-  try {
-    writeFileSync(fOurs, ours);
-    writeFileSync(fTheirs, theirs);
-    if (base !== null) writeFileSync(fBase, base);
-    else writeFileSync(fBase, Buffer.alloc(0));
-    const res = spawnSync("git", ["merge-file", "-p", "-q", fOurs, fBase, fTheirs], { encoding: "buffer", maxBuffer: 50 * 1024 * 1024 });
-    if (res.status === 0 && res.stdout) {
-      return { merged: res.stdout };
-    }
-    return { conflict: true };
-  } catch {
-    return { conflict: true };
-  } finally {
-    try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-  }
+/** Merge units for branch.merge: the caller's first (a path two units match belongs to the first), then MERGE_UNITS. */
+function mergeUnits(extra: MergeOptions["units"] = []): Array<string | { name: string; patterns: string[] }> {
+  const out = [...(extra ?? [])];
+  const names = new Set(out.map((u) => (typeof u === "string" ? u : u.name)));
+  for (const u of MERGE_UNITS) if (!names.has(u.name)) out.push({ name: u.name, patterns: [...u.patterns] });
+  return out;
+}
+
+/** The conflicting paths of a LayerFS `Conflict` refusal. */
+function conflictList(e: any): Array<{ path: string; kind?: string }> {
+  return (e?.detail?.conflicts ?? []).map((c: any) => ({ path: String(c.path).replace(/^\/+/, ""), kind: c.kind }));
 }
 
 function enoent(path: string, why: string) {
@@ -2254,6 +2305,17 @@ const sameSig = (a: HostEntry | null | undefined, b: HostEntry | null | undefine
 const cleanRef = (ref: string | null | undefined) => (ref ?? "").replace(/^(\w+)-/, "").slice(0, 12);
 const fileSig = (data: Buffer, mode?: number): HostEntry => ({ kind: "file", sig: sha(data), ...(mode !== undefined ? { mode: mode & 0o7777 } : {}) });
 const linkSig = (target: string): HostEntry => ({ kind: "symlink", sig: `link:${target}` });
+
+/** A path's content: a file's bytes and mode, a symlink's target, null (absent) or "other" (a directory, device, ...). */
+type RawEntry = { data: Buffer; mode: number } | { target: string } | null | "other";
+
+async function readRawEntry(abs: string): Promise<RawEntry> {
+  const st = await fsp.lstat(abs).catch((e: any) => (e?.code === "ENOENT" || e?.code === "ENOTDIR" ? null : Promise.reject(e)));
+  if (!st) return null;
+  if (st.isSymbolicLink()) return { target: await fsp.readlink(abs) };
+  if (st.isFile()) return { data: await fsp.readFile(abs), mode: st.mode & 0o7777 };
+  return "other";
+}
 
 async function hostState(abs: string): Promise<HostEntry | null | "other"> {
   const st = await fsp.lstat(abs).catch((e: any) => (e?.code === "ENOENT" || e?.code === "ENOTDIR" ? null : Promise.reject(e)));
@@ -2359,7 +2421,7 @@ export function expandBraces(pattern: string): string[] {
   return m[1].split(",").flatMap((part) => expandBraces(`${prefix}${part}${suffix}`));
 }
 
-/** Refuses an import that would hit LayerFS's fixed 60 s Init deadline; names the biggest folders. */
+/** Refuses an import above the configured limits (memory, Init time); names the biggest folders. */
 async function checkImportSize(root: string, files: string[], config: LayerfsConfig): Promise<void> {
   let bytes = 0;
   const perTop = new Map<string, { files: number; bytes: number }>();
@@ -2380,9 +2442,9 @@ async function checkImportSize(root: string, files: string[], config: LayerfsCon
     .map(([p, t]) => `${p} (${t.files} files, ${mb(t.bytes)})`).join(", ");
   throw new LayerfsError("TooLarge",
     `folder too large to import (${files.length} files, ${mb(bytes)}; limit ${config.maxImportFiles} files / ${mb(config.maxImportBytes)}). ` +
-    `Largest (not ignored): ${biggest}. Ignore folders agents need not edit (data, build output) in .gitignore, ` +
-    `or in ${join(root, ".minilfsignore")} to keep them out of minilfs only (one pattern per line, e.g. "runs/"); then /minilfs retry. ` +
-    `Or raise MINILFS_MAX_IMPORT_FILES / MINILFS_MAX_IMPORT_MB.`);
+    `Largest: ${biggest}. LayerFS imports the whole folder (.git, dependencies, ignored output). ` +
+    `Raise MINILFS_MAX_IMPORT_FILES / MINILFS_MAX_IMPORT_MB (and MINILFS_INIT_TIMEOUT_MS for a slow import), ` +
+    `or keep data folders agents need not edit out with MINILFS_BRANCH_ONLY (comma-separated, e.g. "runs/,data/"; never .git or node_modules); then /minilfs retry.`);
 }
 
 /** true for a host path that is never imported or synced (`isDir`: the path is a directory) */
@@ -2412,7 +2474,7 @@ async function listImportable(root: string, skip: Skip): Promise<string[]> {
     for (const ent of entries) {
       const abs = join(dir, ent.name);
       const rel = relative(root, abs).split("\\").join("/");
-      if (ent.name === ".git" || skip(rel, ent.isDirectory())) continue; // .git stays the folder's (see attachHostGit)
+      if (skip(rel, ent.isDirectory())) continue; // full tree: .git, ignored files and dependencies included
       if (ent.isDirectory()) await walk(abs);
       else out.push(rel);
     }
@@ -2430,6 +2492,11 @@ export function matchesToolGlob(rel: string, pattern: string): boolean {
 const INIT_LOCK_WAIT_MS = 30 * 60_000;
 
 const STREAM_HASH_BYTES = 8 * 1024 * 1024;
+/** A scan keeps at most this many changed bytes in memory; a sync re-reads the rest from disk. */
+const SCAN_KEEP_BYTES = 64 * 1024 * 1024;
+/** Host sync writes changes through the Store (`fs.apply`) in batches of this many bytes/ops; larger drift goes through one mount. */
+const SYNC_STORE_BATCH_BYTES = 8 * 1024 * 1024;
+const SYNC_STORE_MAX_FILES = 2000;
 async function streamSha(abs: string): Promise<string> {
   const h = createHash("sha256");
   for await (const chunk of createReadStream(abs, { highWaterMark: 1024 * 1024 })) h.update(chunk as Buffer);
@@ -2447,6 +2514,7 @@ const SCAN_CONCURRENCY = 32;
 async function scanHostDirectory(root: string, skip: Skip, cache: HostIndex = {}, strict = false, keepBytes = true): Promise<{ index: HostIndex; bytes: Map<string, Buffer> }> {
   const index: HostIndex = {};
   const bytes = new Map<string, Buffer>();
+  let keptBytes = 0;
   const visit = async (abs: string, rel: string) => {
     const st = await fsp.lstat(abs).catch((e: any) => (e?.code === "ENOENT" ? null : Promise.reject(e)));
     if (!st) return;
@@ -2466,7 +2534,10 @@ async function scanHostDirectory(root: string, skip: Skip, cache: HostIndex = {}
       const data = await fsp.readFile(abs);
       const entry: HostEntry = { ...fileSig(data, st.mode), mtimeMs: st.mtimeMs, size: st.size };
       index[rel] = entry;
-      if (keepBytes && !sameSig(prev, entry)) bytes.set(rel, data);
+      if (keepBytes && !sameSig(prev, entry) && keptBytes + data.length <= SCAN_KEEP_BYTES) {
+        bytes.set(rel, data);
+        keptBytes += data.length;
+      }
     }
   };
   // read one directory: queue its sub-directories, stat its files
@@ -2480,7 +2551,7 @@ async function scanHostDirectory(root: string, skip: Skip, cache: HostIndex = {}
       }
       const files: Array<[string, string]> = [];
       for (const ent of entries) {
-        if (ent.name === ".git" || ent.name === ".lww" || ent.name.includes(".minilfs-")) continue;
+        if ((!dirRel && ent.name === ".lww") || ent.name.includes(".minilfs-")) continue;
         const rel = dirRel ? `${dirRel}/${ent.name}` : ent.name;
         // an ignored directory is skipped whole, without reading it
         if (skip(rel, ent.isDirectory())) continue;
@@ -2537,6 +2608,8 @@ async function forceUnmount(wsReal: string): Promise<void> {
 }
 
 export async function stopNativeDaemons(localDir?: string): Promise<void> {
+  // the root's store workers first (they hold the Stores), then the daemons; <root>/local is localDir
+  if (localDir) stopWorkers(dirname(localDir));
   const pattern = localDir ? `layerfs-daemon --config ${localDir}/` : "layerfs-daemon --config ";
   const r = await run("pgrep", ["-f", pattern]).catch(() => null);
   if (r?.code === 0 && r.stdout.length > 0) {

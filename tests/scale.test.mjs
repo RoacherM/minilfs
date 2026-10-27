@@ -22,7 +22,7 @@ const pgrep = (pattern) => spawnSync("pgrep", ["-f", pattern], { encoding: "utf8
 const timings = {};
 const time = async (k, fn) => { const t0 = Date.now(); const v = await fn(); timings[k] = Date.now() - t0; return v; };
 
-const cfg = { ...resolveConfig({}), root: join(base, "lfs"), prefix };
+const cfg = { ...resolveConfig({ MINILFS_BUNDLE: process.env.MINILFS_BUNDLE }), root: join(base, "lfs"), prefix };
 const s1 = new LayerfsSession(cwd, `scale1-${id}`, cfg, (m) => console.log(`  [s1] ${m}`));
 const s2 = new LayerfsSession(cwd, `scale2-${id}`, cfg, (m) => console.log(`  [s2] ${m}`));
 let ok = false;

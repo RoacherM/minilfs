@@ -17,7 +17,7 @@ writeFileSync(join(cwd, "a.txt"), "a\n");
 const child = `
   import { resolveConfig } from ${JSON.stringify(new URL("../src/config.ts", import.meta.url).pathname)};
   import { LayerfsSession } from ${JSON.stringify(new URL("../src/workspace.ts", import.meta.url).pathname)};
-  const s = new LayerfsSession(process.argv[1], "cs-" + process.argv[2], { ...resolveConfig({}), root: process.argv[3], prefix: process.argv[4] });
+  const s = new LayerfsSession(process.argv[1], "cs-" + process.argv[2], { ...resolveConfig({ MINILFS_BUNDLE: process.env.MINILFS_BUNDLE }), root: process.argv[3], prefix: process.argv[4] });
   await s.open();
   await s.mutate("w", "write", () => s.writeFile(process.argv[1] + "/w" + process.argv[2] + ".txt", "x"));
   console.log("OK", s.project, s.workBranch);

@@ -29,6 +29,9 @@ export interface SessionBinding {
   logicalBranch?: string;
   /** see LayerfsSession.alignedRef */
   alignedRef?: string | null;
+  /** the process that holds this session; an alias such as `lead` is taken only while it runs */
+  pid?: number;
+  host?: string;
 }
 
 export interface HostEntry {

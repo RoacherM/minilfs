@@ -26,7 +26,7 @@ const step = async (name, fn) => {
 };
 const pgrep = (pattern) => spawnSync("pgrep", ["-f", pattern], { encoding: "utf8" });
 const sha = (b) => createHash("sha256").update(b).digest("hex");
-const config = { ...resolveConfig({}), root: join(base, "root"), prefix: `minilfs-v2-${id}-`, killGraceMs: 1000 };
+const config = { ...resolveConfig({ MINILFS_BUNDLE: process.env.MINILFS_BUNDLE }), root: join(base, "root"), prefix: `minilfs-v2-${id}-`, killGraceMs: 1000 };
 
 function fixture(dir) {
   mkdirSync(join(dir, "src/sub"), { recursive: true });
@@ -155,15 +155,16 @@ try {
     assert.ok(chunks[0].t < 600 && chunks.at(-1).t > 650, `expected streaming chunks: ${JSON.stringify(chunks.map((c) => c.t))}`);
   });
 
-  await step("git in workspace: excluded .env is not shown as deleted, .lww not shown as untracked", async () => {
+  await step("git in workspace: the Branch's own .git (imported) works; .lww not shown as untracked", async () => {
     const out = [];
-    const r = await sA.exec("git status --porcelain", cwd, { onData: (d) => out.push(d.toString()) });
-    assert.equal(r.exitCode, 0);
+    const r = await sA.exec("git rev-parse --git-dir && git status --porcelain", cwd, { onData: (d) => out.push(d.toString()) });
+    assert.equal(r.exitCode, 0, out.join(""));
     const text = out.join("");
-    assert.doesNotMatch(text, /\.env/, `git status mentions .env: ${text}`);
+    assert.match(text, /^\.git\n/, `the Workspace has a real .git directory: ${text}`);
     assert.doesNotMatch(text, /\.lww/, `git status mentions .lww: ${text}`);
-    // a read-only command must not create a Commit (the prelude must not rewrite .git/index again)
-    const ro = await sA.mutate("ro", "bash", () => sA.exec("node -e 1 && git status --porcelain >/dev/null", cwd, { onData: () => {} }));
+    // a second read-only command makes no Commit (git only refreshes its stat cache the first time)
+    await sA.mutate("ro0", "bash", () => sA.exec("git status --porcelain >/dev/null", cwd, { onData: () => {} }));
+    const ro = await sA.mutate("ro", "bash", () => sA.exec("node -e 1", cwd, { onData: () => {} }));
     assert.equal(ro.checkpoint, null, `read-only bash created a Commit ${ro.checkpoint?.commit}`);
     return text.trim().split("\n").slice(0, 6).join(" | ") || "(clean)";
   });

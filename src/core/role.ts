@@ -1,18 +1,14 @@
-// Who an agent is, and what the main agent may do outside its Branch.
+// Who an agent is. Pure sandbox model: every agent (lead included) works only on its own LayerFS
+// Branch, inside the sandbox; nothing runs on the real folder outside it. git commit/merge happen
+// in the Branch's own `.git`, and Branches combine with LayerFS merge.
 //
 // Role: decided once, by the harness, when the agent starts.
-//   lead    the top-level session: works on its Branch, may apply and run elevated commands
-//   worker  a sub-agent: works on its own Branch; never applies, never elevates
+//   lead    the top-level session: works on its Branch, merges sub-agent Branches, applies to the folder
+//   worker  a sub-agent: works on its own Branch; reports its branch name; never applies
 // Default is lead: a top-level session has no sub-agent markers.
-//
-// Elevation: one bash command runs on the real folder, outside the Branch and its sandbox.
-//   auto  (default) the main agent elevates when it judges it needs to, without asking
-//   ask   the user confirms each elevated command (a command-prefix allow list skips the dialog)
-//   never no elevation
 import { basename, dirname, sep } from "node:path";
 
 export type Role = "lead" | "worker";
-export type ElevatePolicy = "auto" | "ask" | "never";
 
 export interface RoleInfo {
   role: Role;
@@ -48,20 +44,3 @@ export function resolveRole(opts: { env?: NodeJS.ProcessEnv; sessionFile?: strin
   if (env.PI_SUBAGENT_CHILD === "1") return { role: "worker", source: "PI_SUBAGENT_CHILD", branchName: env.MINILFS_BRANCH_NAME || undefined };
   return { role: "lead", source: "top-level session" };
 }
-
-export function elevatePolicy(env: NodeJS.ProcessEnv = process.env, flag?: unknown): ElevatePolicy {
-  const v = String(flag || env.MINILFS_ELEVATE || "auto").toLowerCase();
-  return v === "ask" || v === "never" ? v : "auto";
-}
-
-/** `MINILFS_ELEVATE_ALLOW="git *,docker *"`: commands that need no confirmation under `ask`. */
-export function elevateAllowed(command: string, env: NodeJS.ProcessEnv = process.env, extra: string[] = []): boolean {
-  const patterns = [...String(env.MINILFS_ELEVATE_ALLOW ?? "").split(","), ...extra].map((p) => p.trim()).filter(Boolean);
-  const cmd = command.trim();
-  return patterns.some((p) => (p.endsWith("*") ? cmd.startsWith(p.slice(0, -1).trimEnd()) : cmd === p));
-}
-
-export const ELEVATE_PARAM_DESCRIPTIONS = {
-  elevated: "Run this one command on the user's real project folder, outside your minilfs Branch and its sandbox (host PATH, permissions, network, .git). Use it when the sandbox blocks the step (\"Operation not permitted\"), for git commit/push/checkout, Docker, mounts, setuid tools like ps, or long-running services. Before it runs, your Branch's unapplied changes are written to the folder; afterwards the folder's changes come back into your Branch. File tools never need this.",
-  reason: "Required with elevated: one sentence on why this command must run on the real folder (shown to the user, recorded in history).",
-} as const;

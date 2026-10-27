@@ -1,6 +1,7 @@
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { GIT_ALLOWED_BODY, GIT_NESTED_PREFIX, GIT_REFUSED_NAME } from "./gitpaths.ts";
 
 export interface SeatbeltOptions {
   wsPath: string;
@@ -11,8 +12,31 @@ export interface SeatbeltOptions {
   outsideSecrets: string[];
   network: "allow" | "localhost" | "deny";
   logTag?: string;
-  /** git admin directory of the Workspace's work tree (see LayerfsSession.attachHostGit): only its index is writable */
-  gitAdmin?: string;
+}
+
+/** `abc` -> `[aA][bB][cC]`: Seatbelt regex has no case-insensitive flag. */
+function anyCase(s: string): string {
+  return s.replace(/[a-zA-Z]/g, (c) => `[${c.toLowerCase()}${c.toUpperCase()}]`);
+}
+
+/**
+ * Seatbelt rules for the project's git directory (`<ws>/.git`, any letter case): all writes denied,
+ * then the data allowlist of src/gitpaths.ts re-allowed (objects, refs, logs, HEAD, index, ...),
+ * then names that make git run code refused again below `modules/` (submodule git dirs, whose names
+ * may contain `/`). The `.git` entry itself can never be created, removed, renamed or replaced, so
+ * no other git directory takes its place. Nested repositories (`sub/.git`) stay writable in the
+ * sandbox (git init / clone work there); apply writes only their allowlisted data to the folder.
+ */
+export function gitWriteRules(wsEsc: string): string[] {
+  const gitDir = `^${wsEsc}/\\.${anyCase("git")}`;
+  const refused = GIT_REFUSED_NAME.split("|").map((n) => anyCase(n)).join("|");
+  return [
+    `(deny file-write*\n  (regex #"${gitDir}($|/.*)")\n)`,
+    `(allow file-write*\n  (regex #"^${wsEsc}/\\.git/${GIT_NESTED_PREFIX}(${GIT_ALLOWED_BODY})$")\n)`,
+    `(deny file-write*\n  (regex #"${gitDir}/${anyCase("modules")}/(.*/)?(${refused})($|/.*)")\n)`,
+    // a `.` or `..` component would let `.*` in the allowlist span into a protected name
+    `(deny file-write*\n  (regex #"${gitDir}/(.*/)?\\.\\.?(/.*)?$")\n)`,
+  ];
 }
 
 /**
@@ -118,7 +142,8 @@ function escapeLiteral(s: string): string {
  * 3. Network isolation: deny all or allow localhost/unix-socket only.
  * 4. Filesystem write lockdown: deny all file-write*, allow only wsPath, scratchDir, /tmp,
  *    /var/folders, /dev null/zero/tty/urandom/random; then mandatory write denies for hostCwd,
- *    wsPath/.lww, wsPath/.git (the folder's repository; only the work tree's index is writable), and wsPath excludes.
+ *    wsPath/.lww, every git directory outside its data allowlist (src/gitpaths.ts: objects, refs,
+ *    logs, HEAD, index stay writable so git add/commit/branch/merge run in the sandbox), and wsPath excludes.
  * 5. Filesystem read denies & move-blocking: deny file-read-data and file-write-unlink on
  *    outside secrets under $HOME and excludes under hostCwd and wsPath, while keeping
  *    directory metadata traversal allowed.
@@ -224,37 +249,17 @@ export function buildSeatbeltProfile(options: SeatbeltOptions): string {
   for (const s of scratchSpellings) wsScratchAllows.push(`  (subpath "${escapeLiteral(s)}")`);
   lines.push(`(allow file-write*\n${wsScratchAllows.join("\n")}\n)`);
 
-  // 9. Mandatory write denies inside wsPath: .lww, .git (the folder's repository), excludes
+  // 9. Mandatory write denies inside wsPath: .lww and git directories, then excludes (9b).
+  // The Branch's .git is real LayerFS state (imported with the folder, one per Branch): git add,
+  // commit, branch and merge write its data (objects, refs, logs, HEAD, index). Everything else in a
+  // git directory (config, config.worktree, hooks, commondir, info/attributes, objects/info/alternates,
+  // submodule config and hooks, ...) can make git run code, in the sandbox or on the host after apply,
+  // so it is an allowlist (src/gitpaths.ts), matched by regex at any depth and in any letter case.
   lines.push(";; 9. Mandatory write denies inside wsPath");
-  const hookLwwDenies: string[] = [];
-  const hookLwwUnlinkDenies: string[] = [];
-  for (const w of wsSpellings) {
-    hookLwwDenies.push(
-      `  (literal "${escapeLiteral(join(w, ".lww"))}")`,
-      // .git is the folder's repository, never Branch data: the sandbox cannot create, change or
-      // repoint it (git writes run with elevated; see LayerfsSession.attachHostGit)
-      `  (literal "${escapeLiteral(join(w, ".git"))}")`,
-      `  (subpath "${escapeLiteral(join(w, ".git"))}")`,
-    );
-    hookLwwUnlinkDenies.push(
-      `  (literal "${escapeLiteral(join(w, ".git"))}")`,
-      `  (subpath "${escapeLiteral(join(w, ".git"))}")`,
-      `  (literal "${escapeLiteral(join(w, ".lww"))}")`,
-    );
-  }
-  lines.push(
-    `(deny file-write*\n${hookLwwDenies.join("\n")}\n)`,
-    `(deny file-write-unlink\n${hookLwwUnlinkDenies.join("\n")}\n)`,
-  );
-  if (options.gitAdmin) {
-    // the work tree's admin directory: HEAD and the link to the repository are fixed; git may only
-    // refresh the index (stat cache), which never reaches the folder
-    const admins = bothSpellings(options.gitAdmin);
-    lines.push(
-      `(deny file-write*\n${admins.map((a) => `  (subpath "${escapeLiteral(a)}")`).join("\n")}\n)`,
-      `(allow file-write*\n${admins.flatMap((a) => [`  (literal "${escapeLiteral(join(a, "index"))}")`, `  (literal "${escapeLiteral(join(a, "index.lock"))}")`]).join("\n")}\n)`,
-    );
-  }
+  const lwwDenies: string[] = [];
+  for (const w of wsSpellings) lwwDenies.push(`  (regex #"^${esc(w)}/${anyCase(".lww").replace(".", "\\.")}$")`);
+  lines.push(`(deny file-write*\n${lwwDenies.join("\n")}\n)`);
+  for (const w of wsSpellings) lines.push(...gitWriteRules(esc(w)));
 
   // 9b. Excludes inside wsPath: deny writing or unlinking
   // `!pattern` re-includes (e.g. `!.env.example`): denies use the plain patterns, then the

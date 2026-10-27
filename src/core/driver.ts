@@ -13,6 +13,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { LayerfsConfig } from "../config.ts";
 import { bothSpellings, buildSeatbeltProfile } from "../seatbelt.ts";
+import { killAll, leftovers, listOwnProcesses } from "./proc-scan.ts";
+
+/** After the shell exits, how long its output may keep draining before the pipe is cut. */
+const PIPE_DRAIN_MS = 2000;
 import { ensureBundle, missingBundleFiles } from "../bundle.ts";
 import type { Workspace } from "../workspace.ts";
 import { run } from "./exec-helper.ts";
@@ -38,8 +42,6 @@ export interface DriverExecContext {
   logicalBranch: string;
   outsideSecrets: string[];
   lwwContent: string;
-  /** git admin directory of the Workspace's work tree, when the folder is a git repository */
-  gitAdmin?: string;
   command: string;
   options: DriverExecOptions;
 }
@@ -95,14 +97,17 @@ export function buildNativeShellPrelude(hostCwd: string, wsReal: string): string
     `    done`,
     `    [ -n "$_dur" ] || return 125`,
     `    _dur="\${_dur%s}"`,
-    `    "$@" &`,
+    // the command leads its own process group (perl setpgrp, then exec), so the timeout stops its
+    // children too (cargo test spawns the test binary); the watchdog holds no pipe and exits with it
+    `    /usr/bin/perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' "$@" &`,
     `    local _cpid=$!`,
-    `    ( sleep "$_dur" 2>/dev/null && kill -TERM "$_cpid" 2>/dev/null && sleep 1 && kill -KILL "$_cpid" 2>/dev/null ) >/dev/null 2>&1 &`,
+    `    ( exec </dev/null >/dev/null 2>&1; sleep "$_dur" & _s=$!; trap 'kill -KILL $_s 2>/dev/null; exit 0' TERM; wait $_s && kill -TERM -- "-$_cpid" "$_cpid" 2>/dev/null && sleep 1 && kill -KILL -- "-$_cpid" "$_cpid" 2>/dev/null ) &`,
     `    local _wpid=$!`,
     `    wait "$_cpid" 2>/dev/null`,
     `    local _rc=$?`,
-    `    kill -KILL "$_wpid" 2>/dev/null || true`,
+    `    kill -TERM "$_wpid" 2>/dev/null || true`,
     `    wait "$_wpid" 2>/dev/null || true`,
+    `    kill -KILL -- "-$_cpid" 2>/dev/null || true`,
     `    if [ $_rc -eq 143 ] || [ $_rc -eq 137 ]; then return 124; fi`,
     `    return $_rc`,
     `  }`,
@@ -124,8 +129,10 @@ export class LocalNativeDriver implements ExecutionDriver {
     const problems: string[] = [];
     const fetchProblem = await ensureBundle(config.bundle).catch((e) => `installing the LayerFS bundle failed: ${e?.message ?? e}`);
     for (const f of await missingBundleFiles(config.bundle)) problems.push(`missing ${f}`);
-    if (fetchProblem && problems.length) problems.push(fetchProblem);
-    for (const bin of ["/sbin/mount_nfs", "/usr/bin/sandbox-exec"]) {
+    // a missing file reports the download problem too; a complete bundle of another LayerFS commit is a problem by itself
+    if (fetchProblem && (problems.length || /needs [0-9a-f]{12}/.test(fetchProblem))) problems.push(fetchProblem);
+    const mountBin = config.nfsMount ? config.nfsMount.trim().split(/\s+/)[0] : "/sbin/mount_nfs";
+    for (const bin of [mountBin, "/usr/bin/sandbox-exec"]) {
       try {
         await fsp.access(bin, fsc.X_OK);
       } catch {
@@ -166,15 +173,15 @@ export class LocalNativeDriver implements ExecutionDriver {
       excludes: config.excludes,
       outsideSecrets,
       network: config.network,
-      gitAdmin: ctx.gitAdmin,
     });
 
     // first on PATH: a `ps` that works inside the sandbox (/bin/ps is setuid and cannot run here)
     const shimDir = await ensurePsShim(scratchDir).catch(() => null);
     const basePath = process.env.PATH || "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+    const pathParts = [shimDir, basePath].filter(Boolean);
     const childEnv: NodeJS.ProcessEnv = {
       HOME: homedir(),
-      PATH: shimDir ? `${shimDir}:${basePath}` : basePath,
+      PATH: pathParts.join(":"),
       TMPDIR: "/private/tmp",
       USER: process.env.USER || "user",
       LOGNAME: process.env.LOGNAME || "user",
@@ -186,6 +193,8 @@ export class LocalNativeDriver implements ExecutionDriver {
         childEnv[k] = v;
       }
     }
+    // No LAYERFS_* settings: the Stores under configRoot are denied in the sandbox, so the layerfs
+    // CLI or SDK could not work there; the agent's Branch tools are the `minilfs` tool and apply.
 
     const prelude = buildNativeShellPrelude(hostCwd, wsReal);
     const wrappedCommand = `${prelude}\n${command}`;
@@ -195,30 +204,48 @@ export class LocalNativeDriver implements ExecutionDriver {
       ["-p", profile, "/bin/bash", "-c", wrappedCommand],
       { cwd: runCwd, env: childEnv, stdio: ["ignore", "pipe", "pipe"], detached: true },
     );
+    const startedSec = Math.floor(Date.now() / 1000);
     child.stdout.on("data", options.onData);
     child.stderr.on("data", options.onData);
+    // the call's processes may be found under these roots after the shell is gone (see proc-scan.ts)
+    const roots = [...new Set([wsReal, branchScratchDir, sharedCacheDir].flatMap((p) => bothSpellings(p)))];
 
     const tag = randomBytes(6).toString("hex");
     let stopping: Promise<void> | null = null;
     const kill = () => (stopping ??= this.killProcessGroup(child, wsReal, config.killGraceMs));
     this.activeKills.set(tag, kill);
 
+    // the caller's limit (Pi's bash `timeout`), else the overall limit every call has
+    const limitS = Math.min(options.timeout && options.timeout > 0 ? options.timeout : Infinity, config.bashTimeoutS ?? 600);
     let timedOut = false;
-    const timer =
-      options.timeout && options.timeout > 0
-        ? setTimeout(() => {
-            timedOut = true;
-            void kill();
-          }, options.timeout * 1000)
-        : undefined;
+    const timer = Number.isFinite(limitS)
+      ? setTimeout(() => {
+          timedOut = true;
+          void kill();
+        }, limitS * 1000)
+      : undefined;
     const onAbort = () => void kill();
     options.signal?.addEventListener("abort", onAbort, { once: true });
     if (options.signal?.aborted) void kill();
 
     try {
+      // Resolve when the shell exits, not when the pipe closes: a descendant that outlives the shell
+      // (a background server, a test binary in its own session) would hold the pipe, and the call,
+      // open forever. Its output after a short drain is dropped, and it is killed below.
       const code = await new Promise<number | null>((resolveCode, reject) => {
         child.on("error", reject);
-        child.on("close", (c) => resolveCode(c));
+        // each stream reports its own end; one may have closed before the shell exited
+        const closed = (st: NodeJS.ReadableStream & { closed?: boolean; destroyed?: boolean }) =>
+          st.closed || st.destroyed ? Promise.resolve() : new Promise<void>((r) => st.once("close", () => r()));
+        const streams = Promise.all([closed(child.stdout), closed(child.stderr)]);
+        child.once("exit", (c) => {
+          const cut = setTimeout(() => {
+            child.stdout.destroy();
+            child.stderr.destroy();
+            resolveCode(c);
+          }, PIPE_DRAIN_MS);
+          void streams.then(() => { clearTimeout(cut); resolveCode(c); });
+        });
       });
       if (stopping) await stopping;
       if (child.pid) {
@@ -227,6 +254,7 @@ export class LocalNativeDriver implements ExecutionDriver {
         } catch {}
       }
       await this.reapWorkspaceHolders(wsReal).catch(() => {});
+      await this.reapLeftovers(child.pid, startedSec, roots).catch(() => {});
 
       const lwwFile = join(wsReal, ".lww");
       if (!existsSync(lwwFile)) {
@@ -234,7 +262,12 @@ export class LocalNativeDriver implements ExecutionDriver {
       }
 
       if (options.signal?.aborted) throw new Error("aborted");
-      if (timedOut) throw new Error(`timeout:${options.timeout}`);
+      if (timedOut) {
+        if (options.timeout && options.timeout <= limitS) throw new Error(`timeout:${options.timeout}`);
+        // minilfs's own limit: report it with the output so far, as a failed command
+        options.onData(Buffer.from(`\n[minilfs] the command ran longer than ${limitS} s (MINILFS_BASH_TIMEOUT_S); it and the processes it started were stopped.\n`));
+        return { exitCode: 124 };
+      }
       return { exitCode: code };
     } finally {
       if (timer) clearTimeout(timer);
@@ -246,6 +279,12 @@ export class LocalNativeDriver implements ExecutionDriver {
         } catch {}
       }
     }
+  }
+
+  /** Kills what a call left running outside its process group (see proc-scan.ts). */
+  private async reapLeftovers(pgid: number | undefined, sinceSec: number, roots: string[]): Promise<void> {
+    const rows = await listOwnProcesses();
+    killAll(leftovers(rows, { pgid, sinceSec, roots }).map((r) => r.pid));
   }
 
   private async killProcessGroup(child: ReturnType<typeof spawn>, wsReal: string, killGraceMs: number): Promise<void> {

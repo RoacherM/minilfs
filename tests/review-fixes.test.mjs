@@ -13,7 +13,7 @@ import layerfsExtension from "../src/index.ts";
 
 const id = Date.now().toString(36);
 const base = join(homedir(), ".cache/minilfs-test", `fix-${id}`);
-const config = { ...resolveConfig({}), root: join(base, "root"), prefix: `minilfs-fx-${id}-`, killGraceMs: 800, excludes: [...resolveConfig({}).excludes, "secrets/"] };
+const config = { ...resolveConfig({ MINILFS_BUNDLE: process.env.MINILFS_BUNDLE }), root: join(base, "root"), prefix: `minilfs-fx-${id}-`, killGraceMs: 800, excludes: [...resolveConfig({}).excludes, "secrets/"] };
 const pgrep = (pattern) => spawnSync("pgrep", ["-f", pattern], { encoding: "utf8" });
 const results = [];
 const step = async (name, fn) => {
@@ -271,7 +271,7 @@ try {
     assert.equal(readFileSync(join(cwd, "a.txt"), "utf8"), "v2\n");
   });
 
-  await step("two sessions that both ran git: apply + merge on .git metadata does not conflict (.lww .git/)", async () => {
+  await step("two sessions that both ran git: apply + merge on .git metadata does not conflict (.git is one merge unit)", async () => {
     const cwd = project();
     spawnSync("git", ["-C", cwd, "init", "-q"]); spawnSync("git", ["-C", cwd, "add", "-A"]); spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "i"]);
     const a = await open(cwd, "ga");
@@ -415,29 +415,19 @@ try {
     assert.equal(v.unapplied.length, 1, JSON.stringify(v.unapplied));
   });
 
-  await step("fallback merge on InvalidRecord and after rm/mv in bash", async () => {
+  await step("official branch.merge: non-conflicting edits, then rm/mv in bash", async () => {
     const cwd = project();
     const lead = await open(cwd, "fbm-lead");
     const worker = await open(cwd, "fbm-w");
-    // Part A: Injected InvalidRecord
     await lead.mutate("1", "write", () => lead.writeFile(join(cwd, "lead.txt"), "lead\n"));
     await worker.mutate("2", "write", () => worker.writeFile(join(cwd, "worker.txt"), "worker\n"));
+    const r = await lead.mergeBranch(worker.workBranch);
+    assert.equal(r.merged, true);
+    assert.equal(r.resolved, undefined);
+    assert.equal((await lead.readFile(join(cwd, "worker.txt"))).toString(), "worker\n");
+    assert.equal((await lead.readFile(join(cwd, "lead.txt"))).toString(), "lead\n");
 
-    const realMerge = lead.lfs.branch.merge.bind(lead.lfs.branch);
-    lead.lfs.branch.merge = async () => {
-      throw Object.assign(new Error("invalid record: binding kind"), { code: "InvalidRecord" });
-    };
-    try {
-      const r = await lead.mergeBranch(worker.workBranch);
-      assert.equal(r.merged, true);
-      assert.equal(r.fallback, true);
-      assert.equal((await lead.readFile(join(cwd, "worker.txt"))).toString(), "worker\n");
-      assert.equal((await lead.readFile(join(cwd, "lead.txt"))).toString(), "lead\n");
-    } finally {
-      lead.lfs.branch.merge = realMerge;
-    }
-
-    // Part B: Real rm/mv/script writes in bash
+    // real rm/mv/script writes in bash
     await worker.mutate("3", "bash", () => worker.exec("rm a.txt && mv src/app.js src/app-renamed.js && echo 'from script' > script.txt", cwd, { onData: () => {} }));
     const r2 = await lead.mergeBranch(worker.workBranch);
     assert.equal(r2.merged, true);
@@ -460,12 +450,24 @@ try {
 
     const rTheirs = await lead.mergeBranch(worker.workBranch, { strategy: "theirs" });
     assert.equal(rTheirs.merged, true);
+    assert.deepEqual(rTheirs.resolved, ["conf.txt"], "copied the winning side onto a working fork, then merged again");
     assert.equal((await lead.readFile(join(cwd, "conf.txt"))).toString(), "theirs v1\n");
 
+    // only the worker changed it since: a clean three-way change, taken whatever the strategy
+    // (a strategy decides real conflicts only, like git merge -X ours)
     await worker.mutate("3", "write", () => worker.writeFile(join(cwd, "conf.txt"), "theirs v2\n"));
+    const rClean = await lead.mergeBranch(worker.workBranch, { strategy: "ours" });
+    assert.equal(rClean.merged, true);
+    assert.equal(rClean.resolved, undefined, "no conflict to resolve");
+    assert.equal((await lead.readFile(join(cwd, "conf.txt"))).toString(), "theirs v2\n");
+
+    // both change it: a real conflict, and ours wins
+    await worker.mutate("4", "write", () => worker.writeFile(join(cwd, "conf.txt"), "theirs v3\n"));
+    await lead.mutate("5", "write", () => lead.writeFile(join(cwd, "conf.txt"), "ours v3\n"));
     const rOurs = await lead.mergeBranch(worker.workBranch, { strategy: "ours" });
     assert.equal(rOurs.merged, true);
-    assert.equal((await lead.readFile(join(cwd, "conf.txt"))).toString(), "theirs v1\n");
+    assert.deepEqual(rOurs.resolved, ["conf.txt"]);
+    assert.equal((await lead.readFile(join(cwd, "conf.txt"))).toString(), "ours v3\n");
   });
 
   await step("minilfs show >60KB without truncation, pagination, ls, checkout, and cross-branch diff", async () => {
@@ -619,7 +621,7 @@ try {
     assert.ok(srcMtime >= appMtime, `main.rs (${srcMtime}) must be >= target/debug/app (${appMtime})`);
   });
 
-  await step("fallbackMergeBranch with forkedFrom commit:..., +x mode and symlink, then lead.apply() without WouldRevert", async () => {
+  await step("branch.merge brings +x mode and symlink, then lead.apply() without WouldRevert", async () => {
     const cwd = project();
     const lead = await open(cwd, "fbm-sym-lead");
     const worker = await open(cwd, "fbm-sym-w");
@@ -640,30 +642,9 @@ try {
       worker.exec("chmod +x run.sh", cwd, { onData: () => {} })
     );
 
-    // Simulate other having forkedFrom: "commit:<hex>" in list_branches (P0-1)
-    const realListBranches = lead.lfs.project.list_branches.bind(lead.lfs.project);
-    lead.lfs.project.list_branches = async (...args) => {
-      const res = await realListBranches(...args);
-      if (res?.items) {
-        for (const item of res.items) {
-          if (item.name === worker.workBranch && item.head) {
-            item.forkedFrom = `commit:${item.head}`;
-          }
-        }
-      }
-      return res;
-    };
-
-    // Simulate InvalidRecord on native merge to trigger fallbackMergeBranch
-    const realMerge = lead.lfs.branch.merge.bind(lead.lfs.branch);
-    lead.lfs.branch.merge = async (...args) => {
-      throw Object.assign(new Error("invalid record: binding kind"), { code: "InvalidRecord" });
-    };
-
-    try {
+    {
       const r = await lead.mergeBranch(worker.workBranch);
       assert.equal(r.merged, true, "merge succeeded");
-      assert.equal(r.fallback, true, "fallback merge was used");
 
       // Verify test.sh exists and is executable on lead
       const rExec = await lead.sh("(stat -f %Lp test.sh 2>/dev/null || stat -c %a test.sh) && (stat -f %Lp run.sh 2>/dev/null || stat -c %a run.sh) && readlink link-test.sh");
@@ -686,100 +667,91 @@ try {
       assert.ok(hostRunSh.mode & 0o111, "host run.sh has +x");
       assert.ok(lstatSync(join(cwd, "link-test.sh")).isSymbolicLink(), "host link-test.sh is symlink");
       assert.equal(readlinkSync(join(cwd, "link-test.sh")), "test.sh");
-    } finally {
-      lead.lfs.project.list_branches = realListBranches;
-      lead.lfs.branch.merge = realMerge;
     }
   });
 
-  await step("ignore rules: git-ignored paths are not imported, synced or applied; tracked files and .env.example are", async () => {
+  await step("full-tree import: .git, git-ignored files and dependencies are imported; only secrets stay out", async () => {
     const cwd = project();
     const git = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
-    writeFileSync(join(cwd, ".gitignore"), "runs/\n*.log\n!keep.log\n");
-    writeFileSync(join(cwd, ".minilfsignore"), "data/\n");
+    writeFileSync(join(cwd, ".gitignore"), "runs/\n*.log\nnode_modules/\n");
     mkdirSync(join(cwd, "runs/r1"), { recursive: true });
     writeFileSync(join(cwd, "runs/r1/big.bin"), "x".repeat(1000));
-    mkdirSync(join(cwd, "data"));
-    writeFileSync(join(cwd, "data/set.csv"), "1\n");
+    mkdirSync(join(cwd, "node_modules/dep"), { recursive: true });
+    writeFileSync(join(cwd, "node_modules/dep/index.js"), "module.exports = 1;\n");
     writeFileSync(join(cwd, "debug.log"), "noise\n");
-    writeFileSync(join(cwd, "keep.log"), "kept\n");
-    writeFileSync(join(cwd, "forced.log"), "tracked\n");
     writeFileSync(join(cwd, ".env.example"), "API_KEY=\n");
     writeFileSync(join(cwd, ".env"), "API_KEY=secret\n");
-    // .minilfsignore is not a git ignore file: keep data/ untracked (a tracked file is always imported)
-    git("init", "-q"); git("add", "-A", "--", ".", ":!data"); git("add", "-f", "forced.log"); git("commit", "-qm", "i");
+    git("init", "-q"); git("add", "-A"); git("commit", "-qm", "i");
     const s = await open(cwd, "ig");
-    for (const p of ["runs/r1/big.bin", "data/set.csv", "debug.log", ".env"]) assert.equal(await s.exists(join(cwd, p)), false, `${p} not imported`);
-    for (const p of ["keep.log", "forced.log", ".env.example", ".gitignore", "src/app.js"]) assert.equal(await s.exists(join(cwd, p)), true, `${p} imported`);
-    assert.equal((await s.readFile(join(cwd, ".env.example"))).toString(), "API_KEY=\n");
-    // an agent may create ignored output in its branch; apply never writes it, but writes the rest
+    for (const p of [".git/HEAD", "runs/r1/big.bin", "node_modules/dep/index.js", "debug.log", ".env.example", ".gitignore", "src/app.js"]) {
+      assert.equal(await s.exists(join(cwd, p)), true, `${p} imported`);
+    }
+    assert.equal(await s.exists(join(cwd, ".env")), false, ".env (secret) not imported");
+    // ignored output written in the Branch is project state: apply writes it like any other change
     const o = out();
-    await s.mutate("b", "bash", () => s.exec("mkdir -p runs/r2 && echo out > runs/r2/o.txt && echo trace > t.log && echo B=1 >> .env.example && cat .env.example", cwd, o));
+    await s.mutate("b", "bash", () => s.exec("mkdir -p runs/r2 && echo out > runs/r2/o.txt && echo B=1 >> .env.example && cat .env.example", cwd, o));
     assert.match(o.text(), /B=1/, ".env.example readable and writable in bash");
     const r = await s.apply();
-    assert.deepEqual(r.applied, [".env.example"], "only the non-ignored change is applied");
-    assert.equal(existsSync(join(cwd, "runs/r2/o.txt")), false);
-    assert.equal(existsSync(join(cwd, "t.log")), false);
-    assert.equal(s.unapplied, false, "ignored changes do not count as unapplied");
-    // host-side ignored changes are not drift
-    writeFileSync(join(cwd, "runs/r1/new.bin"), "y\n");
+    assert.deepEqual(r.applied.sort(), [".env.example", "runs/r2/o.txt"]);
+    assert.equal(readFileSync(join(cwd, "runs/r2/o.txt"), "utf8"), "out\n");
+    assert.equal(readFileSync(join(cwd, ".env"), "utf8"), "API_KEY=secret\n", "the secret is untouched");
+    // host-side changes to ignored files are drift like any other
     writeFileSync(join(cwd, "debug.log"), "more noise\n");
-    assert.deepEqual((await s.syncHostDriftIntoMain()).synced, [], "ignored host edits are not synced");
+    assert.deepEqual((await s.syncHostDriftIntoMain()).synced, ["debug.log"]);
   });
 
-  await step("elevated: applies pending Branch work first, runs on the folder, brings changes back, keeps branch-only output, records a host checkpoint", async () => {
+  await step("in-sandbox git: commit and branch in the Branch's own .git; apply brings the commit to the folder", async () => {
     const cwd = project();
-    const s = new LayerfsSession(cwd, `elev-${id}`, { ...config, branchOnly: ["dist/"] });
-    sessions.push(s); await s.open();
-    // branch work: a source edit (applicable) + build output (branch-only, never applied)
-    await s.mutate("w", "write", () => s.writeFile(join(cwd, "a.txt"), "edited on branch\n"));
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+    const s = await open(cwd, "git-sb");
     const o = out();
-    await s.mutate("b", "bash", () => s.exec("mkdir -p dist && echo built > dist/app.js", cwd, o));
-    assert.equal(s.unapplied, true);
-    const run = () => new Promise((done) => {
-      const r = spawnSync("bash", ["-c", "cat a.txt > seen.txt && echo host-made > host.txt"], { cwd, encoding: "utf8" });
-      done({ exitCode: r.status });
-    });
-    const r = await s.runElevated(run, { reason: "test" });
-    assert.deepEqual(r.applied, ["a.txt"], "pending branch change applied first");
-    assert.equal(readFileSync(join(cwd, "seen.txt"), "utf8"), "edited on branch\n", "the command saw the applied change");
-    assert.ok(r.synced.includes("host.txt") && r.synced.includes("seen.txt"), `synced: ${r.synced}`);
-    assert.equal((await s.readFile(join(cwd, "host.txt"))).toString(), "host-made\n", "host change is in the Branch");
-    assert.equal((await s.readFile(join(cwd, "dist/app.js"))).toString(), "built\n", "branch-only output survives");
+    const r = await s.mutate("1", "bash", () => s.exec("export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t; echo v2 > a.txt && git add a.txt && git commit -qm c2 && git branch feat && git log -1 --format=%s && git status --short", cwd, o));
+    assert.equal(r.value.exitCode, 0, o.text());
+    assert.equal(o.text().trim(), "c2", `committed in the sandbox with a clean status: ${o.text()}`);
+    assert.equal(g("log", "-1", "--format=%s").stdout.trim(), "c1", "the folder's repository is untouched before apply");
+    const ap = await s.apply();
+    assert.ok(ap.applied.includes("a.txt") && ap.applied.some((p) => p.startsWith(".git/")), `applied: ${ap.applied}`);
+    assert.match(ap.git ?? "", /refs\/heads\/main/, `apply reports what it did to .git: ${ap.git}`);
+    assert.ok(!ap.applied.some((p) => /\.lock$/.test(p)), "no lock file is applied");
+    assert.equal(g("log", "-1", "--format=%s").stdout.trim(), "c2", "the sandbox commit reached the folder");
+    assert.match(g("branch", "--list", "feat").stdout, /feat/);
+    assert.equal(g("status", "--short").stdout.trim(), "", "folder is clean after apply");
+  });
+
+  await step("explicit sandbox lifecycle: sessions share running Sandboxes (sandbox.create + workspace.mount(sandbox, branch))", async () => {
+    const cwd = project();
+    const a = await open(cwd, "sb-a");
+    const b = await open(cwd, "sb-b");
+    await a.exec("true", cwd, { onData: () => {} });
+    const sa = (await a.ensureSandbox()).sandbox;
+    assert.match(sa, /^[1-9][0-9]*$/, "a Sandbox is its number");
+    const sb = (await b.ensureSandbox()).sandbox;
+    assert.equal(sb, sa, "the second session reuses the running Sandbox instead of creating one");
+    // a refused Sandbox is avoided: another running one with room is taken before creating one
+    const extra = (await a.lfs.sandbox.create()).sandbox;
+    const alt = await b.ensureSandbox({ avoid: sa });
+    assert.deepEqual(alt, { sandbox: extra, created: false }, "avoid picks the other running Sandbox");
+    await a.lfs.sandbox.close(extra).catch(() => {});
+    // a Sandbox that was stopped is replaced on the next mount (NoSuchSandbox -> create, mount once)
+    await a.lfs.sandbox.close(sa).catch(() => {});
+    const o = out();
+    const r = await a.exec("echo after-close", cwd, o);
+    assert.equal(r.exitCode, 0, o.text());
+    assert.match(o.text(), /after-close/);
+  });
+
+  await step("branch-only output stays in the Branch: never applied, survives sync", async () => {
+    const cwd = project();
+    const s = new LayerfsSession(cwd, `bo3-${id}`, { ...config, branchOnly: ["dist/"] });
+    sessions.push(s); await s.open();
+    await s.mutate("w", "write", () => s.writeFile(join(cwd, "a.txt"), "edited on branch\n"));
+    await s.mutate("b", "bash", () => s.exec("mkdir -p dist && echo built > dist/app.js", cwd, out()));
+    const r = await s.apply();
+    assert.deepEqual(r.applied, ["a.txt"]);
     assert.equal(existsSync(join(cwd, "dist/app.js")), false, "branch-only output never reached the folder");
-    assert.ok(r.checkpoint?.commit, "host checkpoint has a commit for /tree");
-    assert.match(r.checkpoint.origins[0], /^host: test/);
-    assert.equal(s.unapplied, false, "Branch == folder after an elevated command");
-  });
-
-  await step("elevated: refused before running when applying conflicts; failing command still syncs back", async () => {
-    const cwd = project();
-    const s = await open(cwd, "elevc");
-    await s.mutate("w", "write", () => s.writeFile(join(cwd, "a.txt"), "branch\n"));
-    writeFileSync(join(cwd, "a.txt"), "folder edit\n"); // conflicting edit in the folder
-    let ran = false;
-    await assert.rejects(s.runElevated(async () => { ran = true; }, { reason: "x" }), (e) => e.code === "ElevateConflict" && /a\.txt/.test(e.message));
-    assert.equal(ran, false, "command not run on conflict");
-    const cwd2 = project();
-    const s2 = await open(cwd2, "elevf");
-    await assert.rejects(s2.runElevated(async () => { writeFileSync(join(cwd2, "partial.txt"), "p\n"); throw new Error("boom"); }, { reason: "x" }), /boom/);
-    assert.equal((await s2.readFile(join(cwd2, "partial.txt"))).toString(), "p\n", "changes made before the failure come back");
-  });
-
-  await step("elevated: the project lock is free while the command runs (a sub-agent can sync meanwhile)", async () => {
-    const cwd = project();
-    const lead = await open(cwd, "elevl");
-    const worker = new LayerfsSession(cwd, `elevw-${id}`, { ...config, branchName: "task-lockcheck" });
-    sessions.push(worker); await worker.open();
-    let release;
-    const gate = new Promise((r) => (release = r));
-    const elevated = lead.runElevated(() => gate, { reason: "long command" });
-    await new Promise((r) => setTimeout(r, 300));
-    const t0 = Date.now();
-    await worker.syncHostDriftIntoMain(); // takes the project lock
-    assert.ok(Date.now() - t0 < 5000, "worker sync not blocked by the running command");
-    release({ exitCode: 0 });
-    await elevated;
+    await s.syncHostDriftIntoMain({ full: true });
+    assert.equal((await s.readFile(join(cwd, "dist/app.js"))).toString(), "built\n", "branch-only output survives");
   });
 
   // ---- issue #2 and the storyforge / epi session failures (2026-10-26) ----
@@ -799,9 +771,11 @@ try {
     await s2.mutate("3", "write", () => s2.writeFile(join(cwd, "r3.txt"), "3\n"));
     assert.deepEqual((await s2.apply()).applied, ["r3.txt"]);
     await s2.mutate("4", "write", () => s2.writeFile(join(cwd, "r4.txt"), "4\n"));
-    const r = await s2.runElevated(async () => writeFileSync(join(cwd, "h.txt"), "h\n"), { reason: "t" });
-    assert.deepEqual(r.applied, ["r4.txt"]);
-    assert.equal(r.note, "", r.note);
+    writeFileSync(join(cwd, "h.txt"), "h\n"); // a host edit, then sync from main (seq advances again)
+    await s2.syncHostDriftIntoMain();
+    const m = await s2.adoptMain();
+    assert.ok(m.merged, JSON.stringify(m.conflicts));
+    assert.deepEqual((await s2.apply()).applied, ["r4.txt"]);
   });
 
   await step("apply with nothing new for main (UpToDate) publishes nothing and warns nothing (NoCommit)", async () => {
@@ -815,13 +789,15 @@ try {
     assert.deepEqual(r.warnings, [], r.warnings.join("; "));
   });
 
-  await step("forward delete and rename after an elevated sync do not trip WouldRevert", async () => {
+  await step("forward delete and rename after a host sync do not trip WouldRevert", async () => {
     const cwd = project();
     const s = await open(cwd, "fd");
     await s.mutate("1", "write", () => s.writeFile(join(cwd, "x.txt"), "x\n"));
     await s.mutate("1b", "write", () => s.writeFile(join(cwd, "tools/t.sh"), "t\n"));
     await s.apply();
-    await s.runElevated(async () => writeFileSync(join(cwd, "host.txt"), "h\n"), { reason: "host edit" });
+    writeFileSync(join(cwd, "host.txt"), "h\n");
+    await s.syncHostDriftIntoMain();
+    await s.adoptMain();
     await s.mutate("2", "bash", () => s.exec("rm x.txt && mv tools scripts", cwd, out()));
     const r = await s.apply();
     assert.deepEqual(r.applied.sort(), ["scripts/t.sh", "tools/t.sh", "x.txt"]);
@@ -829,13 +805,14 @@ try {
     assert.equal(readFileSync(join(cwd, "host.txt"), "utf8"), "h\n");
   });
 
-  await step("another session applies; this session's elevated command then apply keep the peer's files (no WouldRevert)", async () => {
+  await step("another session applies; this session's sync then apply keep the peer's files (no WouldRevert)", async () => {
     const cwd = project();
     const me = await open(cwd, "pe-me");
     const peer = await open(cwd, "pe-peer");
     await peer.mutate("1", "write", () => peer.writeFile(join(cwd, "peer.txt"), "p\n"));
     await peer.apply();
-    await me.runElevated(async () => {}, { reason: "read-only command" }); // syncs nothing of its own
+    await me.syncHostDriftIntoMain();
+    await me.adoptMain(); // syncs nothing of its own
     await me.mutate("2", "write", () => me.writeFile(join(cwd, "mine.txt"), "m\n"));
     const r = await me.apply();
     assert.deepEqual(r.applied, ["mine.txt"]);
@@ -851,7 +828,7 @@ try {
     await w.mutate("2", "write", () => w.writeFile(join(cwd, "multi.txt"), "1\n2\n3\n4\n5\n6\n7W\n"));
     const r = await lead.mergeBranch(w.workBranch, { strategy: "theirs" });
     assert.ok(r.merged);
-    assert.equal(r.fallback, undefined, "native merge, not the path-wise fallback");
+    assert.equal(r.resolved, undefined, "no conflict: a plain branch.merge, the strategy was not needed");
     assert.equal((await lead.readFile(join(cwd, "multi.txt"))).toString(), "1L\n2\n3\n4\n5\n6\n7W\n");
   });
 
@@ -903,35 +880,141 @@ try {
     await assert.rejects(s.apply(), (e) => e.code === "WouldRevert" && /action=sync/.test(e.message));
   });
 
-  await step("sandboxed git reads the folder's live repository and cannot write it (no frozen .git, no phantom commits)", async () => {
+  await step("in-sandbox git sees host commits after sync; two branches commit and merge in the sandbox; lead applies", async () => {
     const cwd = project();
     const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
     g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
-    const s = await open(cwd, "git-live");
-    // the folder moves on after the Branch was made: a new commit and a new branch
+    const lead = await open(cwd, "git-lead");
+    const w = await open(cwd, "git-w");
+    // the folder moves on: sync brings the new commit (its .git objects/refs) into the Branch
     writeFileSync(join(cwd, "a.txt"), "host 2\n"); g("commit", "-qam", "c2"); g("branch", "feat");
-    await s.syncHostDriftIntoMain(); await s.adoptMain();
-    await s.mutate("1", "write", () => s.writeFile(join(cwd, "src/app.js"), "export const x = 2;\n"));
+    await lead.syncHostDriftIntoMain(); await lead.adoptMain();
     const o = out();
-    await s.mutate("2", "bash", () => s.exec("git log -1 --format=%s; git branch --list feat; git status --short", cwd, o));
+    await lead.mutate("1", "bash", () => lead.exec("git log -1 --format=%s; git branch --list feat", cwd, o));
     const lines = o.text().trim().split("\n");
-    assert.equal(lines[0], "c2", `log sees the folder's new commit: ${o.text()}`);
-    assert.match(lines[1], /feat/, "branches are the folder's");
-    assert.deepEqual(lines.slice(2), [" M src/app.js"], `status shows only the Branch's own edit: ${o.text()}`);
-    const o2 = out();
-    const r = await s.mutate("3", "bash", () => s.exec("git add -A; git commit -qm phantom; git checkout -q feat; git stash; git log -1 --format=%s", cwd, o2));
-    assert.equal(r.value.exitCode, 0, o2.text());
-    assert.match(o2.text(), /c2\s*$/, `no phantom commit, HEAD unchanged: ${o2.text()}`);
-    assert.equal(g("log", "-1", "--format=%s").stdout.trim(), "c2", "the folder's repository is untouched");
-    assert.equal(g("status", "--short").stdout.trim(), "", "nothing staged or changed in the folder");
-    assert.equal(g("rev-parse", "--abbrev-ref", "HEAD").stdout.trim(), "main");
-    // .git state is never applied, and git commit with elevated still works
+    assert.equal(lines[0], "c2", `log sees the folder's commit after sync: ${o.text()}`);
+    assert.match(lines[1], /feat/);
+    const env = "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t;";
+    // both branches commit: .git is one merge unit, objects are a union, and minilfs records the
+    // join itself: a merge commit on main with both sides' heads as parents, no step by the agent
+    await w.mutate("2", "bash", () => w.exec(`${env} echo w > w.txt && git add w.txt && git commit -qm by-worker`, cwd, out()));
+    await lead.mutate("3", "bash", () => lead.exec(`${env} echo l > l.txt && git add l.txt && git commit -qm by-lead`, cwd, out()));
+    const m = await lead.mergeBranch(w.workBranch);
+    assert.ok(m.merged, `merge of two git-using branches: ${JSON.stringify(m.conflicts)}`);
+    assert.match(m.gitNote ?? "", /merge commit [0-9a-f]{7} with both sides' commits as parents/, `minilfs joined the histories: ${m.gitNote}`);
+    assert.equal((await lead.readFile(join(cwd, "w.txt"))).toString(), "w\n");
+    const chk = out();
+    const rc = await lead.mutate("4", "bash", () => lead.exec([
+      "git fsck --no-progress --connectivity-only 2>&1 && echo FSCK-OK",
+      "echo PARENTS=$(git cat-file -p HEAD | grep -c '^parent')",
+      "echo LOG=$(git log --format=%s main | tr '\\n' '|')",
+      "echo STATUS=$(git status --porcelain | grep -v '^??' | wc -l | tr -d ' ')",
+    ].join("; "), cwd, chk));
+    assert.equal(rc.value.exitCode, 0, chk.text());
+    assert.match(chk.text(), /FSCK-OK/, `merged .git is consistent: ${chk.text()}`);
+    assert.match(chk.text(), /PARENTS=2/, `HEAD is a merge commit: ${chk.text()}`);
+    assert.match(chk.text(), /LOG=.*by-lead/, "the lead's commit is on main");
+    assert.match(chk.text(), /LOG=.*by-worker/, `the worker's commit is on main, not only on a side ref: ${chk.text()}`);
+    assert.match(chk.text(), /STATUS=0/, `git status is clean after the join (the index matches the merged files): ${chk.text()}`);
+    const ap = await lead.apply();
+    assert.ok(ap.applied.includes("l.txt") && ap.applied.includes("w.txt"), `applied: ${ap.applied}`);
+    assert.equal(ap.skipped.filter((p) => !p.startsWith(".git/")).length, 0, `skipped: ${ap.skipped}`);
+    const hostLog = g("log", "--format=%s", "main").stdout;
+    assert.match(hostLog, /^Merge s-/m, `the merge commit reached the folder: ${hostLog}`);
+    assert.match(hostLog, /by-worker/);
+    assert.match(hostLog, /by-lead/);
+    assert.equal(g("status", "--porcelain").stdout.trim(), "", "the folder is clean after apply");
+    assert.equal(spawnSync("git", ["-C", cwd, "fsck", "--no-progress", "--connectivity-only"]).status, 0, "the folder's repository is consistent after apply");
+  });
+
+  await step("Quarry pattern: three workers commit in parallel, the lead merges each; every worker commit ends up on main", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "skeleton");
+    const lead = await open(cwd, "qp-lead");
+    const ws = [await open(cwd, "qp-a"), await open(cwd, "qp-b"), await open(cwd, "qp-c")];
+    const env = "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t;";
+    // worker b also edits a file the lead edits: git sees a conflict LayerFS resolves line-wise
+    await Promise.all(ws.map((w, i) => w.mutate("c", "bash", () => w.exec(`${env} mkdir -p crate${i} && echo w${i} > crate${i}/lib.rs && git add -A && git commit -qm by-w${i} && echo w${i}-2 >> crate${i}/lib.rs && git commit -qam by-w${i}-2`, cwd, out()))));
+    await lead.mutate("l", "bash", () => lead.exec(`${env} echo lead > lead.txt && git add -A && git commit -qm by-lead`, cwd, out()));
+    const notes = [];
+    for (const w of ws) {
+      const m = await lead.mergeBranch(w.workBranch);
+      assert.ok(m.merged, JSON.stringify(m.conflicts));
+      notes.push(m.gitNote);
+    }
+    assert.ok(notes.every((n) => /merge commit|moved forward|already held/.test(n ?? "")), notes.join("\n"));
+    const o = out();
+    await lead.mutate("v", "bash", () => lead.exec("git log --format=%s main | tr '\\n' '|'; echo; git rev-list --merges --count main; git fsck --no-progress --connectivity-only && echo FSCK-OK; git status --porcelain | grep -v '^??' | wc -l", cwd, o));
+    for (const s of ["by-lead", "by-w0", "by-w0-2", "by-w1", "by-w1-2", "by-w2", "by-w2-2"]) assert.match(o.text(), new RegExp(`\\|?${s}\\|`), `${s} on main: ${o.text()}`);
+    assert.match(o.text(), /^\s*3\s*$/m, `three merge commits on main: ${o.text()}`);
+    assert.match(o.text(), /FSCK-OK/);
+    const ap = await lead.apply();
+    assert.deepEqual(ap.conflicts, []);
+    assert.equal(g("rev-list", "--merges", "--count", "main").stdout.trim(), "3", "the merges reached the folder");
+    assert.equal(g("status", "--porcelain").stdout.trim(), "", "folder clean");
+    return `main: ${g("log", "--format=%s", "--graph", "main").stdout.split("\n").length} lines of graph`;
+  });
+
+  await step("apply never overwrites the folder's git history: a host commit meanwhile keeps its refs, files still apply", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+    const s = await open(cwd, "git-host-moved");
+    const env = "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t;";
+    await s.mutate("1", "bash", () => s.exec(`${env} echo branch > b.txt && git add b.txt && git commit -qm by-branch`, cwd, out()));
+    writeFileSync(join(cwd, "h.txt"), "host\n"); g("add", "h.txt"); g("commit", "-qm", "by-host");
+    const hostHead = g("rev-parse", "HEAD").stdout.trim();
     const ap = await s.apply();
-    assert.deepEqual(ap.applied, ["src/app.js"]);
-    await s.runElevated(async () => g("commit", "-qam", "c3"), { reason: "commit" });
-    const o3 = out();
-    await s.mutate("4", "bash", () => s.exec("git log -1 --format=%s; git status --short", cwd, o3));
-    assert.equal(o3.text().trim(), "c3", `sandbox sees the elevated commit with a clean status: ${o3.text()}`);
+    assert.deepEqual(ap.conflicts, []);
+    assert.ok(ap.applied.includes("b.txt"), `files applied: ${ap.applied}`);
+    assert.ok(!ap.applied.some((p) => /^\.git\/(HEAD|index|refs\/)/.test(p)), `no ref/HEAD/index written: ${ap.applied}`);
+    assert.match(ap.warnings.join("\n"), /folder's git moved/);
+    assert.equal(g("rev-parse", "HEAD").stdout.trim(), hostHead, "the host commit is still HEAD");
+    assert.equal(g("log", "-1", "--format=%s").stdout.trim(), "by-host");
+    assert.equal(spawnSync("git", ["-C", cwd, "fsck", "--no-progress", "--connectivity-only"]).status, 0, "consistent repository");
+    assert.match(g("status", "--short").stdout, /b\.txt/, "the Branch's file shows as a change to commit");
+  });
+
+  await step("git attacks: config, config.worktree, commondir, hooks, alternates, submodule config/hooks, symlink into .git/hooks never reach the folder", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+    mkdirSync(join(cwd, ".git/modules/sub"), { recursive: true });
+    writeFileSync(join(cwd, ".git/modules/sub/HEAD"), "ref: refs/heads/main\n");
+    const before = (rel) => (existsSync(join(cwd, rel)) ? readFileSync(join(cwd, rel), "utf8") : null);
+    const watched = [".git/config", ".git/config.worktree", ".git/commondir", ".git/hooks/pre-commit", ".git/objects/info/alternates", ".git/info/attributes", ".git/modules/sub/config", ".git/modules/sub/hooks/post-checkout"];
+    const snap = Object.fromEntries(watched.map((r) => [r, before(r)]));
+    const s = await open(cwd, "git-attack");
+    const pwned = join(base, `pwned-${n}`);
+    const payload = `[core]\n\tfsmonitor = "touch ${pwned}"\n\thooksPath = /tmp\n`;
+    // 1. in the sandbox (Seatbelt): every write is refused
+    const o = out();
+    await s.mutate("1", "bash", () => s.exec([
+      ...watched.map((r) => `mkdir -p "$(dirname ${r})" 2>/dev/null; printf '%s' '${payload.replace(/'/g, "")}' > ${r} 2>/dev/null && echo "WROTE ${r}"`),
+      "printf x > .GIT/CONFIG 2>/dev/null && echo 'WROTE .GIT/CONFIG'",
+      "mv .git .git-old 2>/dev/null && echo 'MOVED .git'",
+      "ln -s .git/hooks hk 2>/dev/null; printf '#!/bin/sh\\ntouch x' > hk/post-commit 2>/dev/null && echo 'WROTE via link'",
+      "git status --short >/dev/null; true",
+    ].join("; "), cwd, o));
+    assert.doesNotMatch(o.text(), /WROTE|MOVED/, `the sandbox wrote a protected git path: ${o.text()}`);
+    // 2. through the Store (file tools, checkout, a merged sub-agent branch): refused or never applied
+    for (const r of watched) await assert.rejects(s.writeFile(join(cwd, r), payload), (e) => e.code === "EACCES", r);
+    await s.lfs.fs.apply(s.workBranch, [
+      { op: "write", path: "/.git/config", bytes: Buffer.from(payload) },
+      { op: "write", path: "/.git/commondir", bytes: Buffer.from("../../evil\n") },
+      { op: "mkdir", path: "/.git/modules/sub/hooks" },
+      { op: "write", path: "/.git/modules/sub/hooks/post-checkout", bytes: Buffer.from("#!/bin/sh\ntouch x\n") },
+      { op: "write", path: "/.git/modules/sub/config", bytes: Buffer.from(payload) },
+      { op: "write", path: "/innocent.txt", bytes: Buffer.from("i\n") },
+    ], "injected through the Store");
+    s.headCommit = (await s.lfs.branch.list_commits(s.workBranch, 1, 0)).items[0].id;
+    const ap = await s.apply();
+    assert.ok(ap.applied.includes("innocent.txt"), `applied: ${ap.applied}`);
+    for (const r of watched) assert.equal(before(r), snap[r], `${r} unchanged in the folder`);
+    // 3. git on the host after apply runs nothing
+    g("status", "--short");
+    assert.equal(existsSync(pwned), false, "no command ran on the host");
   });
 
   await step("too-large first import is refused before copying, naming the largest folders", async () => {
@@ -940,7 +1023,7 @@ try {
     for (let i = 0; i < 30; i++) writeFileSync(join(cwd, `big/f${i}.txt`), `${i}\n`);
     const s = new LayerfsSession(cwd, `tl-${id}`, { ...config, maxImportFiles: 10 });
     sessions.push(s);
-    await assert.rejects(s.open(), (e) => e.code === "TooLarge" && /big\/ \(30 files/.test(e.message) && /\.gitignore/.test(e.message));
+    await assert.rejects(s.open(), (e) => e.code === "TooLarge" && /big\/ \(30 files/.test(e.message) && /MINILFS_BRANCH_ONLY/.test(e.message));
     assert.equal(readdirSync(join(config.root, "staging")).length, 0, "nothing staged");
   });
 

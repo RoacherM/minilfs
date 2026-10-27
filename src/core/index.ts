@@ -9,16 +9,28 @@ export {
   isOutsideSecret,
   LayerfsError,
   LayerfsSession,
+  LWW_DEFAULT,
   matchesToolGlob,
   rsyncExcludeArgs,
   stopNativeDaemons,
   type ApplyResult,
   type Checkpoint,
+  type MergeOptions,
   type MergeResult,
   type OpenOptions,
   type UserBranch,
   type Workspace,
 } from "../workspace.ts";
+
+export {
+  decideGitPath,
+  gitChangeSummary,
+  gitPathKind,
+  indexEntries,
+  isProtectedPath,
+  MERGE_UNITS,
+  type GitPathKind,
+} from "../gitpaths.ts";
 
 export {
   DEFAULT_EXCLUDES,
@@ -61,7 +73,12 @@ export {
 export {
   createProjectClient,
   ensureNativeDirs,
+  initProjectClient,
+  layerfsEnv,
+  loadSdk,
+  storePathOf,
   type NativeSpec,
+  type ProjectClient,
 } from "./client.ts";
 
 export {
@@ -93,11 +110,7 @@ export {
 } from "./tools.ts";
 
 export {
-  ELEVATE_PARAM_DESCRIPTIONS,
-  elevateAllowed,
-  elevatePolicy,
   resolveRole,
-  type ElevatePolicy,
   type Role,
   type RoleInfo,
 } from "./role.ts";

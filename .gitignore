@@ -1,1 +1,4 @@
 node_modules/
+
+# generated from a local run (agent commands, local paths): rebuild with docs/replay/extract.py
+docs/replay/data.js

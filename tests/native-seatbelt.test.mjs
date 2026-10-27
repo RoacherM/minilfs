@@ -45,7 +45,7 @@ const root = join(base, "root");
 const cwd = join(base, "project");
 const outside = join(base, "outside.txt");
 const config = {
-  ...resolveConfig({}),
+  ...resolveConfig({ MINILFS_BUNDLE: process.env.MINILFS_BUNDLE }),
   root,
   prefix: `pi-nat-${id}-`,
   killGraceMs: 800,
@@ -218,11 +218,12 @@ try {
 
     const chunks2 = [];
     const r2 = await sA.mutate("sec3", "bash", () =>
-      sA.exec("rm -f .git; mkdir -p .git/hooks && echo pwn > .git/hooks/pre-commit", cwd, { onData: (d) => chunks2.push(d.toString()) })
+      sA.exec("echo pwn > .git/hooks/pre-commit", cwd, { onData: (d) => chunks2.push(d.toString()) })
     );
     assert.notEqual(r2.value.exitCode, 0);
     assert.match(chunks2.join(""), /Operation not permitted/);
     assert.equal(existsSync(join(cwd, ".git/hooks/pre-commit")), false, "the folder's hooks are untouched");
+    assert.equal(await sA.lfs.fs.stat(sA.workBranch, "/.git/hooks/pre-commit").catch(() => null), null, "no hook planted in the Branch");
   });
 
   await step("3.3 kernel-level secret read protection (denyRead): reading .env, app/.ENV, secrets/api.key fails with EPERM", async () => {
@@ -299,19 +300,29 @@ try {
       (e) => e.code === "EACCES" && /refused for security/.test(e.message)
     );
 
-    // Even if a .git/config is injected into the Store, the Workspace drops stored .git before a command and git reads the folders repository
+    // The Branch has its own real .git (imported with the folder): normal git writes work in the sandbox
+    assert.ok(await sA.lfs.fs.stat(sA.workBranch, "/.git/HEAD"), ".git is imported into the Store");
+    const gc = [];
+    const rc = await sA.mutate("sec-p01-git", "bash", () =>
+      sA.exec("echo branch-commit > committed.txt && git add committed.txt && git -c user.email=t@t -c user.name=t commit -qm in-sandbox && git log -1 --format=%s", cwd, { onData: (d) => gc.push(d.toString()) })
+    );
+    assert.equal(rc.value.exitCode, 0, gc.join(""));
+    assert.match(gc.join(""), /in-sandbox/);
+    assert.equal(spawnSync("git", ["-C", cwd, "log", "-1", "--format=%s"], { encoding: "utf8" }).stdout.trim(), "init", "the folder's repository is untouched until apply");
+
+    // a malicious config written straight into the Store (not via the sandbox) is never applied to the folder
     await sA.lfs.fs.apply(sA.workBranch, [
-      { op: "mkdir", path: "/.git" },
       { op: "write", path: "/.git/config", bytes: Buffer.from(`[core]\n\tfsmonitor = "touch ${pwnedPath}"\n`) }
     ], "inject malicious git config");
-
-    const execRes = await sA.exec("true", cwd, { onData: () => {} });
-    assert.equal(execRes.exitCode, 0);
-    assert.equal(existsSync(pwnedPath), false, "malicious fsmonitor must never be executed");
-
-    // Clean up injected git config
-    // the Workspace drops any stored .git before a command (git state is the folder's): nothing to clean
-    assert.equal(await sA.lfs.fs.stat(sA.workBranch, "/.git").catch(() => null), null, "stored .git was dropped");
+    assert.equal(sA.isApplicable(".git/config"), false, ".git/config is never applied");
+    // the Store-injected config sits in the Branch: a git command in the sandbox reads it, but the
+    // command it names cannot leave the sandbox, and after apply the folder's own config is untouched
+    sA.headCommit = (await sA.lfs.branch.list_commits(sA.workBranch, 1, 0)).items[0].id;
+    const hostConfig = readFileSync(join(cwd, ".git/config"), "utf8");
+    await sA.apply();
+    assert.equal(readFileSync(join(cwd, ".git/config"), "utf8"), hostConfig, "the folder's .git/config is untouched by apply");
+    spawnSync("git", ["-C", cwd, "status", "--short"]);
+    assert.equal(existsSync(pwnedPath), false, "malicious fsmonitor must never be executed on the host (git status ran after apply)");
   });
 
   await step("3.6 P0-2: symlinked paths must not read secrets or write outside workspace", async () => {
@@ -439,6 +450,7 @@ try {
     assert.notEqual(r.value.exitCode, 0);
     assert.match(chunks.join(""), /Operation not permitted/);
     assert.equal(existsSync(join(cwd, ".git")), true, ".git must remain intact");
+    assert.ok(await sA.lfs.fs.stat(sA.workBranch, "/.git/HEAD"), "the Branch's .git must remain intact");
   });
 
   // 4. Network Isolation
@@ -590,6 +602,50 @@ try {
     assert.match(out, /^\s*\d+\s*$/m, `numeric RSS (KiB): ${out}`);
     assert.match(out, /rc=0/);
     assert.doesNotMatch(out, /setuid_rc=0/, "real /bin/ps still refused by Seatbelt (documents why the shim exists)");
+  });
+
+  await step("7.1c a call never hangs on what outlives its shell (Quarry 2026-10-27): background holder, setsid + env -i, grandchild past timeout, overall limit", async () => {
+    const timed = async (label, cmd, extra = {}) => {
+      const o = [];
+      const t0 = Date.now();
+      const r = await sA.mutate(label, "bash", () => sA.exec(cmd, cwd, { onData: (d) => o.push(d.toString()), ...extra }));
+      return { ms: Date.now() - t0, code: r.value?.exitCode, out: o.join("") };
+    };
+    // 1. a server-like process started with & keeps the pipe (was: the call waited forever)
+    let r = await timed("hang1", "(sleep 997 &); echo started");
+    assert.ok(r.ms < 15_000, `returned in ${r.ms} ms`);
+    assert.match(r.out, /started/);
+    // 2. a process that leaves the group and the session, clears its environment, holds stdout
+    r = await timed("hang2", "env -i /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec q(sleep), 996' & echo detached");
+    assert.ok(r.ms < 15_000, `returned in ${r.ms} ms`);
+    // 3. timeout N on a command whose child spawns a grandchild (cargo test -> test binary)
+    r = await timed("hang3", "timeout 2 sh -c 'sleep 995 & wait' | tail -1; echo rc=${PIPESTATUS[0]}");
+    assert.ok(r.ms < 15_000, `returned in ${r.ms} ms`);
+    assert.match(r.out, /rc=124/, r.out);
+    // nothing of these is left running
+    await new Promise((res) => setTimeout(res, 500));
+    assert.equal(spawnSync("pgrep", ["-f", "sleep 99[567]"], { encoding: "utf8" }).stdout.trim(), "", "no leftovers");
+    // 4. minilfs's own limit: a command that never ends is stopped and reported as exit 124
+    const saved = sA.config.bashTimeoutS;
+    sA.config.bashTimeoutS = 3;
+    try {
+      r = await timed("hang4", "echo begin; sleep 994");
+    } finally {
+      sA.config.bashTimeoutS = saved;
+    }
+    assert.ok(r.ms < 15_000, `returned in ${r.ms} ms`);
+    assert.equal(r.code, 124);
+    assert.match(r.out, /begin[\s\S]*MINILFS_BASH_TIMEOUT_S/, r.out);
+    assert.equal(spawnSync("pgrep", ["-f", "sleep 994"], { encoding: "utf8" }).stdout.trim(), "", "the stopped command is gone");
+    // 5. a killed command's git lock does not wedge the Branch's git
+    sA.config.bashTimeoutS = 3;
+    try {
+      await timed("lock", "touch .git/index.lock; sleep 993");
+    } finally {
+      sA.config.bashTimeoutS = saved;
+    }
+    r = await timed("after-lock", "git status --short >/dev/null && echo GIT-OK");
+    assert.match(r.out, /GIT-OK/, r.out);
   });
 
   await step("7.2 persistent mergedFileMtimes across multiple bash calls & cleanScratch", async () => {

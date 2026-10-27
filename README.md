@@ -1,6 +1,6 @@
 # minilfs (`RoacherM/minilfs`)
 
-> **One-sentence summary:** While upstream LayerFS is the underlying copy-on-write storage engine (originally Docker/FUSE-based), **`minilfs` is its zero-Docker macOS-native Agent Runtime and multi-agent harness adapter**: it runs file tools in-process (`0` mounts) and `bash` in on-demand NFSv3 + Seatbelt sandboxes (`0` containers), adds multi-agent branch coordination (`merge` with 3-way fallback, `sync`, `diff`, stable branch aliases) plus single-command host elevation (`elevated: true`), and keeps your real folder untouched until `apply` writes back with a 3-way check.
+> **One-sentence summary:** **`minilfs` is the zero-Docker macOS-native Agent Runtime for [LayerFS v1.1.0](https://github.com/Ephemeral-AI-Lab/layerfs)**: it pairs the official `@layerfs/agent` SDK (`1 call = 1 Commit`, full-tree import including `.git` and dependencies, explicit Sandbox + NFSv3 Workspace lifecycle, native 3-way `branch.merge` with merge units + `.lww`) with an Anthropic (`@anthropic-ai/sandbox-runtime` / `srt`)-style macOS Seatbelt (`sandbox-exec`) pure sandbox, so agents read, edit, build, test, commit, and merge entirely inside isolated Branches until `apply` writes back to your host folder.
 
 **minilfs** (`@roacherm/minilfs`) is a **100% Native, Zero-Docker** [LayerFS](https://github.com/Ephemeral-AI-Lab/layerfs) workspace runtime, [Pi](https://pi.dev) / [Epi](https://github.com/RoacherM/epi) extension, universal CLI / MCP server, and pluggable distributed execution engine.
 
@@ -43,7 +43,7 @@ It isolates coding agents' file operations and shell commands on copy-on-write L
 
 ## 1. Prerequisites (Once per Mac — Zero Docker, Zero Root, Zero macFUSE)
 
-Nothing on Apple silicon (macOS 11+): the first start downloads the prebuilt LayerFS bundle (`layerfs-daemon`, `layerfs.node`, JS SDK; ~8 MB) from this repository's [GitHub releases](https://github.com/RoacherM/minilfs/releases), checks its pinned sha256 and installs it in `~/.cache/minilfs/bundle-native` (`MINILFS_BUNDLE`).
+Nothing on Apple silicon (macOS 11+): the first start downloads the prebuilt LayerFS bundle (`layerfs-daemon`, `layerfs.node`, JS SDK; ~8 MB) from this repository's [GitHub releases](https://github.com/RoacherM/minilfs/releases), checks its pinned sha256 and installs it in `~/.cache/minilfs/bundle-<commit7>` (named after the LayerFS commit pinned in `layerfs.json`; `MINILFS_BUNDLE` overrides it). A bundle of another LayerFS commit is refused, never used.
 
 The bundle is built in CI: `.github/workflows/bundle.yml` runs `scripts/setup-layerfs.sh` on a macOS Apple-silicon runner whenever that recipe changes (or by hand), packs it with `scripts/package-bundle.sh`, smoke-tests it (`scripts/smoke-bundle.mjs`: LayerFS Init and a read with the packed binaries), publishes a release and pins its URL and sha256 in `src/bundle.json`. To upgrade LayerFS, change the commit in `scripts/setup-layerfs.sh` and push.
 
@@ -164,33 +164,28 @@ await session.open();
 |---|---|
 | `MINILFS` | on; `0` turns it off (`--no-minilfs` flag also disables for one run) |
 | `MINILFS_DRIVER` | `native` (or custom registered driver name) |
-| `MINILFS_BUNDLE` | `~/.cache/minilfs/bundle-native` (downloaded on first start when missing) |
+| `MINILFS_BUNDLE` | `~/.cache/minilfs/bundle-<commit7>` for the commit in `layerfs.json` (downloaded on first start when missing) |
 | `MINILFS_ROOT` | `~/.cache/minilfs` (home, APFS Stores, local mounts, bindings) |
 | `MINILFS_PREFIX` | `minilfs-` |
 | `MINILFS_NETWORK` | `allow` \| `localhost` \| `deny` (`offline`) — Seatbelt outbound network policy inside `bash` |
-| `MINILFS_EXCLUDES` | `.env,.env.*,!.env.example,!.env.sample,!.env.template,!.env.dist,!.env.defaults,*.pem,*.key,id_rsa*,id_ed25519*,.npmrc,.netrc,.pypirc` — secrets: never imported, read or written; `!pattern` re-includes |
+| `MINILFS_EXCLUDES` | `.env,.env.*,!.env.example,!.env.sample,!.env.template,!.env.dist,!.env.defaults,*.pem,*.key,id_rsa*,id_ed25519*,.npmrc,.netrc,.pypirc,*.p12,*.pfx,*.jks,*.keystore,*.kdbx,credentials.json,client_secret*.json,service-account*.json,.git-credentials` — secrets: never imported, read or written; `!pattern` re-includes. Ignored files are imported now, so add any other secret file names here |
 | `MINILFS_BRANCH_ONLY` | comma-separated build-output patterns (e.g. `target/,.cargo-home/`) |
 | `MINILFS_BRANCH_NAME` | logical branch alias for this session (defaults to `lead` or `s-<shortId>`) |
-| `MINILFS_MAX_IMPORT_FILES` | `100000` — first import is refused above this (LayerFS Init has a fixed 60 s deadline) |
-| `MINILFS_MAX_IMPORT_MB` | `4096` — same, by total size |
-| `MINILFS_ELEVATE` | `auto` (default) \| `ask` \| `never` — single elevated bash commands of the main agent; same as `--minilfs-elevate` and `/minilfs elevate` |
-| `MINILFS_ELEVATE_ALLOW` | comma-separated command prefixes that need no confirmation under `ask`, e.g. `git *,docker *` |
+| `MINILFS_MAX_IMPORT_FILES` | `300000` — a first import or a host sync above this is refused before copying |
+| `MINILFS_MAX_IMPORT_MB` | `8192` — same, by total size |
+| `MINILFS_INIT_TIMEOUT_MS` | LayerFS Init timeout in milliseconds (defaults to `@layerfs/agent`'s `INIT_TIMEOUT_MS`, `300000` / 300 s) |
+| `MINILFS_STORE_WORKER` | `1` (default): every Pi process of a root (lead and sub-agents) makes its Store calls through one native store worker (`<root>/worker/`, 127.0.0.1 + secret, exits when idle), so parallel agents never race for the Store. `0`: each process opens the Store itself (only a Busy retry protects it). See `docs/DESIGN-store-worker.md` |
+| `MINILFS_WORKER_IDLE_MS` | how long the store worker waits with no client before it exits (default `600000`, 10 min) |
 | `MINILFS_ROLE` | force `lead` or `worker` (normally detected: Pi sub-agents, Epi tasks) |
 
-**What is imported: the files git sees.** A session's Branch holds the project as `git status` sees it: tracked files plus untracked files that are not ignored. `.git/` is not imported: it stays the folder's. Git-ignored paths (`.gitignore` in every directory, `.git/info/exclude`, `core.excludesFile`) are not imported, not synced from the host and never applied back; agents can still create them inside their Branch (build output, `node_modules/` after an install). A tracked file is always imported, even if a pattern matches it. There is no switch for this.
+**What is imported: the full project tree (aligned with official LayerFS).** Following LayerFS's core mental model (*"A Workspace is a complete mutable filesystem view over an immutable committed root. Include `.git` and its index, ignored files, dependencies, symlinks, caches and output; Git ignore rules do not filter LayerFS state"*), a session's Branch holds the complete project tree, `.git/` and dependencies included (`06 · Instant Bootstrap`). Only secret patterns (`MINILFS_EXCLUDES`) and explicit `MINILFS_BRANCH_ONLY` patterns stay out.
 
-**Each Branch is a git work tree of the folder's repository.** `.git` is never imported, stored or merged. For each sandboxed command the Workspace gets a `.git` file in git's own linked-worktree layout (`gitdir:` an admin directory under minilfs scratch, whose `commondir` is the folder's repository), so `git log`, `status`, `diff`, `show` and `branch` are current after every elevated commit or host-side change, and `status` shows exactly what apply would change. The sandbox cannot write the repository: `git add`, `commit`, `reset`, `checkout`/`switch`, `stash`, `merge`, `rebase`, `pull` and `push` fail with a hint and run with `elevated: true`. minilfs adds one local line, `/.lww`, to the folder's `.git/info/exclude` (never committed). Projects imported by older versions drop their stored `.git` copy at the next sync.
-
-`<project>/.minilfsignore` adds patterns for minilfs only (gitignore syntax, `!` re-includes), for folders you keep out of git's ignore list but agents need not edit. Secrets (`MINILFS_EXCLUDES`) are excluded on top of both.
-
-A first import is refused before copying when the files to import exceed `MINILFS_MAX_IMPORT_FILES` / `MINILFS_MAX_IMPORT_MB` (LayerFS Init has a fixed 60 s limit); the error lists the largest folders to ignore. After fixing, `/minilfs retry` starts again without restarting.
-
-**Every agent on a Branch; the main agent can elevate single commands.** Every agent's file tools and `bash` act on its own isolated Branch, the main agent included (checkpoints per tool call, `/tree` restores files, the folder changes only on apply). When a step cannot run in the sandbox (git commit/push, Docker, mounts, setuid tools like `ps`, long-running services, "Operation not permitted"), the main agent runs **that one** `bash` call with `elevated: true` and a `reason`: the Branch's unapplied changes are applied to the folder first, the command runs on the real folder with the host's permissions, and the folder's changes come back into the Branch as a `host:` checkpoint. There is no mode to switch.
-
-- Policy (`--minilfs-elevate`, `MINILFS_ELEVATE`, `/minilfs elevate`): `auto` (default, no confirmation), `ask` (the user confirms each command; "always allow" remembers a command prefix), `never`.
-- **Under `auto` the main agent's sandbox is a guard rail, not a security boundary**: a prompt-injected main agent can run anything on the host. Use `ask` or `never` if that matters.
-- Sub-agents (Pi sub-agents, Epi tasks) never elevate and have no `minilfs_apply`; their branches reach the folder when the main agent merges them (`minilfs merge <branch>`) and applies.
-- The user's `!cmd` runs on the real folder (same apply-first / sync-back steps).
+**Pure Sandbox Model (In-Sandbox Git & Builds, Zero Host Elevation).** Every agent's file tools (`read`, `write`, `edit`, `ls`, `find`, `grep`) and `bash` act strictly on its own isolated LayerFS Branch (`1 call = 1 Commit`):
+- Because `.git/` lives inside each Branch's Workspace, `git status`, `diff`, `log`, `add`, `commit`, `branch` and `merge` work natively inside the sandboxed `bash` without touching the host folder.
+- **`.git` is an allowlist** (`src/gitpaths.ts`): only git's data is writable — objects, refs, logs, `HEAD`, `index`, `packed-refs`, in-progress state. Everything else in a git directory can make git run code (`config`, `config.worktree`, `hooks/`, `commondir`, `info/attributes`, `objects/info/alternates`, submodule `modules/*/config|hooks`, …): Seatbelt denies it (regex, any letter case), file tools refuse it, and apply never writes it. So `git config`, `git remote add` and hook installs fail in the sandbox; the user runs those.
+- **Merging Branches that both ran git:** `.git` is one LayerFS merge unit (`branch.merge(…, units)`): refs, `HEAD` and the index come whole from one side, so the merged repository is consistent; objects merge as a union, and minilfs then records the join itself: a git merge commit on the checked-out branch whose parents are both sides' heads (lead first), made with git plumbing (`merge-tree`, `commit-tree`, `update-ref`; no work-tree change, no hook), so `git log main` holds every Branch's commits. Where git sees a conflict that LayerFS resolved, the merge commit records LayerFS's merged files. A fast-forward or an up-to-date side needs no commit. The other side's other branch heads are kept as `refs/minilfs/<branch>/heads/<name>`. `node_modules` is a merge unit too. `/.lww` defaults to `%include .gitignore` (generated output is last-writer-wins).
+- **Apply and the folder's git:** objects are added (never replaced or deleted); refs, `HEAD` and the index are three-way (the index by its entries, not its stat data). If the folder's git moved meanwhile (a commit made there), no ref, `HEAD` or index is written: the files are applied and show as uncommitted, and the folder's history is never overwritten. Locks and in-progress state are never applied. `/minilfs diff` and the apply preview add one `.git:` line, since views hide `.git`.
+- Sub-agents work on their own branches and report their branch name; the lead agent merges sub-agent branches (`minilfs merge <branch>`) and writes the result back to the host folder with `minilfs_apply` (`/minilfs apply`).
 
 **Isolation is for writes, not reads.** `bash` runs under a "wide read, narrow write" Seatbelt profile (like Claude Code's srt): it can read host files outside the Branch except the secret patterns (`.env`, `*.pem`, `~/.ssh`, the Store, …). Do not treat minilfs as a confidentiality boundary.
 

@@ -27,7 +27,9 @@ const PREFIX = `minilfs-pt-${id}-`;
 process.env.MINILFS_ROOT = join(base, "lfs");
 process.env.MINILFS_PREFIX = PREFIX;
 process.env.MINILFS_KILL_GRACE_MS = "1000";
-process.env.MINILFS_BUNDLE ??= join(REAL_HOME, ".cache/minilfs/bundle-native");
+// default: the bundle folder of the pinned LayerFS commit (layerfs.json); MINILFS_BUNDLE overrides it
+const { defaultBundleDir } = await import("../src/bundle.ts");
+process.env.MINILFS_BUNDLE ??= defaultBundleDir(join(REAL_HOME, ".cache/minilfs"));
 
 const { fauxAssistantMessage, fauxText, fauxToolCall, createFauxCore } = await import("@earendil-works/pi-ai");
 const { createAgentSessionServices, createAgentSessionFromServices, resolveCliModel, SessionManager, SettingsManager } = await import("@earendil-works/pi-coding-agent");
@@ -162,16 +164,15 @@ try {
     assert.doesNotMatch(text(l), /\.env/);
   });
 
-  await step("user ! command runs on the real folder (elevated) and the Branch picks up its changes", async () => {
+  await step("user ! command runs on the Branch in the sandbox (pure sandbox model); the folder is untouched", async () => {
     const routed = await session.extensionRunner.emitUserBash({ type: "user_bash", command: "echo user > user.txt && cat user.txt", cwd, excludeFromContext: false });
     assert.ok(routed?.operations, "user_bash must be routed");
     const out = await session.executeBash("echo user > user.txt && cat user.txt", undefined, { operations: routed.operations });
     assert.match(out.output, /^user\n/, "command output first");
-    assert.equal(readFileSync(join(cwd, "user.txt"), "utf8"), "user\n", "ran on the host folder");
+    assert.equal(existsSync(join(cwd, "user.txt")), false, "not run on the host folder");
     const [r] = await run([["read", { path: "user.txt" }]]);
     assert.match(text(r), /user/, "the Branch has the file after the command");
-    assert.ok(main.checkpoints().some((c) => (c.data.origins ?? []).some((o) => o.startsWith("host:"))), "host checkpoint recorded");
-    rmSync(join(cwd, "user.txt"), { force: true });
+    assert.ok(main.checkpoints().some((c) => (c.data.origins ?? []).includes("user_bash")), "checkpoint recorded for the user's command");
   });
 
   await step("abort stops the remote command tree", async () => {
@@ -223,7 +224,6 @@ try {
       await peer.session.prompt("/minilfs apply");
     } finally { console.log = log; }
 
-    // gen.txt may already be in the folder: the earlier user ! command ran elevated, which applies first
     assert.equal(readFileSync(join(cwd, "gen.txt"), "utf8"), "generated\n");
     assert.equal(readFileSync(join(cwd, "notes/plan.md"), "utf8"), "# plan v1\n");
     assert.match(readFileSync(join(cwd, "src/math.js"), "utf8"), /a \+ b \+ 0/);
