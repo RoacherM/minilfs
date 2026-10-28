@@ -308,3 +308,15 @@ pass). Verdicts: P1 P2 P3 partial; P4–P9 fixed. Push-ready: no; must change M1
 | M3 | git objects installed by `put()` (tmp, chmod, rename) are not fsynced before dependent refs/index are made durable and recovery is cleared | Major |
 | m1 | a marker that is a directory: its subtree is imported into main, and clear cannot remove it | Minor |
 | m2 | the full host index is rewritten and now fsynced after every applied file: O(N·S) bytes, 2 fsyncs per file | Minor |
+
+## 12. Review of the sixth round (353886d..19bd0c6) by auto/gpt-6-1-sol (high), 2026-10-27
+
+Implementation by auto/claude-opus-5-5 (2 commits; full suite: elevate 37, review-fixes 81, …, all
+pass). Verdicts: M1 fixed; M2 partial (narrowing accepted, one gap); M3 fixed for this run, not for
+retries; m1 fixed; m2 implemented with a cache caveat. Push-ready: no; must change Q1, Q2.
+
+| # | Finding | Severity |
+| --- | --- | --- |
+| Q1 | the M2 put-back takes the packed preimage only when packed-refs was rewritten, not when the Branch deleted the file: a worktree seen by the final scan on a branch that lived only in packed-refs stays dangling | Major |
+| Q2 | an apply interrupted after renaming objects but before syncing their folders leaves unfenced entries; the retry sees those objects as unchanged, skips the fence, makes the refs durable and clears recovery | Major |
+| Q3 | a lost non-durable host-index checkpoint (read back as `{}`) hides user deletions from main; the comment "a stale index only costs a rescan" is wrong | Minor |
