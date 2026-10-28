@@ -457,6 +457,21 @@ async function fsyncDir(dir: string): Promise<void> {
   try { await dh.sync(); } finally { await dh.close(); }
 }
 
+/**
+ * Refuses up front (before the folder first changes) when fsyncDir could not open one of `dirs`
+ * later: each is opened "r" and closed. A folder that does not exist yet (ENOENT, ENOTDIR) is made
+ * readable by the apply itself.
+ */
+async function preflightDirsReadable(dirs: Iterable<string>): Promise<void> {
+  for (const d of dirs) {
+    const dh = await fsp.open(d, "r").catch((e: any) => {
+      if (e?.code === "ENOENT" || e?.code === "ENOTDIR") return null;
+      throw new LayerfsError(e?.code ?? "EACCES", `cannot open folder ${d} to sync git objects (${e?.code ?? e?.message ?? e}); nothing was written`);
+    });
+    await dh?.close();
+  }
+}
+
 /** Writes `dst` and fsyncs it before returning. */
 async function writeFileDurable(dst: string, data: Buffer | string, mode = 0o644): Promise<void> {
   const fh = await fsp.open(dst, "w", mode);
@@ -973,5 +988,5 @@ async function removeEmptyGitRefParents(root: string, rel: string, layout?: GitL
 }
 const depthOf = (r: string) => r.split("/").length;
 
-export { cleanGitEnv, fileSig, foundRecoveryMarkers, fsyncDir, gitObjectsMissing, hostState, linkSig, readRawEntry, recoveryMarkersFor, recoveryPendingError, refFileState, refsAfter, removeEmptyGitRefParents, sameSig, writeFileDurable, writeGitLocked };
+export { cleanGitEnv, fileSig, foundRecoveryMarkers, fsyncDir, gitObjectsMissing, hostState, linkSig, preflightDirsReadable, readRawEntry, recoveryMarkersFor, recoveryPendingError, refFileState, refsAfter, removeEmptyGitRefParents, sameSig, writeFileDurable, writeGitLocked };
 export type { GitReads, GitRecovery, GitWrite, RawEntry, RefFileState };

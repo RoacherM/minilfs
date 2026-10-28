@@ -12,7 +12,7 @@ import { run } from "./core/exec-helper.ts";
 import { bothSpellings, buildSeatbeltProfile } from "./seatbelt.ts";
 import { allocateRescueRef, decideGitPath, expectedType, isRescueRef, GIT_JOIN_HINT, gitChangeSummary, gitPathKind, gitSig, isProtectedPath, isSafeRefName, MERGE_UNITS, resolveGitPath, scanGitLayout, splitGitPath, type GitLayout, type GitPathKind } from "./gitpaths.ts";
 import { LayerfsError } from "./errors.ts";
-import { cleanGitEnv, fileSig, foundRecoveryMarkers, fsyncDir, gitObjectsMissing, hostState, isRecoveryMarker, isRecoveryMarkerTree, linkSig, readFolderRecoveryMarker, readRawEntry, RECOVERY_MARKER, recoveryMarkersFor, recoveryPendingError, sameSig, writeFileDurable, writeGitLocked, type GitReads, type RawEntry } from "./gitapply.ts";
+import { cleanGitEnv, fileSig, foundRecoveryMarkers, fsyncDir, gitObjectsMissing, hostState, isRecoveryMarker, isRecoveryMarkerTree, linkSig, preflightDirsReadable, readFolderRecoveryMarker, readRawEntry, RECOVERY_MARKER, recoveryMarkersFor, recoveryPendingError, sameSig, writeFileDurable, writeGitLocked, type GitReads, type RawEntry } from "./gitapply.ts";
 import { isOrphan, MountLeases } from "./mount-leases.ts";
 import { GIT_JOIN_SCRIPT, parseJoin, symbolicHead, type JoinResult } from "./gitjoin.ts";
 import { stopWorkers } from "./core/worker.ts";
@@ -2458,6 +2458,10 @@ export class LayerfsSession {
         for (let d = dirname(join(this.cwd, f.rel)); d.startsWith(`${this.cwd}/`); d = dirname(d)) objectDirs.add(d);
         objectDirs.add(this.cwd);
       }
+      // every one the fence below opens: refused now, not after the files landed (a folder we may
+      // write to but not read, mode 0311)
+      const fenceDirs = [...objectDirs].sort((a, b) => b.length - a.length);
+      await preflightDirsReadable(fenceDirs);
       const put = async (rel: string, next: Next, git: GitPathKind = "none") => {
         const target = join(this.cwd, rel);
         touchHost();
@@ -2505,7 +2509,7 @@ export class LayerfsSession {
         }
         // the objects' folder entries on disk before writeGitLocked makes a ref or the index naming them durable
         // (deepest first; a folder that does not exist holds no object)
-        for (const d of [...objectDirs].sort((a, b) => b.length - a.length)) {
+        for (const d of fenceDirs) {
           await fsyncDir(d).catch((e: any) => (e?.code === "ENOENT" || e?.code === "ENOTDIR" ? undefined : Promise.reject(e)));
         }
         if (gitMeta.length) {

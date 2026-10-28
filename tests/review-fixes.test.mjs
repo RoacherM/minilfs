@@ -2239,6 +2239,35 @@ try {
     assert.equal(onDisk(), true, "main resyncs in full");
   });
 
+  await step("R1 an unreadable ancestor of a git objects folder refuses apply before any file is written", async () => {
+    const cwd = project();
+    const gi = (dir, ...a) => spawnSync("git", ["-C", dir, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    const sub = join(cwd, "sub");
+    mkdirSync(sub);
+    writeFileSync(join(sub, "s.txt"), "s\n");
+    gi(sub, "init", "-q", "-b", "main"); gi(sub, "add", "-A"); gi(sub, "commit", "-qm", "s1");
+    gi(cwd, "init", "-q", "-b", "main"); gi(cwd, "add", "-A"); gi(cwd, "commit", "-qm", "c1");
+    const s1 = gi(sub, "rev-parse", "HEAD").stdout.trim();
+    const s = await open(cwd, "r1");
+    const env = "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t;";
+    const o = out();
+    await s.mutate("1", "bash", () => s.exec(`${env} echo b > a.txt && cd sub && echo s2 > s.txt && git commit -qam s2 && echo OK`, cwd, o));
+    assert.match(o.text(), /OK/, o.text());
+    // traversable and writable, not readable: lstat, reads and writes below it work, open "r" of it does not
+    chmodSync(sub, 0o311);
+    try {
+      await assert.rejects(s.apply(), (e) => /EACCES|cannot open/.test(e.message) && e.message.includes(sub) && !e.result?.applied?.length);
+    } finally { chmodSync(sub, 0o755); }
+    assert.equal(readFileSync(join(cwd, "a.txt"), "utf8"), "a\n", "no source file written");
+    assert.equal(readFileSync(join(sub, "s.txt"), "utf8"), "s\n", "no nested source file written");
+    assert.equal(gi(sub, "rev-parse", "main").stdout.trim(), s1, "the nested repository's branch untouched");
+    assert.equal(s.bindings.byName(s.project).mainStale ?? false, false, "main not marked stale");
+    const ap = await s.apply();
+    assert.deepEqual(ap.warnings, [], ap.warnings.join("; "));
+    assert.equal(readFileSync(join(cwd, "a.txt"), "utf8"), "b\n");
+    assert.notEqual(gi(sub, "rev-parse", "main").stdout.trim(), s1, "the nested commit applied");
+  });
+
   await step("m1 a recovery marker that is a folder: its subtree never reaches main; clear quarantines it (renamed .bad-<time>, reported), never deletes it", async () => {
     const cwd = project();
     const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
