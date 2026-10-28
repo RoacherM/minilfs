@@ -37,8 +37,13 @@ command -v git >/dev/null || { echo "git not found" >&2; exit 1; }
 
 echo "==> LayerFS source ${REF} -> ${SRC} (sparse checkout)"
 if [ ! -d "${SRC}/.git" ]; then
-  mkdir -p "$(dirname "${SRC}")"
-  git clone --filter=blob:none --no-checkout https://github.com/Ephemeral-AI-Lab/layerfs.git "${SRC}"
+  # init in place rather than clone: CI restores the cargo cache (core/target) into ${SRC} before
+  # this runs, and git clone refuses a non-empty destination
+  mkdir -p "${SRC}"
+  git -C "${SRC}" init -q
+  git -C "${SRC}" remote add origin https://github.com/Ephemeral-AI-Lab/layerfs.git
+  git -C "${SRC}" config remote.origin.promisor true
+  git -C "${SRC}" config remote.origin.partialclonefilter blob:none
 fi
 git -C "${SRC}" sparse-checkout set --no-cone '/core/' '!/core/docs/' '/api/' '/.cargo/' '/LICENSE' '/.agents/skills/layerfs-js-sdk/'
 
