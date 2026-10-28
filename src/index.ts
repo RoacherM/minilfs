@@ -534,12 +534,13 @@ export default function minilfsExtension(pi: ExtensionAPI) {
           r = await s.apply({ allowRevert });
         } catch (e: any) {
           status(ctx, describe(s));
-          const partial = e?.result as { applied: string[]; conflicts: string[] } | undefined;
+          const partial = e?.result as { applied: string[]; conflicts: string[]; warnings?: string[] } | undefined;
           if (e?.code === "WouldRevert") return say(e.message, "warning");
           return say([
             `Apply stopped: ${e?.message ?? e}`,
             partial?.applied.length ? `Already written to your folder: ${partial.applied.join(", ")}` : "Nothing was written to your folder.",
             partial?.conflicts.length ? `Changed on disk during apply: ${partial.conflicts.join(", ")}` : "",
+            ...(partial?.warnings ?? []).map((w) => `Warning: ${w}`),
           ].filter(Boolean).join("\n"), "error");
         }
         if (r.conflicts.length) return say(`Nothing applied: these files changed on disk since the session started (or are directories now):\n${r.conflicts.join("\n")}`, "error");

@@ -498,7 +498,9 @@ export function allocateRescueRef(existing: Map<string, string>, dst: string, oi
     // the suffix never leaves the ancestor's subtree (a suffix has no `/`): rename that component
     if (!ancestor || ancestor.split("/").length < 2) throw new Error(`no place for ${dst}: ${ancestor} is a ref`);
     // the first name for it that is no ref itself (a folder of refs there is fine: dst goes inside it)
-    const from = ancestor === "refs/minilfs" ? "refs/minilfs-rescue" : ancestor;
+    // refs/minilfs or one of the rescue roots: renamed among the rescue roots (a suffix on a rescue
+    // root, refs/minilfs-rescue-<oid12>-<oid12>, would leave the namespace isRescueRef recognises)
+    const from = /^refs\/minilfs(-rescue[^/]*)?$/.test(ancestor) ? "refs/minilfs-rescue" : ancestor;
     let alt = from;
     for (const c of names(from)) if (!(existing.has(c) && !c.endsWith("/"))) { alt = c; break; }
     dst = `${alt}${dst.slice(ancestor.length)}`;

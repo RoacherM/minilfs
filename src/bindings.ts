@@ -217,6 +217,17 @@ export class BindingStore {
   }
 
 
+  /** The user dealt with a pending git recovery: forgotten, and main marked stale, in one write. */
+  clearRecovery(name: string): void {
+    this.update((d) => {
+      const p = d.projects[name];
+      if (!p) return;
+      p.mainStale = true;
+      delete p.recoveryDir;
+      delete p.recoveryMarkers;
+    });
+  }
+
   removeProject(name: string): void {
     this.update((d) => {
       delete d.projects[name];

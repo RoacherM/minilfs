@@ -417,8 +417,10 @@ export async function executeLayerfsApply(
     r = await s.apply();
   } catch (e: any) {
     hooks?.onStatusChange?.();
-    const partial = e?.result as { applied: string[] } | undefined;
-    throw new Error(`apply stopped: ${e?.message ?? e}${partial?.applied.length ? ` (already written: ${partial.applied.join(", ")})` : " (nothing was written)"}`);
+    const partial = e?.result as { applied: string[]; warnings?: string[] } | undefined;
+    // the warnings gathered before the stop (a lock that could not be removed, a value the folder's git kept) are part of the answer
+    const warned = partial?.warnings?.length ? ` (warnings: ${partial.warnings.join("; ")})` : "";
+    throw new Error(`apply stopped: ${e?.message ?? e}${partial?.applied.length ? ` (already written: ${partial.applied.join(", ")})` : " (nothing was written)"}${warned}`);
   }
   hooks?.onStatusChange?.();
   hooks?.onApplied?.();

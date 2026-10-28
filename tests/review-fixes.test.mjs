@@ -10,7 +10,7 @@ import { acquireLock } from "../src/lock.ts";
 import { isExcludedPath, LayerfsSession, stopNativeDaemons } from "../src/workspace.ts";
 import { formatHistory, loadHistory } from "../src/history.ts";
 import layerfsExtension from "../src/index.ts";
-import { executeLayerfsAction } from "../src/core/tools.ts";
+import { executeLayerfsAction, executeLayerfsApply } from "../src/core/tools.ts";
 
 const id = Date.now().toString(36);
 const base = join(homedir(), ".cache/minilfs-test", `fix-${id}`);
@@ -1885,6 +1885,107 @@ try {
     const recGone = at((e) => e[0] === "rm" && e[1] === recDir, "saved versions removed");
     assert.ok(parentSync < cleared && parentSync < recGone, "the change is on disk before the recovery state goes");
     assert.equal(existsSync(join(cwd, ".git/minilfs-recovery")), false);
+  });
+
+  await step("P4 on a case-insensitive disk a loose ref differing only in case from another (Main vs packed main) is refused", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c0"); g("commit", "-q", "--allow-empty", "-m", "c1");
+    const c0 = g("rev-parse", "HEAD~1").stdout.trim(), c1 = g("rev-parse", "HEAD").stdout.trim();
+    const st = (p) => statSync(join(cwd, p), { throwIfNoEntry: false });
+    if (!(st(".git/HEAD") && st(".git/head") && st(".git/HEAD").ino === st(".git/head").ino)) return "skipped: case-sensitive disk";
+    g("pack-refs", "--all");
+    assert.equal(existsSync(join(cwd, ".git/refs/heads/main")), false, "main is packed");
+    const s = await open(cwd, "p4");
+    await s.mutate("1", "write", () => s.writeFile(join(cwd, ".git/refs/heads/Main"), `${c0}\n`));
+    const ap = await s.apply();
+    assert.match(ap.warnings.join("\n"), /refs\/heads\/Main and .*refs\/heads\/main differ only in case/, ap.warnings.join("\n"));
+    assert.equal(readdirSync(join(cwd, ".git/refs/heads")).length, 0, "no loose Main written");
+    assert.equal(g("rev-parse", "refs/heads/main").stdout.trim(), c1, "main untouched");
+  });
+
+  await step("P5 a linked worktree's HEAD on refs/worktree/x resolves in that worktree's git dir", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+    const head = g("rev-parse", "HEAD").stdout.trim(), blob = g("rev-parse", "HEAD:a.txt").stdout.trim();
+    assert.equal(g("worktree", "add", "-q", `${cwd}-wt`, "-b", "wtb").status, 0);
+    const wt = readdirSync(join(cwd, ".git/worktrees"))[0];
+    mkdirSync(join(cwd, `.git/worktrees/${wt}/refs/worktree`), { recursive: true });
+    writeFileSync(join(cwd, `.git/worktrees/${wt}/refs/worktree/x`), `${head}\n`);
+    writeFileSync(join(cwd, `.git/worktrees/${wt}/HEAD`), "ref: refs/worktree/x\n");
+    assert.equal(spawnSync("git", ["-C", `${cwd}-wt`, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim(), head, "git resolves it in the worktree");
+    const s = await open(cwd, "p5");
+    await s.mutate("1", "write", () => s.writeFile(join(cwd, `.git/worktrees/${wt}/refs/worktree/x`), `${blob}\n`));
+    const ap = await s.apply();
+    assert.match(ap.warnings.join("\n"), /is a blob, not a commit/, ap.warnings.join("\n"));
+    assert.equal(readFileSync(join(cwd, `.git/worktrees/${wt}/refs/worktree/x`), "utf8").trim(), head, "host ref untouched");
+    rmSync(`${cwd}-wt`, { recursive: true, force: true });
+  });
+
+  await step("P6 a remote's HEAD left dangling by a prune, and an unborn HEAD (new repository, orphan branch), do not refuse the git metadata", async () => {
+    const repo = (name) => {
+      const cwd = project();
+      const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+      g("init", "-q", "-b", "main");
+      return { cwd, g, name };
+    };
+    const env = "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t;";
+    // 1. origin/HEAD -> origin/old; the Branch prunes origin/old
+    let { cwd, g } = repo("p6a");
+    g("add", "-A"); g("commit", "-qm", "c1");
+    g("update-ref", "refs/remotes/origin/old", "HEAD"); g("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/old");
+    let s = await open(cwd, "p6a");
+    await s.mutate("1", "bash", () => s.exec("git update-ref -d refs/remotes/origin/old", cwd, out()));
+    let ap = await s.apply();
+    assert.deepEqual(ap.warnings, [], ap.warnings.join("; "));
+    assert.equal(g("rev-parse", "--verify", "-q", "refs/remotes/origin/old").status, 1, "origin/old pruned");
+    // 2. a repository without commits (HEAD unborn on main): the Branch commits on feat only
+    ({ cwd, g } = repo("p6b"));
+    s = await open(cwd, "p6b");
+    const o = out();
+    // (a repository without commits has no file below refs/ or objects/: the import brings no such folder)
+    await s.mutate("1", "bash", () => s.exec(`${env} mkdir -p .git/refs/heads .git/objects && git add a.txt && c=$(git commit-tree "$(git write-tree)" -m feat) && git update-ref refs/heads/feat $c && git rm -q --cached a.txt && echo $c`, cwd, o));
+    const feat = o.text().trim().split("\n").pop();
+    assert.match(feat, /^[0-9a-f]{40}$/, o.text());
+    ap = await s.apply();
+    assert.deepEqual(ap.warnings, [], ap.warnings.join("; "));
+    assert.equal(g("rev-parse", "refs/heads/feat").stdout.trim(), feat);
+    assert.equal(g("symbolic-ref", "HEAD").stdout.trim(), "refs/heads/main", "HEAD still unborn on main");
+    // 3. the folder's own HEAD on an orphan branch (git checkout --orphan) in a repository with commits; the Branch adds a branch
+    ({ cwd, g } = repo("p6c"));
+    g("add", "-A"); g("commit", "-qm", "c1"); g("checkout", "-q", "--orphan", "fresh");
+    s = await open(cwd, "p6c");
+    await s.mutate("1", "bash", () => s.exec("git branch feat2 main", cwd, out()));
+    ap = await s.apply();
+    assert.deepEqual(ap.warnings, [], ap.warnings.join("; "));
+    assert.equal(g("rev-parse", "refs/heads/feat2").stdout.trim(), g("rev-parse", "refs/heads/main").stdout.trim());
+    assert.equal(g("symbolic-ref", "HEAD").stdout.trim(), "refs/heads/fresh", "HEAD still on the orphan branch");
+  });
+
+  await step("P8 a stopped apply's answer carries the warnings gathered before the stop", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c0"); g("commit", "-q", "--allow-empty", "-m", "c1"); g("branch", "a"); g("branch", "b");
+    g("commit", "-q", "--allow-empty", "-m", "cHost");
+    const cHost = g("rev-parse", "HEAD").stdout.trim();
+    g("reset", "-q", "--soft", "HEAD~1");
+    const s = await open(cwd, "p8");
+    await s.mutate("1", "bash", () => s.exec("git branch -f a HEAD~1 && git branch -f b HEAD~1", cwd, out()));
+    // the host commits to a after apply renamed it, then renaming b fails: the rollback keeps the host's a (a warning) and apply stops
+    const realRename = fsp.rename;
+    let hit = 0;
+    fsp.rename = async (...args) => {
+      if (String(args[1]).endsWith(".git/refs/heads/b") && hit++ === 0) {
+        writeFileSync(join(cwd, ".git/refs/heads/a"), `${cHost}\n`);
+        throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+      }
+      return realRename.apply(fsp, args);
+    };
+    let err = null;
+    try { await executeLayerfsApply(s).catch((e) => { err = e; }); } finally { fsp.rename = realRename; }
+    assert.match(String(err?.message), /apply stopped: .*disk full/, String(err));
+    assert.match(err.message, /warnings: .*updated \.git\/refs\/heads\/a .*kept/, err.message);
   });
 
   await step("too-large first import is refused before copying, naming the largest folders", async () => {

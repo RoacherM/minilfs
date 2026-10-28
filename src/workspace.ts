@@ -2053,7 +2053,8 @@ export class LayerfsSession {
     return this.bindings.withProjectLock(this.projectRecord.name, async () => {
       const rec = this.bindings.byName(this.projectRecord.name);
       const recDir = this.recoveryDir;
-      // the folder's markers first (a marker left alone would block apply again), then the record, then the saved versions
+      // the folder's markers first (a marker left alone would block apply again), then one binding
+      // write that marks main stale and forgets the record (never one without the other), then the saved versions
       const markers = new Set([`.git/${RECOVERY_MARKER}`, ...(rec?.recoveryMarkers ?? [])]);
       for (const m of markers) {
         const abs = join(this.cwd, m);
@@ -2061,10 +2062,9 @@ export class LayerfsSession {
         await fsp.rm(abs, { force: true });
         await fsyncDir(dirname(abs)).catch(() => {});
       }
-      this.bindings.setRecoveryDir(this.projectRecord.name, null);
-      this.projectRecord.recoveryDir = null;
-      this.bindings.setMainStale(this.projectRecord.name, true);
+      this.bindings.clearRecovery(this.projectRecord.name);
       this.projectRecord.mainStale = true;
+      this.projectRecord.recoveryDir = null;
       // the recovery folder only when it is one of ours (a marker's text names it; never anything else)
       const ours = recDir && resolve(recDir).startsWith(`${join(this.config.root, "recovery")}/`);
       if (ours) await fsp.rm(recDir, { recursive: true, force: true }).catch(() => {});
@@ -2853,6 +2853,8 @@ const commonGitDir = (cwd: string, dir: string) => {
   const m = /^(.+)\/worktrees\/[^/]+$/.exec(dir);
   return m && existsSync(join(cwd, dir, "commondir")) ? m[1] : dir;
 };
+/** A ref each worktree has its own of (git's per-worktree refs). */
+const isWorktreeLocalRef = (ref: string) => /^refs\/(bisect|rewritten|worktree)\//.test(ref);
 /** A HEAD in a repository's ref view: its own, or a linked worktree's (`worktrees/<id>/HEAD`). */
 const isHeadName = (name: string) => name === "HEAD" || /^worktrees\/[^/]+\/HEAD$/.test(name);
 
@@ -2919,6 +2921,9 @@ async function refsAfter(cwd: string, common: string, meta: GitWrite[], layout?:
   };
   const resolve = async (start: string): Promise<ResolvedRef> => {
     const chain = [start];
+    // a linked worktree's per-worktree refs (HEAD, refs/bisect|rewritten|worktree/) live in its own
+    // git dir: from its HEAD they are worktrees/<id>/<ref>, never the common dir's or packed-refs'
+    const wt = /^worktrees\/[^/]+\//.exec(start)?.[0] ?? "";
     for (let name = start; ; ) {
       const t = await lookup(name);
       if (t === null) return { kind: "missing", target: name, chain };
@@ -2926,7 +2931,7 @@ async function refsAfter(cwd: string, common: string, meta: GitWrite[], layout?:
       if (!m) return { kind: "oid", oid: t.trim(), chain };
       if (!isValidGitRefName(m[1])) return { kind: "invalid", target: m[1], chain };
       if (chain.length > SYMREF_MAX_HOPS) return { kind: "loop", target: m[1], chain };
-      name = m[1];
+      name = wt && isWorktreeLocalRef(m[1]) ? `${wt}${m[1]}` : m[1];
       chain.push(name);
     }
   };
@@ -2934,6 +2939,39 @@ async function refsAfter(cwd: string, common: string, meta: GitWrite[], layout?:
    * Every name that will be a symbolic ref: HEAD, each worktree's HEAD, the folder's loose
    * symbolic refs (refs/ walked, bounded) and the planned ones; or why they cannot be listed.
    */
+  /** the folder's loose refs (refs/ walked by symbolic()) */
+  const looseHost = new Set<string>();
+  /**
+   * On a case-insensitive disk (`HEAD` and `head` one file) two refs whose names differ only in
+   * case are one file: git reading one reads the other's oid (a loose `Main` shadows a packed
+   * `main`), and a folder `Foo/` is the ref `foo`. Why the refs after `meta` would alias so, where
+   * a changed name is involved, or null. Call after symbolic() (it lists the folder's loose refs).
+   */
+  const caseAliases = async (): Promise<string | null> => {
+    const u = await fsp.lstat(join(cwd, common, "HEAD")).catch(() => null);
+    const l = u ? await fsp.lstat(join(cwd, common, "head")).catch(() => null) : null;
+    if (!u || !l || u.dev !== l.dev || u.ino !== l.ino) return null;
+    const loose = new Set(looseHost);
+    for (const [n, g] of planned) if (n.startsWith("refs/")) { if (g.next) loose.add(n); else loose.delete(n); }
+    const byFold = new Map<string, Set<string>>();
+    const add = (n: string) => { const k = n.toLowerCase(); (byFold.get(k) ?? byFold.set(k, new Set()).get(k)!).add(n); };
+    for (const n of loose) add(n);
+    for (const n of packed.keys()) add(n);
+    for (const [, names] of byFold) {
+      // only packed names: packed-refs is one text file, its names compare exactly
+      if (names.size < 2 || ![...names].some((n) => loose.has(n)) || ![...names].some((n) => touched.has(n))) continue;
+      const [a, b] = [...names].sort();
+      return `${common}/${a} and ${common}/${b} differ only in case on a case-insensitive file system`;
+    }
+    // a loose ref and a folder of loose refs whose names differ only in case
+    for (const n of loose) {
+      for (let p = posix.dirname(n); p.split("/").length > 2; p = posix.dirname(p)) {
+        const other = [...(byFold.get(p.toLowerCase()) ?? [])].find((x) => x !== p && loose.has(x));
+        if (other && (touched.has(n) || touched.has(other))) return `${common}/${other} and ${common}/${n} differ only in case on a case-insensitive file system`;
+      }
+    }
+    return null;
+  };
   const symbolic = async (): Promise<string[] | { error: string }> => {
     const names = new Set<string>(["HEAD", ...planned.keys()]);
     const worktrees = await worktreeList(join(cwd, common));
@@ -2945,6 +2983,7 @@ async function refsAfter(cwd: string, common: string, meta: GitWrite[], layout?:
       for (const e of await fsp.readdir(join(cwd, common, rel), { withFileTypes: true }).catch(() => [])) {
         const child = `${rel}/${e.name}`;
         if (e.isDirectory()) { const why = await walk(child); if (why) return why; continue; }
+        if (e.isFile() && isValidGitRefName(child)) looseHost.add(child);
         if (!e.isFile() || planned.has(child) || !isValidGitRefName(child)) continue; // a lock file is no ref
         if (++files > MAX_SYMREF_SCAN_FILES) return `${common}/refs has more than ${MAX_SYMREF_SCAN_FILES} loose refs (run git pack-refs in your folder)`;
         if (/^ref:/.test((await hostLoose(child)) ?? "")) names.add(child);
@@ -2959,14 +2998,16 @@ async function refsAfter(cwd: string, common: string, meta: GitWrite[], layout?:
     depend([...names].filter(isHeadName));
     return out;
   };
-  return { planned, touched, lookup, resolve, symbolic, depend };
+  return { planned, touched, lookup, resolve, symbolic, depend, caseAliases };
 }
 
 /**
  * Why the folder cannot take these refs/HEAD/index, or null. In each git dir (as the folder has it):
  * every ref parses (oids of the repository's hash length), branch heads and HEAD name commits, index
  * entries name blobs (not gitlinks, not intent-to-add), packed-refs' peeled `^` lines are what their
- * tag peels to, symbolic refs resolve (HEAD may be unborn only in a repository without commits), and
+ * tag peels to, symbolic refs resolve (HEAD may be unborn on a branch this apply does not delete: the
+ * folder's own unborn HEAD always, one the Branch's change leads there only in a repository without
+ * commits), and
  * everything the new commits and tags reach is there (`rev-list --objects --missing=print`, minus
  * what the folder's refs already reach). git runs with cleanGitEnv, no hooks, no fsmonitor. A ref
  * written by a file tool, or objects never added, would otherwise leave the folder's git broken.
@@ -3045,6 +3086,8 @@ async function gitObjectsMissing(cwd: string, meta: GitWrite[], layout?: GitLayo
     if (!view.touched.size) continue;
     const symbolic = await view.symbolic();
     if (!Array.isArray(symbolic)) return symbolic.error;
+    const alias = await view.caseAliases();
+    if (alias) return alias;
     const d = dirOf(common);
     const deleted = new Set<string>();
     for (const n of view.touched) if ((await view.lookup(n)) === null) deleted.add(n);
@@ -3061,8 +3104,14 @@ async function gitObjectsMissing(cwd: string, meta: GitWrite[], layout?: GitLayo
       if (r.kind === "missing") {
         if (r.chain.length === 1 && !isHeadName(name)) continue; // the ref itself is deleted: nothing names it
         if (r.chain.length === 1) return `${at} would not exist`;
-        // HEAD on a branch not born yet: only in a repository without commits (checked below); never a deleted one
+        // HEAD on a branch not born yet, never one this apply deletes. The folder's own unborn HEAD (a
+        // new repository, git checkout --orphan) is valid in git whatever other branches hold: its
+        // chain reaches no change (a changed name missing afterwards is a deleted one), so it is never
+        // checked here. A HEAD the Branch's change leads to a branch not born yet: only in a
+        // repository without commits (checked below)
         if (isHeadName(name) && !r.chain.some((n) => deleted.has(n))) { d.unborn ??= `${at} names ${r.target}`; continue; }
+        // a remote's default branch left behind by a prune (git fetch --prune does the same): git warns, nothing breaks
+        if (!view.touched.has(name) && /^refs\/remotes\/[^/]+\/HEAD$/.test(name)) continue;
         return `${at} names ${r.target}, which does not exist`;
       }
       // a branch (or HEAD) anywhere on the chain must end at a commit: refs/heads/x -> refs/tags/blob is refused

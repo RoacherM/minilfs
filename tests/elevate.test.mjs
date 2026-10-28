@@ -613,6 +613,42 @@ try {
     } finally { if (ws.OUTSIDE_READDIR_LIMITS) Object.assign(ws.OUTSIDE_READDIR_LIMITS, saved); rmSync(t, { recursive: true, force: true }); }
   });
 
+  await step("P7 a rescue root blocked by a ref (refs/minilfs-rescue, refs/minilfs-rescue-<oid12>) moves to another rescue root, never out of the namespace", async () => {
+    const g = await import("../src/gitpaths.ts");
+    // hex letters: an all-digit oid12 would pass for the `-<n>` counter of a rescue root
+    const oid = "ab".repeat(20), other = "cd".repeat(20);
+    let ex = new Map([["refs/minilfs-rescue", other]]);
+    const a = g.allocateRescueRef(ex, "refs/minilfs-rescue/w1/heads/main", oid);
+    assert.match(a.ref, /^refs\/minilfs-rescue-[0-9a-f]{12}\//, a.ref);
+    assert.equal(g.isRescueRef(a.ref), true, a.ref);
+    assert.equal(g.expectedType(a.ref), "commit");
+    // the fallback root itself taken too: the next rescue root name, still recognised
+    ex = new Map([["refs/minilfs-rescue", other], [`refs/minilfs-rescue-${oid.slice(0, 12)}`, other]]);
+    const b = g.allocateRescueRef(ex, `refs/minilfs-rescue-${oid.slice(0, 12)}/w1/heads/main`, oid);
+    assert.equal(g.isRescueRef(b.ref), true, b.ref);
+    assert.equal(g.expectedType(b.ref), "commit", b.ref);
+  });
+
+  await step("P9 clearRecovery marks main stale and forgets the recovery in one bindings write", async () => {
+    const { resolveConfig } = await import("../src/config.ts");
+    const { BindingStore } = await import("../src/bindings.ts");
+    const root = join(dir, "p9");
+    const s = new ws.LayerfsSession(dir, "p9", { ...resolveConfig({}), root });
+    s.bindings = new BindingStore(join(root, "state"));
+    s.projectRecord = { name: "p9", source: dir, volume: "v", mainRef: "", created: 1, updatedAt: 1 };
+    s.bindings.addProject(dir, s.projectRecord);
+    const recDir = join(root, "recovery", "p9-1");
+    mkdirSync(recDir, { recursive: true });
+    s.bindings.setRecoveryDir("p9", recDir);
+    const writes = [];
+    const realSave = Object.getPrototypeOf(s.bindings).save;
+    s.bindings.save = function () { const p = this._data.projects.p9; writes.push({ mainStale: p.mainStale, recoveryDir: p.recoveryDir }); return realSave.call(this); };
+    const r = await s.clearRecovery();
+    assert.equal(r.cleared, recDir);
+    assert.deepEqual(writes, [{ mainStale: true, recoveryDir: undefined }], JSON.stringify(writes));
+    assert.equal(existsSync(recDir), false, "saved versions removed");
+  });
+
   await step("S13 sessionAlive checks the recorded start time for this process's own pid too", async () => {
     const { hostname } = await import("node:os");
     const { procStartTime } = await import("../src/core/proc-scan.ts");
