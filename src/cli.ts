@@ -5,7 +5,7 @@
 // Commands:
 //   minilfs mcp                        Start stdio MCP server (for Claude Code / Codex / Cursor)
 //   minilfs exec [--branch B] -- <cmd> Run a shell command on a LayerFS branch inside macOS Seatbelt
-//   minilfs status | diff | branches | show | ls | checkout | sync | merge | apply | history | clean
+//   minilfs status | diff | branches | show | ls | checkout | sync | merge | apply | recover | history | clean
 import { createInterface } from "node:readline";
 import { resolve } from "node:path";
 import {
@@ -200,6 +200,7 @@ async function main() {
       "  sync [branch] [--ours|--theirs] Merge main (or <branch>) into your branch",
       "  merge <branch> [--ours|--theirs] Merge <branch> into your branch",
       "  apply                          3-way checked write back to host folder",
+      "  recover [--clear]              After an apply that could not finish its git metadata: show / clear the block",
       "  history [limit]                Show branch commit history",
       "  clean                          Remove project scratch build caches",
     ].join("\n"));
@@ -243,6 +244,10 @@ async function main() {
     const strategy = rest.includes("--theirs") ? "theirs" : rest.includes("--ours") ? "ours" : undefined;
     const full = rest.includes("--full");
     const positional = rest.slice(1).filter((a) => a !== "--theirs" && a !== "--ours" && a !== "--full");
+    if (sub === "recover") {
+      console.log(await executeLayerfsAction(s, { action: "recover", clear: rest.includes("--clear") }));
+      return;
+    }
     if (sub === "status" || sub === "branches" || sub === "clean") {
       console.log(await executeLayerfsAction(s, { action: sub }));
       return;

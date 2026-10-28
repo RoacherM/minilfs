@@ -5,6 +5,7 @@ import path from "node:path";
 import { hiddenPath } from "../history.ts";
 import { gitChangeSummary } from "../gitpaths.ts";
 import { isExcludedPath, type LayerfsSession, type MergeResult } from "../workspace.ts";
+import { resolveRole, type Role } from "./role.ts";
 
 const IMAGE_TYPES: Record<string, string> = {
   ".png": "image/png",
@@ -25,12 +26,13 @@ export const LAYERFS_TOOL_DESCRIPTION = [
   "action=ls [branch=<name>] [path=/]: list directory entries on a branch.",
   "action=checkout branch=<name> (path=<file>|paths=[...]): copy files or directories from another branch into your branch.",
   "action=clean: remove temporary scratch build caches for this project.",
+  "action=recover [clear=true]: (lead only) after an apply could not finish putting the folder's git back, show where its previous versions are; once the user checked the folder's git, clear=true lets apply run again.",
 ].join(" ");
 
 export const LAYERFS_TOOL_SCHEMA = {
   type: "object",
   properties: {
-    action: { type: "string", enum: ["status", "diff", "branches", "sync", "merge", "show", "ls", "checkout", "clean"] },
+    action: { type: "string", enum: ["status", "diff", "branches", "sync", "merge", "show", "ls", "checkout", "clean", "recover"] },
     branch: { type: "string", description: "branch to merge (action=merge), read from (action=show/ls/checkout), or diff (action=diff/sync)" },
     base: { type: "string", description: "base branch to diff against (action=diff)" },
     path: { type: "string", description: "file or directory path (action=show, action=ls, action=checkout)" },
@@ -39,6 +41,7 @@ export const LAYERFS_TOOL_SCHEMA = {
     offset: { type: "integer", description: "1-indexed starting line number (action=show, default: 1)" },
     limit: { type: "integer", description: "maximum lines to show (action=show)" },
     full: { type: "boolean", description: "when action=sync, perform a full host-drift rescan into main before merging" },
+    clear: { type: "boolean", description: "when action=recover: the user checked the folder's git; forget the pending recovery so apply runs again" },
   },
   required: ["action"],
   additionalProperties: false,
@@ -54,7 +57,7 @@ export const LAYERFS_APPLY_TOOL_SCHEMA = {
 } as const;
 
 export interface LayerfsActionParams {
-  action: "status" | "diff" | "branches" | "sync" | "merge" | "show" | "ls" | "checkout" | "clean";
+  action: "status" | "diff" | "branches" | "sync" | "merge" | "show" | "ls" | "checkout" | "clean" | "recover";
   branch?: string;
   base?: string;
   path?: string;
@@ -63,9 +66,15 @@ export interface LayerfsActionParams {
   offset?: number;
   limit?: number;
   full?: boolean;
+  clear?: boolean;
 }
 
+/** Why a sub-agent cannot apply or clear an apply's recovery (shared by the tools and /minilfs). */
+export const ONLY_LEAD = "only the lead applies to the folder; you are a sub-agent: report your branch name (`minilfs` action=status) instead";
+
 export interface LayerfsActionHooks {
+  /** the agent's role as the harness decided it (else resolveRole from the environment) */
+  role?: Role;
   onStatusChange?: () => void;
   onMerged?: (otherBranch: string, result: MergeResult) => void;
 }
@@ -366,6 +375,18 @@ export async function executeLayerfsAction(
     const resolvedInfo = r.resolved?.length ? ` (${strategy} on ${r.resolved.length} conflicting file(s): ${r.resolved.slice(0, 5).join(", ")}${r.resolved.length > 5 ? ", …" : ""})` : "";
     const pending = unappliedMergesNote(s);
     return `${driftNote}Merged ${other}${resolvedInfo}. You are now on ${r.branch}${lwwInfo}.${r.gitNote ? `\nGit: ${r.gitNote}.` : ""}${pending ? `\n${pending}` : ""}`;
+  }
+  if (action === "recover") {
+    // clearing re-enables writes to the user's folder: the lead's call, never a sub-agent's
+    if ((hooks?.role ?? resolveRole().role) !== "lead") throw new Error(ONLY_LEAD);
+    const dir = s.recoveryDir;
+    if (!dir) return "No pending git recovery: apply is not blocked.";
+    if (params?.clear !== true) {
+      return `An earlier apply could not finish putting the folder's git metadata back; its previous versions are in ${dir} (manifest.json lists them). Have the user check the folder's git (git status, git fsck), restore what is needed, then call action=recover clear=true to apply again.`;
+    }
+    const r = await s.clearRecovery();
+    hooks?.onStatusChange?.();
+    return `Cleared the pending git recovery${r.cleared ? ` (${r.cleared} removed)` : ""}; apply runs again, and main is resynced from the folder first.`;
   }
   if (action === "clean") {
     const res = await s.cleanScratch();

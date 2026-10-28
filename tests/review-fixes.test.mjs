@@ -10,6 +10,7 @@ import { acquireLock } from "../src/lock.ts";
 import { isExcludedPath, LayerfsSession, stopNativeDaemons } from "../src/workspace.ts";
 import { formatHistory, loadHistory } from "../src/history.ts";
 import layerfsExtension from "../src/index.ts";
+import { executeLayerfsAction } from "../src/core/tools.ts";
 
 const id = Date.now().toString(36);
 const base = join(homedir(), ".cache/minilfs-test", `fix-${id}`);
@@ -1478,13 +1479,184 @@ try {
     assert.deepEqual(manifest.unrecovered.map((u) => u.rel), [".git/refs/heads/a"]);
     assert.equal(s.bindings.byName(s.project).mainStale, true);
     await assert.rejects(s.apply(), (e) => e.code === "RecoveryPending" && e.message.includes(recDir));
-    // dealt with: the user restores a and removes the folder; apply runs again
+    // dealt with: the user restores a and clears the block (removing the folder alone is not enough: N2)
     writeFileSync(join(cwd, ".git/refs/heads/a"), `${c1}\n`);
-    rmSync(recDir, { recursive: true, force: true });
+    await executeLayerfsAction(s, { action: "recover", clear: true }, { role: "lead" });
+    assert.equal(existsSync(recDir), false, "the saved versions are removed");
     const ap = await s.apply();
     assert.deepEqual(ap.warnings, [], ap.warnings.join("; "));
     assert.equal(g("rev-parse", "refs/heads/b").stdout.trim(), g("rev-parse", "HEAD~1").stdout.trim());
     assert.equal(s.bindings.byName(s.project).recoveryDir, undefined, "the binding forgot the folder");
+  });
+
+  await step("N1 the ref graph after apply: an unchanged branch or HEAD whose chain reaches a changed, deleted or uncovered ref must still end at a commit", async () => {
+    const repo = (name) => {
+      const cwd = project();
+      const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+      g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+      const head = g("rev-parse", "HEAD").stdout.trim();
+      const blob = g("rev-parse", "HEAD:a.txt").stdout.trim();
+      return { cwd, g, head, blob, name };
+    };
+    const fsckOk = (cwd) => spawnSync("git", ["-C", cwd, "fsck", "--no-progress"]).status === 0;
+    // host: refs/tags/t -> c1, refs/heads/sym -> ref: refs/tags/t, HEAD -> refs/heads/sym (all unchanged by the Branch)
+    const symRepo = (name) => {
+      const r = repo(name);
+      r.g("tag", "t"); r.g("symbolic-ref", "refs/heads/sym", "refs/tags/t"); r.g("symbolic-ref", "HEAD", "refs/heads/sym");
+      return r;
+    };
+    // 1. only refs/tags/t changes, to a blob: sym and HEAD would name a blob
+    let { cwd, g, head, blob } = symRepo("n1a");
+    let s = await open(cwd, "n1a");
+    await s.mutate("1", "write", () => s.writeFile(join(cwd, ".git/refs/tags/t"), `${blob}\n`));
+    let ap = await s.apply();
+    assert.match(ap.warnings.join("\n"), /is a blob, not a commit/, ap.warnings.join("\n"));
+    assert.equal(readFileSync(join(cwd, ".git/refs/tags/t"), "utf8").trim(), head, "host tag untouched");
+    assert.ok(fsckOk(cwd));
+    // 2. only refs/tags/t is deleted: sym (and HEAD through it) would name nothing
+    ({ cwd, g, head } = symRepo("n1b"));
+    s = await open(cwd, "n1b");
+    await s.mutate("1", "bash", () => s.exec("rm .git/refs/tags/t", cwd, out()));
+    ap = await s.apply();
+    assert.match(ap.warnings.join("\n"), /refs\/heads\/sym names refs\/tags\/t, which does not exist/, ap.warnings.join("\n"));
+    assert.equal(readFileSync(join(cwd, ".git/refs/tags/t"), "utf8").trim(), head, "host tag untouched");
+    // 3. refs/tags/t packed; the Branch drops its packed-refs line
+    ({ cwd, g, head } = symRepo("n1c"));
+    g("pack-refs", "--all");
+    assert.equal(existsSync(join(cwd, ".git/refs/tags/t")), false, "t is packed");
+    s = await open(cwd, "n1c");
+    const packed = readFileSync(join(cwd, ".git/packed-refs"), "utf8");
+    await s.mutate("1", "write", () => s.writeFile(join(cwd, ".git/packed-refs"), packed.split("\n").filter((l) => !l.endsWith(" refs/tags/t")).join("\n")));
+    ap = await s.apply();
+    assert.match(ap.warnings.join("\n"), /names refs\/tags\/t, which does not exist/, ap.warnings.join("\n"));
+    assert.equal(readFileSync(join(cwd, ".git/packed-refs"), "utf8"), packed, "host packed-refs untouched");
+    // 3b. a symbolic line in packed-refs (git has none): refused, never resolved
+    ({ cwd, g, head } = symRepo("n1c2"));
+    s = await open(cwd, "n1c2");
+    await s.mutate("1", "write", () => s.writeFile(join(cwd, ".git/packed-refs"), `# pack-refs with: peeled fully-peeled sorted \nref: refs/tags/t refs/heads/p\n`));
+    ap = await s.apply();
+    assert.match(ap.warnings.join("\n"), /packed-refs has a malformed line/, ap.warnings.join("\n"));
+    assert.equal(existsSync(join(cwd, ".git/packed-refs")), false);
+    // 4. deleting a loose branch uncovers a stale packed line naming a blob
+    ({ cwd, g, head, blob } = repo("n1d"));
+    g("branch", "x");
+    writeFileSync(join(cwd, ".git/packed-refs"), `# pack-refs with: peeled fully-peeled sorted \n${blob} refs/heads/x\n`);
+    assert.equal(g("rev-parse", "refs/heads/x").stdout.trim(), head, "the loose ref shadows the packed one");
+    s = await open(cwd, "n1d");
+    await s.mutate("1", "bash", () => s.exec("rm .git/refs/heads/x", cwd, out()));
+    ap = await s.apply();
+    assert.match(ap.warnings.join("\n"), /is a blob, not a commit/, ap.warnings.join("\n"));
+    assert.equal(readFileSync(join(cwd, ".git/refs/heads/x"), "utf8").trim(), head, "host loose branch kept");
+    // 5. HEAD's branch is deleted (HEAD unchanged): HEAD would name nothing in a repository with commits
+    ({ cwd, g, head } = repo("n1e"));
+    g("checkout", "-q", "-b", "work");
+    s = await open(cwd, "n1e");
+    await s.mutate("1", "bash", () => s.exec("rm .git/refs/heads/work", cwd, out()));
+    ap = await s.apply();
+    assert.match(ap.warnings.join("\n"), /\.git\/HEAD names refs\/heads\/work, which does not exist/, ap.warnings.join("\n"));
+    assert.equal(g("rev-parse", "refs/heads/work").stdout.trim(), head);
+    // 6. a valid change through the same chain still applies: t moves to a new commit
+    ({ cwd, g, head } = symRepo("n1f"));
+    s = await open(cwd, "n1f");
+    const o = out();
+    await s.mutate("1", "bash", () => s.exec("c=$(git -c user.email=t@t -c user.name=t commit-tree 'HEAD^{tree}' -p HEAD -m next) && git update-ref refs/tags/t $c && echo $c", cwd, o));
+    const c2 = o.text().trim().split("\n").pop();
+    ap = await s.apply();
+    assert.deepEqual(ap.warnings, [], ap.warnings.join("; "));
+    assert.equal(g("rev-parse", "HEAD").stdout.trim(), c2, "HEAD -> sym -> t moved");
+    assert.ok(fsckOk(cwd));
+  });
+
+  await step("N2 the pending git recovery is recorded before the folder changes; a failure to record changes nothing; a missing folder never unblocks; main is marked stale even when recording fails", async () => {
+    const setup = async (name) => {
+      const cwd = project();
+      const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+      g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c0"); g("commit", "-q", "--allow-empty", "-m", "c1"); g("branch", "a"); g("branch", "b");
+      const c1 = g("rev-parse", "HEAD").stdout.trim();
+      const s = await open(cwd, name);
+      await s.mutate("1", "bash", () => s.exec("git branch -f a HEAD~1 && git branch -f b HEAD~1", cwd, out()));
+      return { cwd, g, c1, s };
+    };
+    const recRoot = join(config.root, "recovery");
+    const recsOf = (s) => (existsSync(recRoot) ? readdirSync(recRoot).filter((d) => d.startsWith(`${s.project}-`)) : []);
+    const noLocks = (cwd) => assert.equal(spawnSync("find", [join(cwd, ".git"), "-name", "*.lock"], { encoding: "utf8" }).stdout.trim(), "", "no lock left");
+    // 1. recording the recovery fails: nothing in the folder changes, nothing recorded or saved
+    let { cwd, g, c1, s } = await setup("n2a");
+    const realSet = s.bindings.setRecoveryDir.bind(s.bindings);
+    s.bindings.setRecoveryDir = (name, dir) => { if (dir) throw Object.assign(new Error("no space"), { code: "ENOSPC" }); return realSet(name, dir); };
+    let err = null;
+    try { await s.apply().catch((e) => { err = e; }); } finally { s.bindings.setRecoveryDir = realSet; }
+    assert.equal(err?.code, "ENOSPC", String(err));
+    for (const r of ["a", "b"]) assert.equal(g("rev-parse", `refs/heads/${r}`).stdout.trim(), c1, `refs/heads/${r} untouched`);
+    noLocks(cwd);
+    assert.deepEqual(recsOf(s), [], "no saved versions left");
+    assert.equal(s.bindings.byName(s.project).recoveryDir, undefined);
+    // 2. the record and the previous versions exist before the first change (a process dying there leaves the block)
+    ({ cwd, g, c1, s } = await setup("n2b"));
+    const realRename = fsp.rename;
+    let seen = null;
+    fsp.rename = async (...args) => {
+      if (!seen && String(args[1]).startsWith(join(cwd, ".git/refs/heads/"))) {
+        const dir = s.bindings.byName(s.project).recoveryDir;
+        seen = { dir, a: dir && existsSync(join(dir, "preimages/.git/refs/heads/a")) ? readFileSync(join(dir, "preimages/.git/refs/heads/a"), "utf8").trim() : null, ref: readFileSync(join(cwd, ".git/refs/heads/a"), "utf8").trim() };
+      }
+      return realRename.apply(fsp, args);
+    };
+    let ap;
+    try { ap = await s.apply(); } finally { fsp.rename = realRename; }
+    assert.ok(seen?.dir, `recovery recorded before the first rename: ${JSON.stringify(seen)}`);
+    assert.equal(seen.a, c1, "a's previous version saved before the first rename");
+    assert.equal(seen.ref, c1, "and the folder was not changed yet");
+    assert.deepEqual(ap.warnings, [], ap.warnings.join("; "));
+    assert.equal(s.bindings.byName(s.project).recoveryDir, undefined, "forgotten once all is written");
+    assert.deepEqual(recsOf(s), [], "saved versions removed once all is written");
+    // 3. a rollback that cannot finish; the user deletes the saved folder: apply still refuses until recover --clear
+    ({ cwd, g, c1, s } = await setup("n2c"));
+    const realOpen = fsp.open;
+    let failed = false;
+    let hit = 0;
+    fsp.rename = async (...args) => {
+      if (String(args[1]).endsWith(".git/refs/heads/b") && hit++ === 0) { failed = true; throw Object.assign(new Error("disk full"), { code: "ENOSPC" }); }
+      return realRename.apply(fsp, args);
+    };
+    fsp.open = async (...args) => {
+      if (failed && String(args[0]).endsWith(".git/refs/heads/a.lock")) throw Object.assign(new Error("i/o error"), { code: "EIO" });
+      return realOpen.apply(fsp, args);
+    };
+    err = null;
+    try { await s.apply().catch((e) => { err = e; }); } finally { fsp.rename = realRename; fsp.open = realOpen; }
+    assert.equal(err?.code, "RollbackIncomplete", String(err));
+    const recDir = s.bindings.byName(s.project).recoveryDir;
+    assert.ok(recDir && existsSync(recDir), "recorded");
+    assert.equal(JSON.parse(readFileSync(join(recDir, "manifest.json"), "utf8")).status, "rollback_incomplete");
+    rmSync(recDir, { recursive: true, force: true });
+    await assert.rejects(s.apply(), (e) => e.code === "RecoveryPending" && e.message.includes("/minilfs recover --clear") && e.message.includes(recDir));
+    await assert.rejects(s.apply(), (e) => e.code === "RecoveryPending", "still refused (the missing folder did not clear it)");
+    await assert.rejects(executeLayerfsAction(s, { action: "recover", clear: true }, { role: "worker" }), /only the lead/);
+    assert.match(await executeLayerfsAction(s, { action: "recover" }, { role: "lead" }), /clear=true/);
+    assert.ok(s.bindings.byName(s.project).recoveryDir, "a report alone does not clear");
+    writeFileSync(join(cwd, ".git/refs/heads/a"), `${c1}\n`);
+    assert.match(await executeLayerfsAction(s, { action: "recover", clear: true }, { role: "lead" }), /Cleared/);
+    assert.equal(s.bindings.byName(s.project).recoveryDir, undefined);
+    ap = await s.apply();
+    assert.deepEqual(ap.warnings, [], ap.warnings.join("; "));
+    assert.equal(g("rev-parse", "refs/heads/b").stdout.trim(), g("rev-parse", "HEAD~1").stdout.trim());
+    // 4. saving the folder's index fails while handling a failed apply: main is still marked stale, the cause is reported
+    ({ cwd, g, c1, s } = await setup("n2d"));
+    const realWrite = s.bindings.writeHostIndex.bind(s.bindings);
+    hit = 0;
+    fsp.rename = async (...args) => {
+      if (String(args[1]).endsWith(".git/refs/heads/b") && hit++ === 0) throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+      return realRename.apply(fsp, args);
+    };
+    s.bindings.writeHostIndex = () => { throw Object.assign(new Error("manifest write failed"), { code: "EIO" }); };
+    err = null;
+    try { await s.apply().catch((e) => { err = e; }); } finally { fsp.rename = realRename; s.bindings.writeHostIndex = realWrite; }
+    assert.equal(err?.code, "ENOSPC", `the apply's own error is reported: ${err}`);
+    assert.equal(s.bindings.byName(s.project).mainStale, true, "main marked stale in bindings");
+    assert.equal(s.projectRecord.mainStale, true, "and in memory");
+    for (const r of ["a", "b"]) assert.equal(g("rev-parse", `refs/heads/${r}`).stdout.trim(), c1, `refs/heads/${r} put back`);
+    noLocks(cwd);
   });
 
   await step("F7 a git join whose ref update fails and whose index cannot be put back is discarded: the Branch's .git (index) stays the kept side's", async () => {

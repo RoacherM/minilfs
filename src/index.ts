@@ -30,13 +30,14 @@ import {
   LAYERFS_TOOL_SCHEMA,
   LayerfsSession,
   loadHistory,
+  ONLY_LEAD as CORE_ONLY_LEAD,
   resolveConfig,
   type Checkpoint,
 } from "./core/index.ts";
 
 export const CHECKPOINT_ENTRY = "minilfs-checkpoint";
 export const SESSION_ENTRY = "minilfs-session";
-const ONLY_LEAD = "only the lead applies to the folder; you are a sub-agent: report your branch name (`minilfs` action=status) instead";
+const ONLY_LEAD = CORE_ONLY_LEAD;
 
 export default function minilfsExtension(pi: ExtensionAPI) {
   pi.registerFlag("no-minilfs", { description: "Disable minilfs isolation for this run (tools act on the host folder)", type: "boolean", default: false });
@@ -195,6 +196,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
         if (disabled) return text("minilfs is off for this run: there are no branches; tools act on the user's folder.");
         const s = await need();
         const out = await executeLayerfsAction(s, params, {
+          role: role.role,
           onStatusChange: () => status(ctx, describe(s)),
           onMerged: (other, r) => recordMerge(s, other, r),
         });
@@ -411,10 +413,11 @@ export default function minilfsExtension(pi: ExtensionAPI) {
     ["merge", "把另一个分支（如子 agent 的分支）合并进本会话：merge <branch>"],
     ["retry", "checkpoint 失败被锁住后重试；启动失败（如目录太大）后重新启动"],
     ["clean", "清理本项目的 scratch 构建缓存目录"],
+    ["recover", "写回 .git 未能完成时：显示旧版本保存位置；检查 .git 后用 recover --clear 解除写回保护"],
   ];
 
   pi.registerCommand("minilfs", {
-    description: "minilfs workspace: status | diff | history | apply | merge | retry | sync | branches | clean",
+    description: "minilfs workspace: status | diff | history | apply | merge | retry | sync | branches | clean | recover",
     getArgumentCompletions: (prefix: string) => {
       const typed = prefix.trim();
       if (SUBCOMMANDS.some(([n]) => n === typed || typed.startsWith(`${n} `))) return null;
@@ -507,6 +510,15 @@ export default function minilfsExtension(pi: ExtensionAPI) {
       if (sub === "clean") {
         const res = await s.cleanScratch();
         return say(`Cleaned scratch build caches at ${res.removedPath}.`);
+      }
+      if (sub === "recover") {
+        if (role.role !== "lead") return say(ONLY_LEAD, "error");
+        const dir = s.recoveryDir;
+        if (!dir) return say("No pending git recovery: apply is not blocked.");
+        if (!argv.includes("--clear")) return say(`An earlier apply could not finish putting your folder's git metadata back; its previous versions are in ${dir} (manifest.json lists them). Check the folder's git (git status, git fsck), restore what is needed, then run /minilfs recover --clear.`, "warning");
+        const r = await s.clearRecovery();
+        status(ctx, describe(s));
+        return say(`Cleared the pending git recovery${r.cleared ? ` (${r.cleared} removed)` : ""}; /minilfs apply runs again.`);
       }
       if (sub === "apply") {
         if (role.role !== "lead") return say(ONLY_LEAD, "error");

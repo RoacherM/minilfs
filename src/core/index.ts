@@ -116,6 +116,7 @@ export {
   LAYERFS_APPLY_TOOL_SCHEMA,
   LAYERFS_TOOL_DESCRIPTION,
   LAYERFS_TOOL_SCHEMA,
+  ONLY_LEAD,
   type LayerfsActionHooks,
   type LayerfsActionParams,
 } from "./tools.ts";
