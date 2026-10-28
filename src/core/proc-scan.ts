@@ -130,17 +130,18 @@ export function leftovers(rows: ProcRow[], opts: { pgid?: number; sinceUs: numbe
  * before (time has passed since the listing; the pid may now be another process), in one libproc
  * call for the whole batch (one python per pid would be too slow with many holders), with nothing
  * else between that lookup and the signals. A lookup that cannot run signals nothing. Never this
- * process or its parent. Returns how many were signalled.
+ * process or its parent. Returns how many were signalled (with `which`: the pids signalled).
  */
-export function killAll(rows: Array<Pick<ProcRow, "pid" | "startSec" | "startUsec">>, sig: NodeJS.Signals = "SIGKILL"): number {
+export function killAll(rows: Array<Pick<ProcRow, "pid" | "startSec" | "startUsec">>, sig?: NodeJS.Signals): number;
+export function killAll(rows: Array<Pick<ProcRow, "pid" | "startSec" | "startUsec">>, sig: NodeJS.Signals, which: true): Set<number>;
+export function killAll(rows: Array<Pick<ProcRow, "pid" | "startSec" | "startUsec">>, sig: NodeJS.Signals = "SIGKILL", which = false): number | Set<number> {
+  const done = new Set<number>();
   const targets = rows.filter((r) => r.pid > 1 && r.pid !== process.pid && r.pid !== process.ppid);
-  if (!targets.length) return 0;
-  const now = procStartTimes(targets.map((r) => r.pid));
-  let n = 0;
+  const now = targets.length ? procStartTimes(targets.map((r) => r.pid)) : null;
   for (const r of targets) {
     const cur = now?.get(r.pid);
     if (!cur || cur.startSec !== r.startSec || cur.startUsec !== r.startUsec) continue;
-    try { process.kill(r.pid, sig); n++; } catch {}
+    try { process.kill(r.pid, sig); done.add(r.pid); } catch {}
   }
-  return n;
+  return which ? done : done.size;
 }

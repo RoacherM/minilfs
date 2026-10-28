@@ -537,6 +537,82 @@ try {
     } finally { ps.procScan.python = realPython; try { child.kill("SIGKILL"); } catch {} }
   });
 
+  await step("N3 a ref named refs/minilfs moves rescues to refs/minilfs-rescue/, which later merges still recognise", async () => {
+    const g = await import("../src/gitpaths.ts");
+    const oid = "1".repeat(40), other = "2".repeat(40);
+    let ex = new Map([["refs/minilfs", other]]);
+    const a = g.allocateRescueRef(ex, "refs/minilfs/w1/heads/main", oid);
+    assert.deepEqual(a, { kind: "kept", ref: "refs/minilfs-rescue/w1/heads/main" });
+    assert.equal(g.isRescueRef(a.ref), true);
+    assert.equal(g.expectedType(a.ref), "commit");
+    // refs/minilfs-rescue taken by a ref too: the next name, still a rescue namespace
+    ex = new Map([["refs/minilfs", other], ["refs/minilfs-rescue", other]]);
+    const b = g.allocateRescueRef(ex, "refs/minilfs/w1/HEAD", oid);
+    assert.deepEqual(b, { kind: "kept", ref: `refs/minilfs-rescue-${oid.slice(0, 12)}/w1/HEAD` });
+    assert.equal(g.isRescueRef(b.ref), true);
+    assert.equal(g.expectedType(b.ref), "commit");
+    // a ref below refs/minilfs/ blocks: the component is renamed inside refs/minilfs/
+    ex = new Map([["refs/minilfs/w1", other]]);
+    const c = g.allocateRescueRef(ex, "refs/minilfs/w1/heads/main", oid);
+    assert.deepEqual(c, { kind: "kept", ref: `refs/minilfs/w1-${oid.slice(0, 12)}/heads/main` });
+    assert.equal(g.isRescueRef(c.ref), true);
+    for (const r of ["refs/heads/x", "refs/tags/t", "refs/minilfsx/a", "refs/minilfs-other/a"]) assert.equal(g.isRescueRef(r), false, r);
+    assert.equal(g.expectedType(`refs/minilfs-rescue-${oid}-2/w/heads/x`), "commit");
+    assert.equal(g.expectedType("refs/minilfs-rescue/w/tags/t"), "any");
+  });
+
+  await step("N6 an unmount that never answers ends at its deadline (lease kept); a mount holder that cannot be signalled is reported", async () => {
+    const { resolveConfig } = await import("../src/config.ts");
+    // 1. workspace.unmount never answers
+    const logs = [];
+    const s = new ws.LayerfsSession(dir, "n6", { ...resolveConfig({}), unmountDeadlineMs: 50 }, (m) => logs.push(m), { reapWorkspaceHolders: async () => {} });
+    let removed = false;
+    s.leases = { read: () => ({ pid: process.pid }), remove: () => { removed = true; } };
+    const lfs = { workspace: { unmount: () => new Promise(() => {}) } };
+    const t0 = Date.now();
+    const done = s.releaseWorkspace({ sandbox: "x", path: "/nonexistent/minilfs-n6" }, "/nonexistent/minilfs-n6", false, process.pid, lfs);
+    const r = await Promise.race([done.then(() => "done"), new Promise((res) => setTimeout(() => res("hung"), 5000))]);
+    assert.equal(r, "done", "releaseWorkspace finished");
+    assert.ok(Date.now() - t0 < 3000, `${Date.now() - t0} ms`);
+    assert.match(logs.join("\n"), /UnmountDeadline/, logs.join("\n"));
+    assert.equal(removed, false, "the lease stays (LayerFS may still hold the Workspace)");
+    // 2. a holder whose start time is after the listing (it started during lsof): not signalled, reported
+    const { spawn } = await import("node:child_process");
+    const { realpathSync, chmodSync } = await import("node:fs");
+    const ps = await import("../src/core/proc-scan.ts");
+    const { LocalNativeDriver } = await import("../src/core/driver.ts");
+    mkdirSync(join(dir, "n6-hold"), { recursive: true });
+    const holdDir = realpathSync(join(dir, "n6-hold"));
+    const child = spawn("/bin/sleep", ["600.62"], { cwd: holdDir, stdio: "ignore" });
+    const fake = join(dir, "n6-python3");
+    writeFileSync(fake, `#!/usr/bin/python3\nimport subprocess, sys, json\nr = subprocess.run(["/usr/bin/python3"] + sys.argv[1:], capture_output=True, text=True)\nif r.returncode: sys.exit(r.returncode)\nrows = json.loads(r.stdout)\nfor x in rows:\n  if x[0] == ${child.pid}: x[3] += 3600\nprint(json.dumps(rows))\n`);
+    chmodSync(fake, 0o755);
+    const realPython = ps.procScan.python;
+    try {
+      await new Promise((res) => setTimeout(res, 150));
+      ps.procScan.python = fake;
+      await assert.rejects(new LocalNativeDriver().reapWorkspaceHolders(holdDir), (e) => e.message.includes(String(child.pid)) && /not signalled/.test(e.message));
+      assert.equal(child.exitCode === null && child.signalCode === null, true, "never signalled");
+    } finally { ps.procScan.python = realPython; try { child.kill("SIGKILL"); } catch {} }
+  });
+
+  await step("N7 an outside directory listing is bounded (EFBIG beyond the entry or byte cap)", async () => {
+    const { resolveConfig } = await import("../src/config.ts");
+    const t = `/tmp/minilfs-n7-${Date.now().toString(36)}`;
+    mkdirSync(join(t, "proj"), { recursive: true });
+    mkdirSync(join(t, "many"));
+    for (let i = 0; i < 10; i++) writeFileSync(join(t, "many", `f${i}`), "");
+    const saved = { ...ws.OUTSIDE_READDIR_LIMITS };
+    try {
+      const s = new ws.LayerfsSession(join(t, "proj"), "n7", { ...resolveConfig({}), root: join(t, "root") });
+      assert.equal((await s.readdir(join(t, "many"))).length, 10);
+      ws.OUTSIDE_READDIR_LIMITS.entries = 5;
+      await assert.rejects(s.readdir(join(t, "many")), (e) => e.code === "EFBIG");
+      Object.assign(ws.OUTSIDE_READDIR_LIMITS, saved, { bytes: 8 });
+      await assert.rejects(s.readdir(join(t, "many")), (e) => e.code === "EFBIG");
+    } finally { if (ws.OUTSIDE_READDIR_LIMITS) Object.assign(ws.OUTSIDE_READDIR_LIMITS, saved); rmSync(t, { recursive: true, force: true }); }
+  });
+
   await step("S13 sessionAlive checks the recorded start time for this process's own pid too", async () => {
     const { hostname } = await import("node:os");
     const { procStartTime } = await import("../src/core/proc-scan.ts");

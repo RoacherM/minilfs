@@ -10,7 +10,7 @@ import { createProjectClient, ensureNativeDirs, initProjectClient, type NativeSp
 import { resolveExecutionDriver, stopDaemonProcesses, type ExecutionDriver } from "./core/driver.ts";
 import { run } from "./core/exec-helper.ts";
 import { bothSpellings, buildSeatbeltProfile } from "./seatbelt.ts";
-import { allocateRescueRef, decideGitPath, expectedType, GIT_APPLY_ORDER, GIT_JOIN_HINT, gitChangeSummary, gitPathKind, gitSig, isProtectedPath, isValidGitRefName, parseIndexEntries, isSafeRefName, MERGE_UNITS, resolveGitPath, scanGitLayout, type GitLayout, type GitPathKind } from "./gitpaths.ts";
+import { allocateRescueRef, decideGitPath, expectedType, isRescueRef, GIT_APPLY_ORDER, GIT_JOIN_HINT, gitChangeSummary, gitPathKind, gitSig, isProtectedPath, isValidGitRefName, parseIndexEntries, isSafeRefName, MERGE_UNITS, resolveGitPath, scanGitLayout, type GitLayout, type GitPathKind } from "./gitpaths.ts";
 import { isOrphan, MountLeases } from "./mount-leases.ts";
 import { GIT_JOIN_SCRIPT, parseJoin, symbolicHead, type JoinResult } from "./gitjoin.ts";
 import { stopWorkers } from "./core/worker.ts";
@@ -157,6 +157,8 @@ type Log = (msg: string) => void;
  * units (MERGE_UNITS, src/gitpaths.ts), each taken whole from one side, never mixed file by file.
  */
 export const LWW_DEFAULT = "%include .gitignore\n";
+/** How long one workspace.unmount may take before releaseWorkspace moves on (retry with discard, then the forced OS unmount). */
+export const UNMOUNT_DEADLINE_MS = 30_000;
 /** Workspaces one LayerFS Sandbox holds (workspace.mount answers Capacity beyond it). */
 const SANDBOX_CAPACITY = 16;
 const HOMES = [...new Set([homedir(), (() => { try { return realpathSync(homedir()); } catch { return homedir(); } })()])];
@@ -172,16 +174,30 @@ const sha = (b: Buffer | string) => createHash("sha256").update(b).digest("hex")
  * file-read-data (unlike stat), so Seatbelt's denial applies to directories too; O_NONBLOCK: a FIFO
  * never hangs the call. A read is bounded: at most OUTSIDE_READ_MAX bytes (EFBIG beyond, also for a
  * file that grows while read), no device but /dev/null (/dev/zero, /dev/random never end; a disk
- * is no file), nothing but regular files and /dev/null (a FIFO or socket: EINVAL).
+ * is no file), nothing but regular files and /dev/null (a FIFO or socket: EINVAL). A listing is
+ * bounded too: at most OUTSIDE_READDIR_MAX_ENTRIES names and OUTSIDE_READDIR_MAX_BYTES of them
+ * (EFBIG beyond), read one by one.
  */
 const OUTSIDE_READ_MAX = 64 * 1024 * 1024;
+export const OUTSIDE_READDIR_LIMITS = { entries: 100_000, bytes: 16 * 1024 * 1024 };
 const OUTSIDE_READ_PL = String.raw`
 use Fcntl qw(O_RDONLY O_NONBLOCK);
-my ($op, $p, $max) = @ARGV;
+my ($op, $p, $max, $maxn, $maxb) = @ARGV;
 sub fail { my ($c) = grep { $!{$_} } keys %!; print STDERR (($c || "EACCES") . ":$!\n"); exit 1 }
 sub refuse { print STDERR "$_[0]\n"; exit 1 }
 binmode(STDOUT);
-if ($op eq "readdir") { opendir(my $d, $p) or fail(); print join("\0", sort grep { $_ ne "." && $_ ne ".." } readdir($d)); exit 0 }
+if ($op eq "readdir") {
+  opendir(my $d, $p) or fail();
+  my @names; my ($n, $bytes) = (0, 0);
+  while (defined(my $e = readdir($d))) {
+    next if $e eq "." || $e eq "..";
+    $n++; $bytes += length($e) + 1;
+    refuse("EFBIG:directory has more than $maxn entries or $maxb bytes of names") if $n > $maxn || $bytes > $maxb;
+    push @names, $e;
+  }
+  print join("\0", sort @names);
+  exit 0;
+}
 sysopen(my $f, $p, O_RDONLY | O_NONBLOCK) or fail();
 my @st = stat($f) or fail();
 if ($op eq "isDir") { print((-d _) ? "1" : "0"); exit 0 }
@@ -916,7 +932,7 @@ export class LayerfsSession {
     // branch has with the right type (a branch head is a commit), in a fixed order
     const isOid = (o: string) => o.length === oidLen && /^[0-9a-f]+$/.test(o);
     // (a ref the merged branch has at the same commit needs nothing)
-    const candidates = [...refs].filter(([ref, oid]) => isSafeRefName(ref) && isOid(oid) && /^refs\/(heads|tags|minilfs)\//.test(ref) && existing.get(ref) !== oid)
+    const candidates = [...refs].filter(([ref, oid]) => isSafeRefName(ref) && isOid(oid) && (/^refs\/(heads|tags)\//.test(ref) || isRescueRef(ref)) && existing.get(ref) !== oid)
       .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : x[1] < y[1] ? -1 : x[1] > y[1] ? 1 : 0));
     const detached = isOid(lostHead) && lostHead !== (await rawHead(target));
     const types = await this.branchObjectTypes(target, [...candidates.map(([, oid]) => oid), ...(detached ? [lostHead] : [])]);
@@ -938,7 +954,7 @@ export class LayerfsSession {
       if (!verified(ref, oid)) continue;
       if (ref.startsWith("refs/heads/")) {
         want(`refs/minilfs/${safeLabel}/heads/${ref.slice("refs/heads/".length)}`, oid);
-      } else if (ref.startsWith("refs/minilfs/")) {
+      } else if (isRescueRef(ref)) {
         want(ref, oid);
       } else {
         if (!base.has(ref) && !base.has(`${ref}/`)) want(ref, oid);
@@ -1401,7 +1417,7 @@ export class LayerfsSession {
     const abs = resolve(this.cwd, hostPath); // not the realpath: the kernel resolves symlinks at open
     const r = await withOutsideReadSlot(() => {
       outsideReadStats.peak = Math.max(outsideReadStats.peak, outsideReadSlots.active);
-      return run("/usr/bin/sandbox-exec", ["-p", this.outsideReadProfile(), "/usr/bin/perl", "-e", OUTSIDE_READ_PL, op, abs, String(OUTSIDE_READ_MAX)], {
+      return run("/usr/bin/sandbox-exec", ["-p", this.outsideReadProfile(), "/usr/bin/perl", "-e", OUTSIDE_READ_PL, op, abs, String(OUTSIDE_READ_MAX), String(OUTSIDE_READDIR_LIMITS.entries), String(OUTSIDE_READDIR_LIMITS.bytes)], {
         env: { PATH: "/usr/bin:/bin", LANG: "C" }, timeoutMs: 120_000,
       });
     });
@@ -1724,6 +1740,8 @@ export class LayerfsSession {
    * Ends a Workspace so that neither the OS mount nor the daemon's Workspace slot leaks:
    * reap holders, unmount (`discard` as asked), then retry once with discard, then force the
    * OS unmount. The lease stays when LayerFS still holds the Workspace, so a later session retries.
+   * Each unmount has its own deadline (UNMOUNT_DEADLINE_MS; config.unmountDeadlineMs in tests): a
+   * daemon that never answers cannot hold a close or an exec forever.
    */
   private async releaseWorkspace(ws: Workspace, wsReal: string, discard: boolean, owner = process.pid, lfs = this.lfs): Promise<void> {
     await this.reapHolders(wsReal).catch(() => {});
@@ -1731,7 +1749,16 @@ export class LayerfsSession {
     let gone = false;
     for (const d of discard ? [true] : [false, true]) {
       try {
-        await lfs.workspace.unmount(ws, d);
+        const ms = this.config.unmountDeadlineMs ?? UNMOUNT_DEADLINE_MS;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const call = Promise.resolve(lfs.workspace.unmount(ws, d));
+        call.catch(() => {}); // a late answer after the deadline is dropped, never an unhandled rejection
+        try {
+          await Promise.race([
+            call,
+            new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(new Error(`workspace.unmount timed out after ${ms} ms`), { code: "UnmountDeadline" })), ms); }),
+          ]);
+        } finally { clearTimeout(timer); }
         err = null;
         break;
       } catch (e: any) {
@@ -3067,6 +3094,16 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
     // forgotten only once removed: a lock whose removal failed is still ours for the rollback
     if (held.has(lockOf(rel))) { await fsp.rm(lockOf(rel), { force: true }); held.delete(lockOf(rel)); }
   };
+  /**
+   * Removes one of our locks where no rollback follows; a lock that stays blocks git on that path,
+   * so a failure is reported (never swallowed): returned, and a warning unless `quiet`.
+   */
+  const unlockWarn = async (lockPath: string, quiet = false): Promise<string | null> => {
+    const why = await fsp.rm(lockPath, { force: true }).then(() => null, (e: any) => `could not remove ${relative(cwd, lockPath)}: ${e?.message ?? e}`);
+    held.delete(lockPath);
+    if (why && !quiet) recovery.warnings.push(`${why} (git refuses that path until it is removed)`);
+    return why;
+  };
   const removeCreatedDirs = async () => {
     for (const d of [...createdDirs].sort((a, b) => depth(b) - depth(a))) await fsp.rmdir(join(cwd, d)).catch(() => {});
   };
@@ -3102,8 +3139,13 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
     // locks of deleted paths we still hold stay: their path comes back through them, no window for another writer
     for (const l of [...held]) {
       if ([...unlinked].some((rel) => lockOf(rel) === l)) continue;
-      await fsp.rm(l, { force: true }).then(() => held.delete(l), (e: any) => unrecovered.push({ rel: l, err: String(e?.message ?? e) }));
+      await fsp.rm(l, { force: true }).then(() => held.delete(l), (e: any) => unrecovered.push({ rel: relative(cwd, l), err: `its lock could not be removed: ${e?.message ?? e}` }));
     }
+    /** our lock on `rel` goes; a lock that stays is not put back (git refuses the path): unrecovered */
+    const unlockOrRecord = (rel: string) => unlock(rel).catch((e: any) => {
+      held.delete(lockOf(rel));
+      unrecovered.push({ rel: `${rel}.lock`, err: `could not be removed: ${e?.message ?? e}` });
+    });
     for (const [rel, put] of [...installed].sort((a, b) => depth(b[0]) - depth(a[0]))) {
       const old = prev.get(rel) ?? null;
       let fh: import("node:fs/promises").FileHandle | null = null;
@@ -3130,7 +3172,7 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
         unrecovered.push({ rel, err: String(e?.message ?? e) });
       } finally {
         await fh?.close().catch(() => {});
-        await unlock(rel).catch(() => {});
+        await unlockOrRecord(rel);
       }
     }
     for (const [rel] of installed) if (!prev.get(rel)) await removeEmptyGitRefParents(cwd, rel, layout);
@@ -3156,10 +3198,15 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
         unrecovered.push({ rel, err: String(e?.message ?? e) });
       } finally {
         await fh?.close().catch(() => {});
-        await unlock(rel).catch(() => {});
+        await unlockOrRecord(rel);
       }
     }
     await removeCreatedDirs();
+    // every lock of ours is gone by now; one that is not (or cannot be removed) is reported
+    for (const l of [...held]) {
+      const why = await unlockWarn(l, true);
+      if (why) unrecovered.push({ rel: relative(cwd, l), err: why });
+    }
     if (hostKept.length) recovery.warnings.push(`your folder's git updated ${hostKept.join(", ")} while apply was putting git metadata back; its value was kept`);
     if (!unrecovered.length) return forget();
     // the folder's git metadata cannot be fully put back: its previous versions were saved before the
@@ -3212,8 +3259,7 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
   };
   /** nothing changed in the folder yet: our locks and folders go, nothing else to undo */
   const release = async () => {
-    for (const l of held) await fsp.rm(l, { force: true }).catch(() => {});
-    held.clear();
+    for (const l of [...held]) await unlockWarn(l);
     await removeCreatedDirs();
     await forget();
   };
@@ -3263,8 +3309,9 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
       held.delete(lockOf(w.rel));
       installed.set(w.rel, { data: next.data, mode: next.mode & 0o7777, git: w.git });
     }
+    // everything is written: a deletion's lock that cannot be removed is reported, nothing is undone
     for (const d of deletes) {
-      await unlock(d.rel);
+      if (held.has(lockOf(d.rel))) await unlockWarn(lockOf(d.rel));
       await removeEmptyGitRefParents(cwd, d.rel, layout);
     }
     await forget();
@@ -3279,7 +3326,7 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
     } else await release();
     throw e;
   } finally {
-    for (const l of held) await fsp.rm(l, { force: true }).catch(() => {});
+    for (const l of [...held]) await unlockWarn(l);
   }
 }
 

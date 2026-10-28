@@ -275,3 +275,5 @@ no; must change N1 and N2.
 | N5 | strictest-wins refuses a real submodule named like `a/rebase-merge/s` (index treated as transient) | Minor |
 | N6 | a holder started during listing is omitted and unresolved holders are not reported; unmount has no own deadline | Minor |
 | N7 | outside `readdir` unbounded; ref names > 255 chars and `.LOCK` rejected beyond check-ref-format | Minor |
+
+N5 accepted as a documented limitation (fourth round): a submodule whose name holds `rebase-merge/`, `rebase-apply/`, `sequencer/` or `rr-cache/` has its refs and index read as transient (never applied), so a fake git layout there can never lower transient to an applied ref or index (comment in `classifyGitTail`, src/gitpaths.ts).

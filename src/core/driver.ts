@@ -326,11 +326,14 @@ export class LocalNativeDriver implements ExecutionDriver {
    * SIGKILLs the processes using the mount, each identified first (identifyListed: started before
    * lsof ran, then re-checked right before the signal by killAll). When they cannot be identified
    * (no python3, a timeout, bad output) nothing is signalled and this throws: the caller's unmount
-   * falls back to discard and the forced OS unmount, which never hit an unrelated process.
+   * falls back to discard and the forced OS unmount, which never hit an unrelated process. A holder
+   * listed but not signalled (it started during lsof, so the pid may name another process, or it
+   * changed identity before the signal) and still running is reported the same way (thrown).
    */
   async reapWorkspaceHolders(wsReal: string): Promise<void> {
     const spellings = bothSpellings(wsReal);
     let unverified = 0;
+    const unresolved = new Set<number>();
     for (const p of spellings) {
       // `lsof <mount point>` lists every process using that file system without walking it;
       // `+D` walked the whole tree over NFS before every unmount (1 s per 20k files).
@@ -341,10 +344,12 @@ export class LocalNativeDriver implements ExecutionDriver {
         if (!pids.length) continue;
         const rows = identifyListed(pids, before);
         if (!rows) { unverified += pids.length; continue; }
-        killAll(rows);
+        const signalled = killAll(rows, "SIGKILL", true) as Set<number>;
+        for (const pid of pids) if (!signalled.has(pid) && pidAlive(pid)) unresolved.add(pid);
       }
     }
     if (unverified) throw new Error(`${unverified} process(es) holding the mount could not be verified (no libproc lookup); none was signalled: holders could not be verified`);
+    if (unresolved.size) throw new Error(`${unresolved.size} process(es) holding the mount (${[...unresolved].join(", ")}) started during lsof or changed identity and were not signalled`);
   }
 
   async stopDaemons(localDir?: string): Promise<void> {
@@ -357,6 +362,11 @@ export class LocalNativeDriver implements ExecutionDriver {
  * identified (started before pgrep ran, a layerfs-daemon executable) and re-checked right before
  * the signal; when they cannot be identified nothing is signalled.
  */
+/** `pid` names a running process (EPERM: it runs, as another user). */
+function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; }
+}
+
 export async function stopDaemonProcesses(localDir?: string): Promise<void> {
   const pattern = localDir ? `layerfs-daemon --config ${localDir}/` : "layerfs-daemon --config ";
   const before = nowUs();

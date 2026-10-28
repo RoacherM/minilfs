@@ -52,6 +52,8 @@ export interface LayerfsConfig {
   storeWorker?: boolean;
   /** overall time limit of one bash call, seconds (MINILFS_BASH_TIMEOUT_S, default 600); the caller's smaller `timeout` wins */
   bashTimeoutS?: number;
+  /** deadline of one workspace.unmount, ms (default UNMOUNT_DEADLINE_MS, 30 s; a seam for tests) */
+  unmountDeadlineMs?: number;
 }
 
 export type MinilfsConfig = LayerfsConfig;

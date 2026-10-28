@@ -95,6 +95,9 @@ export function gitPathKind(rel: string): GitPathKind {
 /** How a path below its own git directory (`refs/heads/x`, `index`, ...) is applied. */
 function classifyGitTail(inner: string): GitPathKind {
   if (/\.(lock|new)$/.test(inner)) return "transient"; // git's temp files: renamed over the real one
+  // Known limitation (accepted): a submodule whose name holds one of these folders (`a/rebase-merge/s`)
+  // has its files read as transient too (strictest wins in resolveGitPath), so its refs and index are
+  // never applied; the other way, a fake git dir inside rebase-merge/ could lower transient to a ref.
   if (/^(rebase-merge|rebase-apply|sequencer|rr-cache)(\/|$)/.test(inner)) return "transient";
   if (/^(FETCH_HEAD|MERGE_[A-Z_]+|AUTO_MERGE|SQUASH_MSG|CHERRY_PICK_HEAD|REVERT_HEAD|REBASE_HEAD|BISECT_[A-Z_]+|gc\.pid|gc\.log)$/.test(inner)) return "transient";
   if (/^objects\/info(\/|$)/.test(inner)) return "transient"; // caches git rebuilds (packs list, commit-graph)
@@ -422,7 +425,10 @@ export function isSafeRefName(name: string): boolean {
  * A full ref name git accepts (the rules of `git check-ref-format`): under refs/, no control
  * character, space or `~^:?*[\\`, no `..`, `@{`, `//`, trailing `/` or `.`, no component that starts
  * with `.` or ends with `.lock`. A name git would refuse is never written to the folder (git would
- * then fail on every command that lists refs).
+ * then fail on every command that lists refs). Stricter than git on purpose: at most 255 characters
+ * (a loose ref is a file path; longer names fail on most file systems, NAME_MAX per component and
+ * deep paths), and `.lock` in any case (`FOO.LOCK` is git's lock file `FOO.lock` on a
+ * case-insensitive APFS/HFS+ disk).
  */
 export function isValidGitRefName(ref: string): boolean {
   if (!ref.startsWith("refs/") || ref.length <= 5 || ref.length > 255) return false;
@@ -432,12 +438,26 @@ export function isValidGitRefName(ref: string): boolean {
 }
 
 /**
+ * The namespaces of minilfs's rescued refs: `refs/minilfs/`, and the places allocateRescueRef moves
+ * them to when a ref named `refs/minilfs` blocks that folder (`refs/minilfs-rescue/`,
+ * `refs/minilfs-rescue-<oid12>/`, `refs/minilfs-rescue-<oid>[-n]/`).
+ */
+const RESCUE_NS = "refs/minilfs(-rescue(-[0-9a-f]+(-[0-9]+)?)?)?/";
+const RESCUE_RX = new RegExp(`^${RESCUE_NS}`);
+const RESCUED_HEAD_RX = new RegExp(`^${RESCUE_NS}[^/]+/(heads/|HEAD$)`);
+
+/** A ref minilfs keeps for a merged Branch (see RESCUE_NS); later merges carry these along. */
+export function isRescueRef(ref: string): boolean {
+  return RESCUE_RX.test(ref);
+}
+
+/**
  * The object type a ref must name: HEAD, branch heads and minilfs's rescues of them a commit; any
  * other ref (tags, notes, ...) anything. For a symbolic ref, every name on its chain counts
  * (`refs/heads/x` -> `refs/tags/t` must still end at a commit).
  */
 export function expectedType(inner: string): "commit" | "any" {
-  return inner === "HEAD" || inner.startsWith("refs/heads/") || /^refs\/minilfs\/[^/]+\/(heads\/|HEAD$)/.test(inner) ? "commit" : "any";
+  return inner === "HEAD" || inner.startsWith("refs/heads/") || RESCUED_HEAD_RX.test(inner) ? "commit" : "any";
 }
 
 export type RescueAllocation = { kind: "kept" | "already"; ref: string };
@@ -448,8 +468,10 @@ export type RescueAllocation = { kind: "kept" | "already"; ref: string };
  * added): `dst`, then `dst-<oid12>`, `dst-<oid>`, `dst-<oid>-2`, `-3`, ... The first name that already
  * holds `oid` means it is kept already; else the first that is free and is neither a folder of refs
  * nor inside a ref (git keeps refs as paths: `foo` and `foo/bar` cannot both exist). A ref above
- * `dst` blocks every suffix, so that component is renamed (`<ancestor>-<oid12>/...`) and the search
- * restarts. Always answers (`existing` is finite): nothing is dropped.
+ * `dst` blocks every suffix, so that component is renamed (`<ancestor>-<oid12>/...`, the first of
+ * its names that is not a ref) and the search restarts; a ref named `refs/minilfs` itself moves the
+ * rescue to `refs/minilfs-rescue[...]/`, so it stays a rescue (isRescueRef) for later merges.
+ * Always answers (`existing` is finite): nothing is dropped.
  */
 export function allocateRescueRef(existing: Map<string, string>, dst: string, oid: string): RescueAllocation {
   const names = function* (d: string) {
@@ -475,6 +497,10 @@ export function allocateRescueRef(existing: Map<string, string>, dst: string, oi
     }
     // the suffix never leaves the ancestor's subtree (a suffix has no `/`): rename that component
     if (!ancestor || ancestor.split("/").length < 2) throw new Error(`no place for ${dst}: ${ancestor} is a ref`);
-    dst = `${ancestor}-${oid.slice(0, 12)}${dst.slice(ancestor.length)}`;
+    // the first name for it that is no ref itself (a folder of refs there is fine: dst goes inside it)
+    const from = ancestor === "refs/minilfs" ? "refs/minilfs-rescue" : ancestor;
+    let alt = from;
+    for (const c of names(from)) if (!(existing.has(c) && !c.endsWith("/"))) { alt = c; break; }
+    dst = `${alt}${dst.slice(ancestor.length)}`;
   }
 }

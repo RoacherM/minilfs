@@ -155,6 +155,7 @@ await session.open();
 | `/minilfs merge <branch> [--ours\|--theirs]` | merge another branch into yours (with automatic path-wise fallback merge) |
 | `/minilfs clean` | remove temporary scratch build caches for this project |
 | `/minilfs retry` | retry after a failed checkpoint |
+| `/minilfs recover [--clear]` | after an apply that could not finish changing the folder's git: where its previous versions are; `--clear` (once you checked the folder's git) lets apply run again |
 
 ---
 

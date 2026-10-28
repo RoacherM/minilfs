@@ -26,6 +26,7 @@ export {
   allocateRescueRef,
   decideGitPath,
   expectedType,
+  isRescueRef,
   gitChangeSummary,
   gitPathKind,
   isValidGitRefName,

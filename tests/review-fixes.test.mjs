@@ -1659,6 +1659,32 @@ try {
     noLocks(cwd);
   });
 
+  await step("N4 a lock of ours that cannot be removed is reported, not swallowed", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c0"); g("commit", "-q", "--allow-empty", "-m", "c1"); g("branch", "a"); g("branch", "b");
+    const c0 = g("rev-parse", "HEAD~1").stdout.trim();
+    const s = await open(cwd, "n4");
+    await s.mutate("1", "bash", () => s.exec("git branch -f a HEAD~1 && git branch -f b HEAD~1", cwd, out()));
+    // the folder's git moves b while apply holds a's lock (nothing changed yet: release), and a.lock cannot be removed
+    const realOpen = fsp.open, realRm = fsp.rm;
+    const aLock = join(cwd, ".git/refs/heads/a.lock");
+    fsp.open = async (...args) => {
+      if (String(args[0]).endsWith(".git/refs/heads/b.lock")) writeFileSync(join(cwd, ".git/refs/heads/b"), `${c0}\n`);
+      return realOpen.apply(fsp, args);
+    };
+    fsp.rm = async (...args) => {
+      if (String(args[0]) === aLock) throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+      return realRm.apply(fsp, args);
+    };
+    let ap;
+    try { ap = await s.apply(); } finally { fsp.open = realOpen; fsp.rm = realRm; }
+    const w = ap.warnings.join("\n");
+    assert.match(w, /moved while applying \(\.git\/refs\/heads\/b changed\)/, w);
+    assert.match(w, /could not remove \.git\/refs\/heads\/a\.lock: permission denied/, w);
+    rmSync(aLock, { force: true });
+  });
+
   await step("F7 a git join whose ref update fails and whose index cannot be put back is discarded: the Branch's .git (index) stays the kept side's", async () => {
     const cwd = project();
     const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
