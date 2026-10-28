@@ -139,6 +139,31 @@ for line in subprocess.run(["git", "-C", root, "for-each-ref", "--format=%(refna
     name, oid = line.split("|")
     refs[name] = oid
 
+# ---- roles: the lead's subagent calls name the role in the task ("You are worker **P1**" or
+# "You are **P1**"); newer pi-subagents redact the prompt in the transcript, so map run id -> role
+ROLE_RX = re.compile(r"You are (?:worker )?\**(P[123]|X[12]|S[12]|C)\b")
+role_by_run = {}
+for f in glob.glob(os.path.join(sessions, "*", "*.jsonl")):
+    tasks = {}
+    with open(f) as fh:
+        for line in fh:
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            m = e.get("message") or {}
+            if m.get("role") == "assistant":
+                for c in m.get("content", []):
+                    if c.get("type") == "toolCall" and c.get("name") == "subagent":
+                        r = ROLE_RX.search(str((c.get("arguments") or {}).get("task", "")))
+                        if r:
+                            tasks[c["id"]] = r.group(1)
+            elif m.get("role") == "toolResult" and m.get("toolCallId") in tasks:
+                d = m.get("details") or {}
+                run = d.get("asyncId") or d.get("runId")
+                if run:
+                    role_by_run[run] = tasks[m["toolCallId"]]
+
 # ---- sub-agent transcripts: who, when, which branch
 workers = []
 for f in sorted(glob.glob(os.path.join(sessions, "*", "subagent-artifacts", "*_transcript.jsonl"))):
@@ -152,13 +177,14 @@ for f in sorted(glob.glob(os.path.join(sessions, "*", "subagent-artifacts", "*_t
             if e.get("timestamp"):
                 ts.append(local(e["timestamp"]))
             if role is None:
-                m = re.search(r"You are worker (P[123]|X[12]|S[12]|C)\b", line)
+                m = ROLE_RX.search(line)
                 if m:
                     role = m.group(1)
             for m in re.finditer(r"branch: (s-[0-9a-f]{10}-\d+)", line):
                 branch = m.group(1)
             tools += line.count('"type":"toolCall"')
             gitc += len(re.findall(r"git commit", line))
+    role = role or role_by_run.get(os.path.basename(f).split("_")[0])
     if ts and role:
         acts = actions_of(f)
         files = {}
@@ -202,7 +228,7 @@ for f in lead_files:
                     gitnote = "both sides ran git" in text
                     events.append({"t": t, "kind": "merge", "branch": args.get("branch"), "conflict": conflict, "gitNote": gitnote})
                 elif name == "subagent" and args.get("async") and args.get("task"):
-                    m2 = re.search(r"You are worker (P[123]|X[12]|S[12]|C)\b", args["task"])
+                    m2 = ROLE_RX.search(args["task"])
                     events.append({"t": t, "kind": "spawn", "role": m2.group(1) if m2 else "?"})
 
 # ---- rounds from PROGRESS.md (headings only)

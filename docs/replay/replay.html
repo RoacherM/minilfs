@@ -134,9 +134,11 @@
   // a commit's lane: its author when it is a worker name, else the lane of the ref that holds it
   const laneOf = {};
   const authorLane = (a) => {
-    const m = /^(P[123]|X[12]|S[12])\b/.exec(a);
-    if (m) return m[1];
-    if (/corpus|RoacherM/i.test(a)) return "C";
+    // worker names as authors (X1, s2, ...); other authors (the user's global git identity when a
+    // worker committed without -c user.name) are placed by the Branch ref that holds the commit
+    const m = /^(P[123]|X[12]|S[12])\b/i.exec(a);
+    if (m) return m[1].toUpperCase();
+    if (/corpus/i.test(a)) return "C";
     return null;
   };
   // walk back from each worker ref until main's first-parent chain
@@ -424,7 +426,8 @@
 
   $("sub").textContent = `${fmt(tStart)} → ${fmt(tEnd)}${D.ended ? "" : "（运行中，数据截至 " + fmt(D.generatedAt) + "）"} · ${D.workers.length} 个 worker 会话 · ${D.commits.length} 个 commit`;
   build();
-  setPlaying(true);
+  // #end opens on the final state (for a static look or a screenshot); otherwise play from the start
+  if (location.hash === "#end") { now = tEnd; render(true); } else setPlaying(true);
 })();
 </script>
 </body>
