@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { constants as fsc, createReadStream, promises as fsp, realpathSync } from "node:fs";
+import { constants as fsc, createReadStream, existsSync, promises as fsp, realpathSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { ensureBundle, missingBundleFiles } from "./bundle.ts";
@@ -2087,6 +2087,12 @@ export class LayerfsSession {
       throw new Error(`cannot apply while a checkpoint is pending (${this.blocked.reason}); run /minilfs retry`);
     }
     return this.bindings.withProjectLock(this.projectRecord.name, async (guard) => {
+      // an earlier apply (any session of this project) could not put the folder's git metadata back
+      const recDir = this.bindings.byName(this.projectRecord.name)?.recoveryDir;
+      if (recDir && existsSync(recDir)) {
+        throw new LayerfsError("RecoveryPending", `an earlier apply could not finish putting your folder's git metadata (refs, HEAD, index) back; their previous versions are saved in ${recDir} (see manifest.json there). Check the folder's git, restore what is needed from that folder, then remove it to apply again.`);
+      }
+      if (recDir) this.bindings.setRecoveryDir(this.projectRecord.name, null); // removed: dealt with
       const result: ApplyResult = { applied: [], skipped: [], conflicts: [], unchanged: [], warnings: [] };
       const snapRef = this.headCommit ?? this.baseRef;
       this.seq++;
@@ -2271,7 +2277,7 @@ export class LayerfsSession {
           const missing = await gitObjectsMissing(this.cwd, gitMeta, layout);
           const locked = gitMeta.filter((g) => g.git !== "soft");
           if (!missing) hostTouched = true;
-          const moved = missing ? null : await writeGitLocked(this.cwd, locked, layout);
+          const moved = missing ? null : await writeGitLocked(this.cwd, locked, layout, { root: join(this.config.root, "recovery"), project: this.projectRecord.name, warnings: result.warnings });
           if (missing) dropMeta(`the Branch's git names objects your folder does not have (${missing})`);
           else if (moved) dropMeta(`your folder's git moved while applying (${moved})`);
           else {
@@ -2298,6 +2304,8 @@ export class LayerfsSession {
         if (gitSummary) result.git = gitSummary;
       } catch (e: any) {
         for (const t of tmps) await fsp.rm(t, { force: true }).catch(() => {});
+        // the folder's git metadata could not be put back: no apply until the saved versions are dealt with
+        if (e?.code === "RollbackIncomplete" && e.recoveryDir) this.bindings.setRecoveryDir(this.projectRecord.name, e.recoveryDir);
         this.bindings.writeHostIndex(this.projectRecord.name, hostIndex);
         if (result.applied.length || hostTouched) this.bindings.setMainStale(this.projectRecord.name, true);
         const err = new LayerfsError(e?.code ?? "PartialApply", `apply stopped after ${result.applied.length} file(s): ${e?.message ?? e}`);
@@ -2783,36 +2791,57 @@ async function gitObjectsMissing(cwd: string, meta: GitWrite[], layout?: GitLayo
   return null;
 }
 
+/** Where writeGitLocked saves the folder's git metadata when a rollback cannot finish, and where it reports. */
+type GitRecovery = { root: string; project: string; warnings: string[] };
+
 /**
  * Writes refs, HEAD and the index the way git does, so a git command running in the folder at the
  * same time is never overwritten: `<path>.lock` taken exclusively for every path first (sorted),
- * the folder's version checked again under the lock, the new bytes written into the lock file; then
- * deletions (deepest first), then each lock renamed over its path (refs, then the index, then HEAD).
- * A ref namespace change works both ways: a ref below a deleted ref (`foo` -> `foo/bar`) takes its
- * lock after the deletion; a ref over a folder of deleted refs (`foo/bar` -> `foo`) is renamed once
- * the folder is empty. Anything that fails after the first change puts every touched path back to
- * the bytes it had (all or nothing). Returns why nothing was written (a lock git holds, a path that
- * moved), or null when all were written; an I/O error is thrown after the rollback.
+ * the folder's version checked again under the lock, the new bytes written into the lock file.
+ * Only then does anything in the folder change: deletions, then each lock renamed over its path
+ * (refs, then the index, then HEAD). A ref namespace change works both ways: a ref below a deleted
+ * ref (`foo` -> `foo/bar`) takes its lock once that ref is deleted (the only deletions made before
+ * every lock is held); a ref over a folder of deleted refs (`foo/bar` -> `foo`) is renamed once the
+ * folder is empty. Returns why nothing was written (a lock git holds, a path that moved), or null
+ * when all were written; an I/O error is thrown. Either way after a change, everything is put back
+ * (rollback): never over a value the folder's git wrote meanwhile (that one is kept, with a
+ * warning), and when something cannot be put back the folder's previous git metadata is saved under
+ * `<root>/recovery/<project>-<time>` and RollbackIncomplete is thrown (apply then refuses until that
+ * folder is dealt with).
  */
-async function writeGitLocked(cwd: string, items: GitWrite[], layout?: GitLayout): Promise<string | null> {
+async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout | undefined, recovery: GitRecovery): Promise<string | null> {
   const depth = (r: string) => r.split("/").length;
   const below = (a: string, b: string) => a.startsWith(`${b}/`);
+  const byName = (a: { rel: string }, b: { rel: string }) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0);
   const deletes = items.filter((i) => !i.next).sort((a, b) => depth(b.rel) - depth(a.rel));
-  const writes = items.filter((i) => i.next).sort((a, b) =>
-    GIT_APPLY_ORDER[a.git] - GIT_APPLY_ORDER[b.git] || depth(a.rel) - depth(b.rel) || (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+  const writes = items.filter((i) => i.next).sort((a, b) => GIT_APPLY_ORDER[a.git] - GIT_APPLY_ORDER[b.git] || depth(a.rel) - depth(b.rel) || byName(a, b));
   // locked only once the ref file in their way is deleted
   const deferred = new Set(writes.filter((w) => deletes.some((d) => below(w.rel, d.rel))));
   // renamed over a folder the deletions empty
   const overDir = new Set(writes.filter((w) => deletes.some((d) => below(d.rel, w.rel))));
+  // the deletions that must happen before every lock is held; the others wait for step 4
+  const blocking = new Set(deletes.filter((d) => [...deferred].some((w) => below(w.rel, d.rel)) || [...overDir].some((w) => below(d.rel, w.rel))));
   const held = new Set<string>();
-  /** what each path held before (null: absent), for the rollback */
+  /** what each locked path held before (null: absent) */
   const prev = new Map<string, { data: Buffer; mode: number } | null>();
-  const touched: string[] = [];
+  /** folders this call created (to take a lock below a deleted ref), shallowest first */
+  const createdDirs: string[] = [];
+  /** paths deleted, and paths renamed into place with exactly these bytes */
+  const unlinked = new Set<string>();
+  const installed = new Map<string, { data: Buffer; mode: number; git: GitPathKind }>();
   const lockOf = (rel: string) => `${join(cwd, rel)}.lock`;
+  const ensureDir = async (relDir: string) => {
+    let cur = "";
+    for (const c of relDir.split("/")) {
+      cur = cur ? `${cur}/${c}` : c;
+      const made = await fsp.mkdir(join(cwd, cur)).then(() => true, (e: any) => (e?.code === "EEXIST" ? false : Promise.reject(e)));
+      if (made) createdDirs.push(cur);
+    }
+  };
   /** takes `it`'s lock and checks the folder still has `it.host`; null when taken, else why not */
   const take = async (it: GitWrite): Promise<string | null> => {
     const target = join(cwd, it.rel);
-    await fsp.mkdir(dirname(target), { recursive: true });
+    await ensureDir(posix.dirname(it.rel));
     const mode = it.next?.kind === "file" ? it.next.mode & 0o7777 : 0o644;
     const fh = await fsp.open(`${target}.lock`, "wx", mode).catch((e: any) => (e?.code === "EEXIST" ? null : Promise.reject(e)));
     if (!fh) return `${it.rel}.lock exists: git is running there`;
@@ -2835,34 +2864,146 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout?: GitLayout
   const unlock = async (rel: string) => {
     if (held.delete(lockOf(rel))) await fsp.rm(lockOf(rel), { force: true });
   };
+  const removeCreatedDirs = async () => {
+    for (const d of [...createdDirs].sort((a, b) => depth(b) - depth(a))) await fsp.rmdir(join(cwd, d)).catch(() => {});
+  };
+  /**
+   * git's lock on `rel` again, waiting up to 2 s while git holds it (briefly, usually). Still held:
+   * thrown, so the path counts as not put back (git may yet give up and leave our value there)
+   */
+  const relock = async (rel: string, mode: number) => {
+    for (let i = 0; ; i++) {
+      try { return await fsp.open(lockOf(rel), "wx", mode); } catch (e: any) {
+        if (e?.code !== "EEXIST" || i >= 40) throw e?.code === "EEXIST" ? new Error(`${rel}.lock is held by git`) : e;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+  };
+  /** `old` into `rel` through the open lock `fh` (closed here) */
+  const putBack = async (fh: import("node:fs/promises").FileHandle, rel: string, old: { data: Buffer; mode: number }) => {
+    try {
+      await fh.writeFile(old.data);
+      await fh.chmod(old.mode & 0o7777);
+    } finally { await fh.close(); }
+    await fsp.rename(lockOf(rel), join(cwd, rel));
+  };
+  /**
+   * Puts the folder back as it was, without overwriting what its git wrote meanwhile (compare and
+   * swap under git's lock). Order: the paths renamed into place, then the folders this call created
+   * (now empty: their locks are gone and the new refs in them removed), then the deleted paths
+   * (`foo` comes back once `foo/deep/` is gone; `foo/bar` once the ref `foo` over it is gone).
+   */
   const rollback = async () => {
+    const unrecovered: Array<{ rel: string; err: string }> = [];
+    const hostKept: string[] = [];
+    // locks of deleted paths we still hold stay: their path comes back through them, no window for another writer
+    for (const l of [...held]) {
+      if ([...unlinked].some((rel) => lockOf(rel) === l)) continue;
+      await fsp.rm(l, { force: true }).then(() => held.delete(l), (e: any) => unrecovered.push({ rel: l, err: String(e?.message ?? e) }));
+    }
+    for (const [rel, put] of [...installed].sort((a, b) => depth(b[0]) - depth(a[0]))) {
+      const old = prev.get(rel) ?? null;
+      let fh: import("node:fs/promises").FileHandle | null = null;
+      try {
+        fh = await relock(rel, old?.mode ?? 0o644);
+        held.add(lockOf(rel));
+        const cur = await readRawEntry(join(cwd, rel));
+        // still what we wrote? the index by its entries (a `git status` meanwhile only refreshes its stat data)
+        const ours = cur && cur !== "other" && "data" in cur && (cur.mode & 0o7777) === (put.mode & 0o7777)
+          && (put.git === "index" ? gitSig("index", cur) === gitSig("index", put) : cur.data.equals(put.data));
+        if (!ours) {
+          hostKept.push(rel); // the folder's git moved it after our rename: its value stays
+          continue;
+        }
+        if (!old) {
+          await fsp.rm(join(cwd, rel), { force: true });
+          continue;
+        }
+        const f = fh;
+        fh = null;
+        await putBack(f, rel, old);
+        held.delete(lockOf(rel));
+      } catch (e: any) {
+        unrecovered.push({ rel, err: String(e?.message ?? e) });
+      } finally {
+        await fh?.close().catch(() => {});
+        await unlock(rel).catch(() => {});
+      }
+    }
+    for (const [rel] of installed) if (!prev.get(rel)) await removeEmptyGitRefParents(cwd, rel, layout);
+    await removeCreatedDirs();
+    for (const rel of [...unlinked].sort((a, b) => depth(a) - depth(b))) {
+      const old = prev.get(rel) ?? null;
+      if (!old) continue;
+      const target = join(cwd, rel);
+      let fh: import("node:fs/promises").FileHandle | null = null;
+      try {
+        if ((await fsp.lstat(target).catch(() => null))?.isDirectory()) await fsp.rmdir(target); // fails when not empty: unrecovered
+        await fsp.mkdir(dirname(target), { recursive: true });
+        fh = held.has(lockOf(rel)) ? await fsp.open(lockOf(rel), "w", old.mode & 0o7777) : await relock(rel, old.mode & 0o7777);
+        held.add(lockOf(rel));
+        const cur = await readRawEntry(target);
+        if (cur && cur !== "other" && "data" in cur && cur.data.equals(old.data)) continue; // already as it was
+        if (cur !== null) { hostKept.push(rel); continue; } // the folder's git made it again meanwhile
+        const f = fh;
+        fh = null;
+        await putBack(f, rel, old);
+        held.delete(lockOf(rel));
+      } catch (e: any) {
+        unrecovered.push({ rel, err: String(e?.message ?? e) });
+      } finally {
+        await fh?.close().catch(() => {});
+        await unlock(rel).catch(() => {});
+      }
+    }
+    await removeCreatedDirs();
+    if (hostKept.length) recovery.warnings.push(`your folder's git updated ${hostKept.join(", ")} while apply was putting git metadata back; its value was kept`);
+    if (!unrecovered.length) return;
+    // the folder's git metadata cannot be fully put back: keep every previous version, then refuse further applies
+    const recDir = join(recovery.root, `${recovery.project}-${Date.now()}`);
+    let saved = "";
+    try {
+      // the manifest first: the folder exists (and blocks the next apply) even when a preimage cannot be saved
+      const absentBefore = [...prev].filter(([, v]) => v === null).map(([k]) => k);
+      await fsp.mkdir(recDir, { recursive: true });
+      await fsp.writeFile(join(recDir, "manifest.json"), JSON.stringify({ project: recovery.project, cwd, at: Date.now(), unrecovered, hostKept, absentBefore, preimages: "preimages/<path> holds each path's previous bytes" }, null, 2) + "\n");
+      for (const [rel, val] of prev) {
+        if (!val) continue;
+        const dst = join(recDir, "preimages", rel);
+        await fsp.mkdir(dirname(dst), { recursive: true });
+        await fsp.writeFile(dst, val.data, { mode: val.mode & 0o7777 });
+      }
+      saved = `; the previous versions are saved in ${recDir} (manifest.json lists what is where)`;
+    } catch (e: any) {
+      saved = `; saving the previous versions in ${recDir} failed too (${e?.message ?? e})`;
+    }
+    const err = new LayerfsError("RollbackIncomplete", `git rollback could not restore ${unrecovered.map((u) => `${u.rel} (${u.err.slice(0, 80)})`).join(", ")}${saved}`);
+    (err as any).recoveryDir = recDir;
+    throw err;
+  };
+  const mutated = () => unlinked.size > 0 || installed.size > 0;
+  /** nothing changed in the folder yet: our locks and folders go, nothing else to undo */
+  const release = async () => {
     for (const l of held) await fsp.rm(l, { force: true }).catch(() => {});
     held.clear();
-    for (const rel of touched.reverse()) {
-      const target = join(cwd, rel);
-      const old = prev.get(rel);
-      try {
-        if ((await fsp.lstat(target).catch(() => null))?.isDirectory()) await fsp.rmdir(target);
-        else await fsp.rm(target, { force: true });
-        if (!old) { await removeEmptyGitRefParents(cwd, rel, layout); continue; }
-        await fsp.mkdir(dirname(target), { recursive: true });
-        const tmp = join(dirname(target), `.${basename(rel)}.minilfs-${randomBytes(4).toString("hex")}`);
-        await fsp.writeFile(tmp, old.data, { mode: old.mode });
-        await fsp.chmod(tmp, old.mode);
-        await fsp.rename(tmp, target);
-      } catch {} // best effort; the caller marks main stale
-    }
+    await removeCreatedDirs();
+  };
+  const stop = async (why: string) => {
+    if (mutated()) await rollback();
+    else await release();
+    return why;
   };
   try {
     // 1. every lock that can be taken now, sorted; nothing in the folder changes yet
-    for (const it of [...items].filter((i) => !deferred.has(i)).sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0))) {
+    for (const it of [...items].filter((i) => !deferred.has(i)).sort(byName)) {
       const why = await take(it);
-      if (why) return why;
+      if (why) return await stop(why);
     }
-    // 2. deletions, deepest first; a folder a ref replaces is emptied (its locks go first)
+    // 2. only the deletions a lock or a rename waits for, deepest first; a folder a ref replaces is emptied (its locks go first)
     for (const d of deletes) {
+      if (!blocking.has(d)) continue;
       await fsp.rm(join(cwd, d.rel), { force: true });
-      touched.push(d.rel);
+      unlinked.add(d.rel);
       const over = [...overDir].find((w) => below(d.rel, w.rel));
       if (!over) continue;
       await unlock(d.rel);
@@ -2871,26 +3012,38 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout?: GitLayout
       }
     }
     // 3. the locks that had to wait for a deletion; the emptied folders must be gone
-    for (const w of deferred) {
+    for (const w of [...deferred].sort(byName)) {
       const why = await take(w);
-      if (why) { await rollback(); return why; }
+      if (why) return await stop(why);
     }
     for (const w of overDir) {
-      if ((await readRawEntry(join(cwd, w.rel))) !== null) { await rollback(); return `${w.rel} changed`; }
+      if ((await readRawEntry(join(cwd, w.rel))) !== null) return await stop(`${w.rel} changed`);
     }
-    // 4. the new versions, in git's order; then the deletions' locks
+    // 4. every lock is held: the other deletions, then the new versions in git's order; then the deletions' locks
+    for (const d of deletes) {
+      if (blocking.has(d)) continue;
+      await fsp.rm(join(cwd, d.rel), { force: true });
+      unlinked.add(d.rel);
+    }
     for (const w of writes) {
+      const next = w.next as { kind: "file"; data: Buffer; mode: number };
       await fsp.rename(lockOf(w.rel), join(cwd, w.rel));
       held.delete(lockOf(w.rel));
-      touched.push(w.rel);
+      installed.set(w.rel, { data: next.data, mode: next.mode & 0o7777, git: w.git });
     }
     for (const d of deletes) {
       await unlock(d.rel);
       await removeEmptyGitRefParents(cwd, d.rel, layout);
     }
     return null;
-  } catch (e) {
-    if (touched.length) await rollback();
+  } catch (e: any) {
+    if (e?.code === "RollbackIncomplete") throw e;
+    if (mutated()) {
+      try { await rollback(); } catch (re: any) {
+        re.message = `${re.message} (after: ${e?.message ?? e})`;
+        throw re;
+      }
+    } else await release();
     throw e;
   } finally {
     for (const l of held) await fsp.rm(l, { force: true }).catch(() => {});

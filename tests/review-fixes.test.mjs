@@ -1386,6 +1386,107 @@ try {
     assert.equal(existsSync(join(cwd, ".git/packed-refs")), false);
   });
 
+  await step("F1 nested ref namespace change (foo -> foo/deep/bar) that cannot finish: foo comes back, the folders made for foo/deep are gone", async () => {
+    for (const failure of ["EEXIST", "EIO"]) {
+      const cwd = project();
+      const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+      g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1"); g("branch", "foo");
+      const c1 = g("rev-parse", "HEAD").stdout.trim();
+      const s = await open(cwd, `f1-${failure}`);
+      await s.mutate("1", "bash", () => s.exec("git branch -D foo >/dev/null && git branch foo/deep/bar", cwd, out()));
+      // git (or the disk) refuses the lock below the deleted ref, after foo is gone and foo/deep/ was made
+      const realOpen = fsp.open;
+      let hit = 0;
+      fsp.open = async (...args) => {
+        if (String(args[0]).endsWith(".git/refs/heads/foo/deep/bar.lock") && hit++ === 0) {
+          assert.equal(existsSync(join(cwd, ".git/refs/heads/foo/deep")), true, "foo/deep/ made");
+          throw Object.assign(new Error(failure), { code: failure });
+        }
+        return realOpen.apply(fsp, args);
+      };
+      let ap = null;
+      try {
+        if (failure === "EIO") await assert.rejects(s.apply(), (e) => e.code === "EIO");
+        else ap = await s.apply();
+      } finally { fsp.open = realOpen; }
+      assert.equal(hit, 1, "the injected failure fired");
+      if (ap) assert.match(ap.warnings.join("\n"), /bar\.lock exists: git is running there/, ap.warnings.join("\n"));
+      assert.equal(lstatSync(join(cwd, ".git/refs/heads/foo")).isFile(), true, `${failure}: foo is a ref again`);
+      assert.equal(readFileSync(join(cwd, ".git/refs/heads/foo"), "utf8").trim(), c1, "with its oid");
+      const locks = spawnSync("find", [join(cwd, ".git"), "-name", "*.lock"], { encoding: "utf8" }).stdout.trim();
+      assert.equal(locks, "", "no lock left");
+      assert.equal(spawnSync("git", ["-C", cwd, "fsck", "--no-progress"]).status, 0, "git fsck clean");
+      if (failure === "EIO") assert.equal(s.bindings.byName(s.project).mainStale, true, "main marked stale");
+    }
+  });
+
+  await step("F2 rollback keeps a host update to a ref already renamed; a rollback that cannot finish saves the previous versions and blocks apply", async () => {
+    const setup = async (name) => {
+      const cwd = project();
+      const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+      g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c0"); g("commit", "-q", "--allow-empty", "-m", "c1"); g("branch", "a"); g("branch", "b");
+      const c1 = g("rev-parse", "HEAD").stdout.trim();
+      g("commit", "-q", "--allow-empty", "-m", "cHost");
+      const cHost = g("rev-parse", "HEAD").stdout.trim();
+      g("reset", "-q", "--soft", c1);
+      const s = await open(cwd, name);
+      await s.mutate("1", "bash", () => s.exec("git branch -f a HEAD~1 && git branch -f b HEAD~1", cwd, out()));
+      return { cwd, g, c1, cHost, s };
+    };
+    // 1. the host commits to `a` after apply renamed `a`, then renaming `b` fails: `a` keeps the host's commit
+    let { cwd, g, c1, cHost, s } = await setup("f2a");
+    const realRename = fsp.rename;
+    let hit = 0;
+    fsp.rename = async (...args) => {
+      if (String(args[1]).endsWith(".git/refs/heads/b") && hit++ === 0) {
+        writeFileSync(join(cwd, ".git/refs/heads/a"), `${cHost}\n`);
+        throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+      }
+      return realRename.apply(fsp, args);
+    };
+    let err = null;
+    try { await s.apply().catch((e) => { err = e; }); } finally { fsp.rename = realRename; }
+    assert.equal(err?.code, "ENOSPC", String(err));
+    assert.equal(g("rev-parse", "refs/heads/a").stdout.trim(), cHost, "the host's commit on a is kept");
+    assert.equal(g("rev-parse", "refs/heads/b").stdout.trim(), c1, "b is back");
+    assert.match(err.result.warnings.join("\n"), /updated \.git\/refs\/heads\/a .*kept/, err.result.warnings.join("\n"));
+    assert.equal(s.bindings.byName(s.project).mainStale, true);
+    assert.equal(spawnSync("find", [join(cwd, ".git"), "-name", "*.lock"], { encoding: "utf8" }).stdout.trim(), "", "no lock left");
+    // 2. putting `a` back fails too: the previous versions are saved, apply refuses until that folder is gone
+    ({ cwd, g, c1, cHost, s } = await setup("f2b"));
+    const realOpen = fsp.open;
+    let failed = false;
+    hit = 0;
+    fsp.rename = async (...args) => {
+      if (String(args[1]).endsWith(".git/refs/heads/b") && hit++ === 0) { failed = true; throw Object.assign(new Error("disk full"), { code: "ENOSPC" }); }
+      return realRename.apply(fsp, args);
+    };
+    fsp.open = async (...args) => {
+      if (failed && String(args[0]).endsWith(".git/refs/heads/a.lock")) throw Object.assign(new Error("i/o error"), { code: "EIO" });
+      return realOpen.apply(fsp, args);
+    };
+    err = null;
+    try { await s.apply().catch((e) => { err = e; }); } finally { fsp.rename = realRename; fsp.open = realOpen; }
+    assert.equal(err?.code, "RollbackIncomplete", String(err));
+    const recRoot = join(config.root, "recovery");
+    const rec = readdirSync(recRoot).find((d) => d.startsWith(`${s.project}-`));
+    assert.ok(rec, "a recovery folder named after the project");
+    const recDir = join(recRoot, rec);
+    assert.match(err.message, new RegExp(recDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.equal(readFileSync(join(recDir, "preimages/.git/refs/heads/a"), "utf8").trim(), c1, "a's previous version saved");
+    const manifest = JSON.parse(readFileSync(join(recDir, "manifest.json"), "utf8"));
+    assert.deepEqual(manifest.unrecovered.map((u) => u.rel), [".git/refs/heads/a"]);
+    assert.equal(s.bindings.byName(s.project).mainStale, true);
+    await assert.rejects(s.apply(), (e) => e.code === "RecoveryPending" && e.message.includes(recDir));
+    // dealt with: the user restores a and removes the folder; apply runs again
+    writeFileSync(join(cwd, ".git/refs/heads/a"), `${c1}\n`);
+    rmSync(recDir, { recursive: true, force: true });
+    const ap = await s.apply();
+    assert.deepEqual(ap.warnings, [], ap.warnings.join("; "));
+    assert.equal(g("rev-parse", "refs/heads/b").stdout.trim(), g("rev-parse", "HEAD~1").stdout.trim());
+    assert.equal(s.bindings.byName(s.project).recoveryDir, undefined, "the binding forgot the folder");
+  });
+
   await step("too-large first import is refused before copying, naming the largest folders", async () => {
     const cwd = project();
     mkdirSync(join(cwd, "big"));

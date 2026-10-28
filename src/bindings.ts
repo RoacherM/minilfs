@@ -12,6 +12,8 @@ export interface ProjectRecord {
   mainRef: string;
   /** main in the Store may lag the host (a publish after apply failed): resync on next start */
   mainStale?: boolean;
+  /** an apply could not put the folder's git metadata back; its previous versions are here: apply refuses while it exists */
+  recoveryDir?: string | null;
   created: number;
   updatedAt: number;
 }
@@ -182,6 +184,14 @@ export class BindingStore {
   setMainStale(name: string, stale: boolean): void {
     this.update((d) => {
       if (d.projects[name]) d.projects[name].mainStale = stale;
+    });
+  }
+
+  setRecoveryDir(name: string, dir: string | null): void {
+    this.update((d) => {
+      if (!d.projects[name]) return;
+      if (dir) d.projects[name].recoveryDir = dir;
+      else delete d.projects[name].recoveryDir;
     });
   }
 
