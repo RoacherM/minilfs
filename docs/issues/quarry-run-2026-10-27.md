@@ -259,3 +259,19 @@ S10 S13; not fixed — S4 S6 S7 S8 S9 (residual cases below). Push-ready: no.
 | F6 | classification is still lexical: a real submodule `a/logs` has its index classified `soft` → skips object check and the lock transaction | Major |
 | F7 | join index restore ignores `cp` failure and deletes the backup; the join then still commits | Major |
 | m | outside read: whole file slurped (no byte bound), `/dev/zero` unbounded, no concurrency limit; packed-refs name check accepts `a..b`; `IgnoreRules.load` runs host git with the inherited env | Minor |
+
+## 9. Review of the third round (b044726..2d23879) by auto/gpt-6-1-sol (high), 2026-10-27
+
+Implementation by auto/claude-opus-5-5 (3 commits; full suite: elevate 32, review-fixes 66, …, all
+pass). Verdicts: fixed — F7; fixed with caveat — F1 F2 F4 F5 F6 m; not fixed — F3 (N1). Push-ready:
+no; must change N1 and N2.
+
+| # | Finding | Severity |
+| --- | --- | --- |
+| N1 | unchanged symbolic predecessors bypass F3: `HEAD → refs/heads/main → refs/tags/t`, change only `t` to a blob → the checked-out branch resolves to a blob. Validate the resulting symbolic-ref graph incl. existing predecessors of changed/deleted refs | Major |
+| N2 | recovery state is created after rollback fails; if `mkdir(recDir)` or `setRecoveryDir` fails, the next apply sees no folder and clears the guard: partial metadata without preimages or guard. Make the pending state durable before destructive mutations; a missing folder must not mean "user removed it" unless the user said so | Major |
+| N3 | allocator may produce `refs/minilfs-<oid12>/…`, which later rescue discovery ignores | Minor |
+| N4 | lock removal errors swallowed during release/rollback; an owned lock can remain unreported | Minor |
+| N5 | strictest-wins refuses a real submodule named like `a/rebase-merge/s` (index treated as transient) | Minor |
+| N6 | a holder started during listing is omitted and unresolved holders are not reported; unmount has no own deadline | Minor |
+| N7 | outside `readdir` unbounded; ref names > 255 chars and `.LOCK` rejected beyond check-ref-format | Minor |
