@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { constants as fsc, createReadStream, existsSync, promises as fsp, realpathSync } from "node:fs";
+import { constants as fsc, createReadStream, existsSync, lstatSync, promises as fsp, readFileSync, realpathSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { ensureBundle, missingBundleFiles } from "./bundle.ts";
@@ -10,7 +10,7 @@ import { createProjectClient, ensureNativeDirs, initProjectClient, type NativeSp
 import { resolveExecutionDriver, stopDaemonProcesses, type ExecutionDriver } from "./core/driver.ts";
 import { run } from "./core/exec-helper.ts";
 import { bothSpellings, buildSeatbeltProfile } from "./seatbelt.ts";
-import { allocateRescueRef, decideGitPath, expectedType, isRescueRef, GIT_APPLY_ORDER, GIT_JOIN_HINT, gitChangeSummary, gitPathKind, gitSig, isProtectedPath, isValidGitRefName, parseIndexEntries, isSafeRefName, MERGE_UNITS, resolveGitPath, scanGitLayout, type GitLayout, type GitPathKind } from "./gitpaths.ts";
+import { allocateRescueRef, decideGitPath, expectedType, isRescueRef, GIT_APPLY_ORDER, GIT_JOIN_HINT, gitChangeSummary, gitPathKind, gitSig, isProtectedPath, isValidGitRefName, parseIndexEntries, isSafeRefName, MERGE_UNITS, resolveGitPath, scanGitLayout, splitGitPath, type GitLayout, type GitPathKind } from "./gitpaths.ts";
 import { isOrphan, MountLeases } from "./mount-leases.ts";
 import { GIT_JOIN_SCRIPT, parseJoin, symbolicHead, type JoinResult } from "./gitjoin.ts";
 import { stopWorkers } from "./core/worker.ts";
@@ -383,10 +383,12 @@ export class LayerfsSession {
             ),
         );
       if (options.reason !== "reload" && !(options.reason === "resume" && hasPriorSession) && !options.forkFromRef) {
+        await this.adoptFolderRecovery();
         phase("syncing host changes…");
         await this.syncHostDriftIntoMain();
       }
     }
+    await this.adoptFolderRecovery();
     await this.reclaimOrphanMounts().catch((e) => this.log(`reclaiming orphan mounts failed: ${e?.message ?? e}`));
 
     phase("preparing branch…");
@@ -486,18 +488,31 @@ export class LayerfsSession {
     return this.bindings.withProjectLock(this.projectRecord.name, async (guard) => {
       // in memory too: an apply whose bindings write failed still resyncs main
       const full = options.full || Boolean(this.bindings.byName(this.projectRecord.name)?.mainStale || this.projectRecord.mainStale);
+      // an apply could not finish the folder's git metadata: main keeps its own until the user clears
+      // that (then main is resynced in full, git included); the folder's half-written git never
+      // spreads to main and the Branches forked from it
       const prev = full ? await this.mainIndex() : this.bindings.readHostIndex(this.projectRecord.name);
       const scanned = await scanHostDirectory(this.cwd, this.hostSkip, full ? {} : prev, true);
       const curr = scanned.index;
+      // (the scan saw markers in nested repositories too)
+      const pending = this.recoveryDir ?? [...this.nestedMarkers].map((m) => readFolderRecoveryMarker(this.cwd, m)).find(Boolean) ?? null;
+      const withheld = (rel: string) => Boolean(pending) && splitGitPath(rel) !== null;
       const changed: string[] = [];
       const removed: string[] = [];
       for (const [rel, ent] of Object.entries(curr)) {
         const old = prev[rel];
-        if (!old || !sameSig(old, ent)) changed.push(rel);
+        if ((!old || !sameSig(old, ent)) && !withheld(rel)) changed.push(rel);
       }
       // a path that is now secret or branch-only stays in main (never a mass delete)
       const skip = this.hostSkip;
-      for (const rel of Object.keys(prev)) if (!curr[rel] && !skip(rel, false)) removed.push(rel);
+      for (const rel of Object.keys(prev)) if (!curr[rel] && !skip(rel, false) && !withheld(rel)) removed.push(rel);
+      // the host index keeps main's view of withheld paths (their drift is synced once the recovery is cleared)
+      if (pending) {
+        for (const rel of Object.keys(curr)) if (withheld(rel)) { if (prev[rel]) curr[rel] = prev[rel]; else delete curr[rel]; }
+        for (const rel of Object.keys(prev)) if (withheld(rel) && !curr[rel]) curr[rel] = prev[rel];
+      }
+      // main stays marked stale while git metadata is withheld (the clear marks it stale: a full resync follows)
+      const clearsStale = full && !pending;
       if (changed.length) {
         // never pull a huge new tree into memory and the Store unasked (e.g. the first start after an
         // upgrade that imports .git and dependencies: the old host index lacks them)
@@ -508,7 +523,7 @@ export class LayerfsSession {
       }
       if (!changed.length && !removed.length) {
         this.bindings.writeHostIndex(this.projectRecord.name, curr);
-        if (full) { this.bindings.setMainStale(this.projectRecord.name, false); this.projectRecord.mainStale = false; }
+        if (clearsStale) { this.bindings.setMainStale(this.projectRecord.name, false); this.projectRecord.mainStale = false; }
         return { synced: [] };
       }
 
@@ -546,7 +561,7 @@ export class LayerfsSession {
       this.projectRecord.mainRef = pub?.publishedLayer?.id ?? pub?.layer ?? this.projectRecord.mainRef;
       this.bindings.updateProjectMain(this.projectRecord.name, this.projectRecord.mainRef);
       this.bindings.writeHostIndex(this.projectRecord.name, curr);
-      if (full) { this.bindings.setMainStale(this.projectRecord.name, false); this.projectRecord.mainStale = false; }
+      if (clearsStale) { this.bindings.setMainStale(this.projectRecord.name, false); this.projectRecord.mainStale = false; }
       return { synced: [...changed, ...removed] };
     });
   }
@@ -591,7 +606,33 @@ export class LayerfsSession {
    */
   private get hostSkip(): Skip {
     const patterns = [...this.config.excludes, ...this.config.branchOnly];
-    return (rel, isDir) => isExcludedPath(rel, patterns) || (isDir && isExcludedPath(`${rel}/x`, patterns));
+    // the folder's record of a pending git recovery is the folder's own: never in main, a Branch or
+    // apply; one seen in a nested repository's .git is adopted too (adoptFolderRecovery)
+    return (rel, isDir) => {
+      if (!isDir && isRecoveryMarker(rel)) { if (rel !== `.git/${RECOVERY_MARKER}`) this.nestedMarkers.add(rel); return true; }
+      return isExcludedPath(rel, patterns) || (isDir && isExcludedPath(`${rel}/x`, patterns));
+    };
+  }
+  /** recovery markers a scan of the folder saw in nested repositories (`sub/.git/minilfs-recovery`) */
+  private nestedMarkers = new Set<string>();
+
+  /**
+   * A pending git recovery the folder records (`.git/minilfs-recovery`) that the project does not (a
+   * folder moved after an apply could not finish is a new project; a power loss before the binding
+   * was written): adopted into the project, so apply refuses and recover --clear can clear it.
+   */
+  private async adoptFolderRecovery(): Promise<void> {
+    const found = () => [`.git/${RECOVERY_MARKER}`, ...this.nestedMarkers].map((m) => ({ m, dir: readFolderRecoveryMarker(this.cwd, m) })).filter((x) => x.dir);
+    if (!found().length || this.bindings.byName(this.projectRecord.name)?.recoveryDir) return;
+    await this.bindings.withProjectLock(this.projectRecord.name, async () => {
+      // under the lock: an apply finishing meanwhile removes its marker before its record
+      const markers = found();
+      if (!markers.length || this.bindings.byName(this.projectRecord.name)?.recoveryDir) return;
+      const marker = markers[0].dir!;
+      this.bindings.setRecoveryDir(this.projectRecord.name, marker, markers.map((x) => x.m));
+      this.projectRecord.recoveryDir = marker;
+      this.log(`the folder records a pending git recovery (${marker}): apply refuses until /minilfs recover --clear`);
+    });
   }
 
   private async setupBranches(options: OpenOptions): Promise<void> {
@@ -2010,19 +2051,34 @@ export class LayerfsSession {
    */
   async clearRecovery(): Promise<{ cleared: string | null }> {
     return this.bindings.withProjectLock(this.projectRecord.name, async () => {
-      const recDir = this.bindings.byName(this.projectRecord.name)?.recoveryDir ?? null;
+      const rec = this.bindings.byName(this.projectRecord.name);
+      const recDir = this.recoveryDir;
+      // the folder's markers first (a marker left alone would block apply again), then the record, then the saved versions
+      const markers = new Set([`.git/${RECOVERY_MARKER}`, ...(rec?.recoveryMarkers ?? [])]);
+      for (const m of markers) {
+        const abs = join(this.cwd, m);
+        if (!isRecoveryMarker(m) || !(await assertInsideWorkspace(this.cwd, abs, true).then(() => true, () => false))) continue;
+        await fsp.rm(abs, { force: true });
+        await fsyncDir(dirname(abs)).catch(() => {});
+      }
       this.bindings.setRecoveryDir(this.projectRecord.name, null);
       this.projectRecord.recoveryDir = null;
       this.bindings.setMainStale(this.projectRecord.name, true);
       this.projectRecord.mainStale = true;
-      if (recDir) await fsp.rm(recDir, { recursive: true, force: true }).catch(() => {});
+      // the recovery folder only when it is one of ours (a marker's text names it; never anything else)
+      const ours = recDir && resolve(recDir).startsWith(`${join(this.config.root, "recovery")}/`);
+      if (ours) await fsp.rm(recDir, { recursive: true, force: true }).catch(() => {});
       return { cleared: recDir };
     });
   }
 
-  /** The saved versions of an apply that could not finish (apply refuses while set), or null. */
+  /**
+   * The saved versions of an apply that could not finish (apply refuses while set), or null: the
+   * project's record, else the folder's own marker (`.git/minilfs-recovery`).
+   */
   get recoveryDir(): string | null {
-    return this.bindings?.byName(this.projectRecord?.name)?.recoveryDir ?? null;
+    if (!this.bindings || !this.projectRecord) return null;
+    return this.bindings.byName(this.projectRecord.name)?.recoveryDir ?? readFolderRecoveryMarker(this.cwd);
   }
 
   /** Removes the per-project scratch build cache directory (`<root>/scratch/<project>`). */
@@ -2197,7 +2253,8 @@ export class LayerfsSession {
     return this.bindings.withProjectLock(this.projectRecord.name, async (guard) => {
       // an earlier apply (any session of this project) could not put the folder's git metadata back
       // (a missing folder is not "dealt with": only the user says so, with recover --clear)
-      const recDir = this.bindings.byName(this.projectRecord.name)?.recoveryDir;
+      // the folder's own marker counts too (a folder moved, or a binding write lost to a power loss)
+      const recDir = this.recoveryDir;
       if (recDir) {
         const how = "then run /minilfs recover --clear (or the minilfs tool with action=recover clear=true) to apply again";
         throw new LayerfsError("RecoveryPending", existsSync(recDir)
@@ -2385,15 +2442,17 @@ export class LayerfsSession {
             result.warnings.push(`${why}: the files were applied, but no ref, HEAD or index was changed, so the Branch's commits are not on your branches (their objects were added; the changes show as uncommitted). Commit them in your folder, or sync the Branch and apply again.`);
           };
           for (const g of gitMeta) await checkTarget(g.rel);
-          const missing = await gitObjectsMissing(this.cwd, gitMeta, layout);
+          // what the check read (HEADs, symbolic refs, packed-refs): locked and re-checked by writeGitLocked
+          const reads: GitReads = new Map();
+          const missing = await gitObjectsMissing(this.cwd, gitMeta, layout, reads);
           const locked = gitMeta.filter((g) => g.git !== "soft");
           if (!missing) hostTouched = true;
           const moved = missing ? null : await writeGitLocked(this.cwd, locked, layout, {
             root: join(this.config.root, "recovery"),
             project: this.projectRecord.name,
             warnings: result.warnings,
-            setRecoveryDir: (dir) => { this.bindings.setRecoveryDir(this.projectRecord.name, dir); this.projectRecord.recoveryDir = dir; },
-          });
+            setRecoveryDir: (dir, markers) => { this.bindings.setRecoveryDir(this.projectRecord.name, dir, markers); this.projectRecord.recoveryDir = dir; },
+          }, reads);
           if (missing) dropMeta(`the Branch's git names objects your folder does not have (${missing})`);
           else if (moved) dropMeta(`your folder's git moved while applying (${moved})`);
           else {
@@ -2743,6 +2802,28 @@ async function hostState(abs: string): Promise<HostEntry | null | "other"> {
   return "other";
 }
 
+/**
+ * A folder file the ref graph check read, as read: its bytes, null (absent, or a folder of refs), "big"
+ * (a file too large to be a ref) or "other" (a symlink, device, unreadable).
+ */
+type RefFileState = Buffer | null | "big" | "other";
+/**
+ * The folder files (project-relative) gitObjectsMissing's answer rests on, as it read them; a key
+ * ending in `worktrees/` is a git dir's worktree listing (names joined by newlines).
+ */
+type GitReads = Map<string, RefFileState>;
+async function refFileState(abs: string, max = 1024): Promise<RefFileState> {
+  const st = await fsp.lstat(abs).catch((e: any) => (e?.code === "ENOENT" || e?.code === "ENOTDIR" ? null : "other" as const));
+  if (st === null || st === "other") return st;
+  if (st.isDirectory()) return null;
+  if (!st.isFile()) return "other";
+  if (st.size > max) return "big";
+  return fsp.readFile(abs).catch(() => "other" as const);
+}
+/** A git dir's linked worktrees (the names below `worktrees/`), sorted. */
+const worktreeList = async (gitDirAbs: string) => (await fsp.readdir(join(gitDirAbs, "worktrees")).catch(() => [] as string[])).sort();
+const sameRefFileState = (a: RefFileState, b: RefFileState) => (Buffer.isBuffer(a) && Buffer.isBuffer(b) ? a.equals(b) : a === b);
+
 type GitWrite = { rel: string; git: GitPathKind; next: { kind: "file"; data: Buffer; mode: number } | { kind: "symlink"; target: string } | null; host: HostEntry | null };
 /**
  * git's environment for checks on a repository: nothing inherited from this process (GIT_DIR,
@@ -2786,7 +2867,7 @@ type ResolvedRef =
  * one, else the folder's). `touched`: every name `meta` writes or deletes, and every name whose
  * packed-refs line is added, changed or removed.
  */
-async function refsAfter(cwd: string, common: string, meta: GitWrite[], layout?: GitLayout) {
+async function refsAfter(cwd: string, common: string, meta: GitWrite[], layout?: GitLayout, reads?: GitReads) {
   const planned = new Map<string, GitWrite>();
   let packedPlan: GitWrite | null = null;
   for (const g of meta) {
@@ -2806,16 +2887,30 @@ async function refsAfter(cwd: string, common: string, meta: GitWrite[], layout?:
     }
     return out;
   };
-  const hostPacked = parsePacked(await fsp.readFile(join(cwd, common, "packed-refs"), "utf8").catch(() => ""));
+  /** every folder file this view read, as read (writeGitLocked locks and re-reads the ones the check depends on) */
+  const seen = new Map<string, RefFileState>();
+  const packedState = await refFileState(join(cwd, common, "packed-refs"), Infinity);
+  seen.set("packed-refs", packedState);
+  const hostPacked = parsePacked(Buffer.isBuffer(packedState) ? packedState.toString("utf8") : "");
   const packed = packedPlan ? parsePacked(text(packedPlan) ?? "") : hostPacked;
   const touched = new Set(planned.keys());
   for (const n of new Set([...hostPacked.keys(), ...packed.keys()])) if (hostPacked.get(n) !== packed.get(n)) touched.add(n);
   /** the folder's loose ref: its text, null (none, or a folder of refs), or "" (too large to be a ref: resolves as invalid) */
   const hostLoose = async (name: string): Promise<string | null> => {
-    const p = join(cwd, common, name);
-    const st = await fsp.lstat(p).catch(() => null);
-    if (!st?.isFile()) return null;
-    return st.size > 1024 ? "" : fsp.readFile(p, "utf8").catch(() => null);
+    let st = seen.get(name);
+    if (st === undefined) seen.set(name, (st = await refFileState(join(cwd, common, name))));
+    return Buffer.isBuffer(st) ? st.toString("utf8") : st === "big" ? "" : null;
+  };
+  /**
+   * The graph check depends on these names as the folder has them now (a symbolic ref's chain, a
+   * HEAD, and packed-refs): recorded in `reads` with what was read, so writeGitLocked holds their
+   * locks and finds them unchanged until the folder's git metadata is written. Planned names are
+   * locked and checked as writes already.
+   */
+  const depend = (names: string[]) => {
+    if (!reads) return;
+    reads.set(`${common}/packed-refs`, packedState);
+    for (const n of names) if (!planned.has(n) && seen.has(n)) reads.set(`${common}/${n}`, seen.get(n)!);
   };
   const lookup = async (name: string): Promise<string | null> => {
     const p = planned.get(name);
@@ -2841,7 +2936,10 @@ async function refsAfter(cwd: string, common: string, meta: GitWrite[], layout?:
    */
   const symbolic = async (): Promise<string[] | { error: string }> => {
     const names = new Set<string>(["HEAD", ...planned.keys()]);
-    for (const w of await fsp.readdir(join(cwd, common, "worktrees")).catch(() => [] as string[])) names.add(`worktrees/${w}/HEAD`);
+    const worktrees = await worktreeList(join(cwd, common));
+    for (const w of worktrees) names.add(`worktrees/${w}/HEAD`);
+    // a worktree added meanwhile brings a HEAD this check never saw: the listing is re-read under the locks
+    reads?.set(`${common}/worktrees/`, Buffer.from(worktrees.join("\n")));
     let files = 0;
     const walk = async (rel: string): Promise<string | null> => {
       for (const e of await fsp.readdir(join(cwd, common, rel), { withFileTypes: true }).catch(() => [])) {
@@ -2857,9 +2955,11 @@ async function refsAfter(cwd: string, common: string, meta: GitWrite[], layout?:
     if (why) return { error: why };
     const out: string[] = [];
     for (const n of names) if (/^ref:/.test(((await lookup(n)) ?? "").trim())) out.push(n);
+    // every HEAD, symbolic or detached: a checkout in the folder meanwhile makes it name another branch
+    depend([...names].filter(isHeadName));
     return out;
   };
-  return { planned, touched, lookup, resolve, symbolic };
+  return { planned, touched, lookup, resolve, symbolic, depend };
 }
 
 /**
@@ -2871,7 +2971,7 @@ async function refsAfter(cwd: string, common: string, meta: GitWrite[], layout?:
  * what the folder's refs already reach). git runs with cleanGitEnv, no hooks, no fsmonitor. A ref
  * written by a file tool, or objects never added, would otherwise leave the folder's git broken.
  */
-async function gitObjectsMissing(cwd: string, meta: GitWrite[], layout?: GitLayout): Promise<string | null> {
+async function gitObjectsMissing(cwd: string, meta: GitWrite[], layout?: GitLayout, reads?: GitReads): Promise<string | null> {
   type Want = "commit" | "blob" | "any";
   type Dir = { want: Map<string, Set<Want>>; tips: Set<string>; peeled: Array<[string, string]>; addsHeads: boolean; unborn: string | null };
   const byDir = new Map<string, Dir>();
@@ -2941,7 +3041,7 @@ async function gitObjectsMissing(cwd: string, meta: GitWrite[], layout?: GitLayo
   // through refs the Branch did not touch (HEAD -> refs/heads/main -> refs/tags/t, only t changed),
   // must end where its names require: a branch or HEAD at a commit, nothing at a deleted ref.
   for (const common of commons) {
-    const view = await refsAfter(cwd, common, meta, layout);
+    const view = await refsAfter(cwd, common, meta, layout, reads);
     if (!view.touched.size) continue;
     const symbolic = await view.symbolic();
     if (!Array.isArray(symbolic)) return symbolic.error;
@@ -2951,6 +3051,9 @@ async function gitObjectsMissing(cwd: string, meta: GitWrite[], layout?: GitLayo
     // HEADs last: a refusal names the ref closest to the change (refs/heads/x before the HEAD on it)
     for (const name of [...new Set([...view.touched, ...symbolic])].sort((a, b) => Number(isHeadName(a)) - Number(isHeadName(b)))) {
       const r = await view.resolve(name);
+      // the answer rests on every name the chain read, also when it reaches no change (any of them
+      // retargeted onto a change meanwhile, it would): locked and re-checked by writeGitLocked
+      view.depend(r.chain);
       if (!view.touched.has(name) && !r.chain.some((n) => view.touched.has(n))) continue;
       const at = `${common}/${name}`;
       if (r.kind === "loop") return `${at}: symbolic ref loop at ${r.target}`;
@@ -3019,7 +3122,41 @@ async function gitObjectsMissing(cwd: string, meta: GitWrite[], layout?: GitLayo
  * Where writeGitLocked saves the folder's git metadata before changing it, where it reports, and how
  * it records (and, once the folder is whole again, forgets) the pending recovery for the project.
  */
-type GitRecovery = { root: string; project: string; warnings: string[]; setRecoveryDir: (dir: string | null) => void };
+type GitRecovery = { root: string; project: string; warnings: string[]; setRecoveryDir: (dir: string | null, markers?: string[]) => void };
+
+/**
+ * The folder's own record of a pending git recovery: `<git dir>/minilfs-recovery` (its text: the
+ * recovery folder). It moves with the folder (a moved folder is a new project for minilfs, without
+ * the binding's record). Inside .git and not on the allowlist: protected (the sandbox, file tools
+ * and apply never write it), never imported or synced into main (hostSkip).
+ */
+export const RECOVERY_MARKER = "minilfs-recovery";
+const RECOVERY_MARKER_RX = /(^|\/)\.git\/minilfs-recovery$/i;
+export const isRecoveryMarker = (rel: string) => RECOVERY_MARKER_RX.test(rel);
+/** The recovery folder the folder's top-level marker (or the marker `rel`) names (the marker's own path when it names none), or null. */
+export function readFolderRecoveryMarker(cwd: string, rel = `.git/${RECOVERY_MARKER}`): string | null {
+  const m = join(cwd, rel);
+  let st;
+  try { st = lstatSync(m); } catch { return null; }
+  if (!st.isFile()) return m;
+  try { return readFileSync(m, "utf8").trim() || m; } catch { return m; }
+}
+
+/** Makes `dir`'s entries (a rename, a new or removed name in it) durable. */
+async function fsyncDir(dir: string): Promise<void> {
+  const dh = await fsp.open(dir, "r");
+  try { await dh.sync(); } finally { await dh.close(); }
+}
+
+/** Writes `dst` and fsyncs it before returning. */
+async function writeFileDurable(dst: string, data: Buffer | string, mode = 0o644): Promise<void> {
+  const fh = await fsp.open(dst, "w", mode);
+  try {
+    await fh.writeFile(data);
+    await fh.chmod(mode);
+    await fh.sync();
+  } finally { await fh.close(); }
+}
 
 /**
  * Writes refs, HEAD and the index the way git does, so a git command running in the folder at the
@@ -3037,7 +3174,7 @@ type GitRecovery = { root: string; project: string; warnings: string[]; setRecov
  * it is recorded); both go once everything is written or put back. When something cannot be put
  * back (or the process dies midway) the record stays and RollbackIncomplete is thrown.
  */
-async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout | undefined, recovery: GitRecovery): Promise<string | null> {
+async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout | undefined, recovery: GitRecovery, reads: GitReads = new Map()): Promise<string | null> {
   if (!items.length) return null;
   const depth = (r: string) => r.split("/").length;
   const below = (a: string, b: string) => a.startsWith(`${b}/`);
@@ -3048,8 +3185,22 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
   const deferred = new Set(writes.filter((w) => deletes.some((d) => below(w.rel, d.rel))));
   // renamed over a folder the deletions empty
   const overDir = new Set(writes.filter((w) => deletes.some((d) => below(d.rel, w.rel))));
+  /**
+   * The folder files gitObjectsMissing read (unchanged HEADs, symbolic refs on a checked chain,
+   * packed-refs) and the items do not write: locked like git does (`<path>.lock`) and checked
+   * unchanged, held until the end, never renamed or deleted. Those below a ref the items delete
+   * wait for that deletion, like deferred writes.
+   */
+  const itemRels = new Set(items.map((i) => i.rel));
+  const listings = [...reads].filter(([rel]) => rel.endsWith("/worktrees/"));
+  // (a path below a ref the items write cannot exist once that ref is a file: that ref's lock covers it)
+  const readDeps = [...reads]
+    .filter(([rel]) => !rel.endsWith("/") && !itemRels.has(rel) && !items.some((i) => i.next && below(rel, i.rel)))
+    .map(([rel, expected]) => ({ rel, expected }));
+  const deferredReads = new Set(readDeps.filter((r) => deletes.some((d) => below(r.rel, d.rel))));
+  const readLocks = new Set<string>();
   // the deletions that must happen before every lock is held; the others wait for step 4
-  const blocking = new Set(deletes.filter((d) => [...deferred].some((w) => below(w.rel, d.rel)) || [...overDir].some((w) => below(d.rel, w.rel))));
+  const blocking = new Set(deletes.filter((d) => [...deferred, ...deferredReads].some((w) => below(w.rel, d.rel)) || [...overDir].some((w) => below(d.rel, w.rel))));
   const held = new Set<string>();
   /** what each locked path held before (null: absent) */
   const prev = new Map<string, { data: Buffer; mode: number } | null>();
@@ -3084,11 +3235,46 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
       if (it.next?.kind === "file") {
         await fh.writeFile(it.next.data);
         await fh.chmod(mode);
+        await fh.sync(); // durable before it is renamed into place
       }
     } finally {
       await fh.close();
     }
     return null;
+  };
+  /** takes the lock of a path the check read and checks it still holds what was read; null when held, else why not */
+  const takeRead = async (r: { rel: string; expected: RefFileState }): Promise<string | null> => {
+    const target = join(cwd, r.rel);
+    // a ref file where a folder of this path should be: no lock there, and no ref either until that
+    // file goes (git deletes it under its own lock): an absent name stays absent, checked below
+    const dirOk = await ensureDir(posix.dirname(r.rel)).then(() => true, (e: any) => (e?.code === "ENOTDIR" ? false : Promise.reject(e)));
+    const fh = !dirOk ? ("blocked" as const) : await fsp.open(`${target}.lock`, "wx", 0o644).catch((e: any) => {
+      if (e?.code === "EEXIST") return "held" as const;
+      if (e?.code === "ENOTDIR" || e?.code === "ENOENT") return "blocked" as const;
+      return Promise.reject(e);
+    });
+    if (fh === "held") return `${r.rel}.lock exists: git is running there`;
+    if (fh === "blocked" && r.expected !== null) return `${r.rel} cannot be locked`;
+    if (fh !== "blocked") {
+      held.add(`${target}.lock`);
+      readLocks.add(`${target}.lock`);
+      await fh.close();
+    }
+    const now = await refFileState(target, /(^|\/)packed-refs$/.test(r.rel) ? Infinity : 1024);
+    return sameRefFileState(now, r.expected) ? null : `${r.rel} changed`;
+  };
+  /** the folders holding every path written or deleted (and every folder this call made): their entries made durable */
+  const syncParents = async () => {
+    const dirs = new Set<string>();
+    for (const it of items) dirs.add(posix.dirname(it.rel));
+    for (const d of createdDirs) dirs.add(posix.dirname(d));
+    for (const d of dirs) {
+      // a folder removed meanwhile (a namespace change emptied it): its parent holds the removal
+      for (let cur = d; ; cur = posix.dirname(cur)) {
+        const ok = await fsyncDir(join(cwd, cur)).then(() => true, (e: any) => (e?.code === "ENOENT" || e?.code === "ENOTDIR" ? false : Promise.reject(e)));
+        if (ok || cur === "." || !cur.includes("/")) break;
+      }
+    }
   };
   const unlock = async (rel: string) => {
     // forgotten only once removed: a lock whose removal failed is still ours for the rollback
@@ -3124,6 +3310,7 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
     try {
       await fh.writeFile(old.data);
       await fh.chmod(old.mode & 0o7777);
+      await fh.sync();
     } finally { await fh.close(); }
     await fsp.rename(lockOf(rel), join(cwd, rel));
   };
@@ -3136,9 +3323,12 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
   const rollback = async () => {
     const unrecovered: Array<{ rel: string; err: string }> = [];
     const hostKept: string[] = [];
-    // locks of deleted paths we still hold stay: their path comes back through them, no window for another writer
+    // locks of deleted paths we still hold stay: their path comes back through them, no window for
+    // another writer; the read locks stay too (a checkout meanwhile could land on a ref put back)
+    // (a read lock below a deleted ref goes: that ref comes back where its folder was)
     for (const l of [...held]) {
-      if ([...unlinked].some((rel) => lockOf(rel) === l)) continue;
+      const belowDeleted = [...unlinked].some((rel) => l.startsWith(`${join(cwd, rel)}/`));
+      if ((readLocks.has(l) && !belowDeleted) || [...unlinked].some((rel) => lockOf(rel) === l)) continue;
       await fsp.rm(l, { force: true }).then(() => held.delete(l), (e: any) => unrecovered.push({ rel: relative(cwd, l), err: `its lock could not be removed: ${e?.message ?? e}` }));
     }
     /** our lock on `rel` goes; a lock that stays is not put back (git refuses the path): unrecovered */
@@ -3202,16 +3392,21 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
       }
     }
     await removeCreatedDirs();
-    // every lock of ours is gone by now; one that is not (or cannot be removed) is reported
+    // every lock of ours is gone by now; one that is not (or cannot be removed) is reported (a read
+    // lock changed nothing: a warning, like any lock left once all is done)
     for (const l of [...held]) {
-      const why = await unlockWarn(l, true);
-      if (why) unrecovered.push({ rel: relative(cwd, l), err: why });
+      const why = await unlockWarn(l, !readLocks.has(l));
+      if (why && !readLocks.has(l)) unrecovered.push({ rel: relative(cwd, l), err: why });
     }
     if (hostKept.length) recovery.warnings.push(`your folder's git updated ${hostKept.join(", ")} while apply was putting git metadata back; its value was kept`);
-    if (!unrecovered.length) return forget();
+    if (!unrecovered.length) {
+      // the folder is whole again only once that is on disk: then the record goes
+      await syncParents();
+      return forget();
+    }
     // the folder's git metadata cannot be fully put back: its previous versions were saved before the
     // first change, and the project already records them (apply refuses); the manifest says what failed
-    await fsp.writeFile(join(recDir!, "manifest.json"), JSON.stringify({ ...manifest, status: "rollback_incomplete", unrecovered, hostKept }, null, 2) + "\n").catch(() => {});
+    await writeFileDurable(join(recDir!, "manifest.json"), JSON.stringify({ ...manifest, status: "rollback_incomplete", unrecovered, hostKept }, null, 2) + "\n").catch(() => {});
     const err = new LayerfsError("RollbackIncomplete", `git rollback could not restore ${unrecovered.map((u) => `${u.rel} (${u.err.slice(0, 80)})`).join(", ")}; the previous versions are saved in ${recDir} (manifest.json lists what is where)`);
     (err as any).recoveryDir = recDir;
     throw err;
@@ -3225,33 +3420,60 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
    * folder changes: a failure afterwards (or the process dying) leaves the record, and apply
    * refuses until the user clears it. A failure here changes nothing in the folder: thrown.
    */
+  /**
+   * The folder's markers (`<git dir>/minilfs-recovery`, see RECOVERY_MARKER): in the top-level .git
+   * (the folder's identity) and in every other .git a written path is in (a nested repository).
+   */
+  const markers = [...new Set([".git", ...items.map((i) => splitGitPath(i.rel)?.dir).filter((d): d is string => Boolean(d))])]
+    .filter((d) => lstatSync(join(cwd, d), { throwIfNoEntry: false })?.isDirectory())
+    .map((d) => `${d}/${RECOVERY_MARKER}`);
+  const removeMarkers = async () => {
+    for (const m of markers) await fsp.rm(join(cwd, m), { force: true });
+    for (const m of markers) await fsyncDir(join(cwd, posix.dirname(m))).catch(() => {});
+  };
   const persist = async () => {
     const dir = join(recovery.root, `${recovery.project}-${Date.now()}-${randomBytes(3).toString("hex")}`);
     try {
+      // durable before the first change (fsync: the files, then the folders holding them, up to the
+      // recovery root's parent), then the folder's markers, then the binding (fsynced in save)
+      const dirs = new Set<string>([dir, recovery.root, dirname(recovery.root)]);
       for (const [rel, val] of prev) {
         if (!val) continue;
         const dst = join(dir, "preimages", rel);
         await fsp.mkdir(dirname(dst), { recursive: true });
-        await fsp.writeFile(dst, val.data, { mode: val.mode & 0o7777 });
+        await writeFileDurable(dst, val.data, val.mode & 0o7777);
+        for (let d = dirname(dst); d !== dir && d.startsWith(`${dir}/`); d = dirname(d)) dirs.add(d);
       }
-      manifest = { project: recovery.project, cwd, at: Date.now(), status: "applying", absentBefore: items.filter((i) => !prev.get(i.rel)).map((i) => i.rel), preimages: "preimages/<path> holds each path's previous bytes" };
+      manifest = { project: recovery.project, cwd, at: Date.now(), status: "applying", absentBefore: items.filter((i) => !prev.get(i.rel)).map((i) => i.rel), preimages: "preimages/<path> holds each path's previous bytes", markers };
       await fsp.mkdir(dir, { recursive: true });
-      await fsp.writeFile(join(dir, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
-      recovery.setRecoveryDir(dir);
+      await writeFileDurable(join(dir, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
+      for (const d of [...dirs].sort((a, b) => b.length - a.length)) await fsyncDir(d);
+      for (const m of markers) await writeFileDurable(join(cwd, m), `${dir}\n`);
+      for (const m of markers) await fsyncDir(join(cwd, posix.dirname(m)));
+      recovery.setRecoveryDir(dir, markers);
       recDir = dir;
     } catch (e) {
-      // the record goes before the folder: a record whose folder is gone still blocks apply (never the reverse)
+      // the record goes before the markers and the folder: a record whose folder is gone still blocks apply (never the reverse)
       let cleared = true;
       try { recovery.setRecoveryDir(null); } catch { cleared = false; }
-      if (cleared) await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+      if (cleared) {
+        await removeMarkers().catch(() => {});
+        await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+      }
       throw e;
     }
   };
-  /** the folder's git is whole again (all written, or all put back): the record goes, then the saved versions */
+  /**
+   * The folder's git is whole again (all written, or all put back, and on disk): the markers go,
+   * then the record, then the saved versions. Either guard alone still blocks apply.
+   */
   const forget = async () => {
     if (!recDir) return;
-    try { recovery.setRecoveryDir(null); } catch (e: any) {
-      recovery.warnings.push(`could not clear the pending git recovery record (${e?.message ?? e}); apply stays blocked until /minilfs recover --clear (the previous versions stay in ${recDir})`);
+    try {
+      await removeMarkers();
+      recovery.setRecoveryDir(null);
+    } catch (e: any) {
+      recovery.warnings.push(`could not clear the pending git recovery (${e?.message ?? e}); apply stays blocked until /minilfs recover --clear (the previous versions stay in ${recDir})`);
       return;
     }
     await fsp.rm(recDir, { recursive: true, force: true }).catch(() => {});
@@ -3268,12 +3490,29 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
     else await release();
     return why;
   };
+  /** a worktree added or removed since the check (its HEAD has no lock to hold before it exists): checked under the locks, again before the renames */
+  const listingsChanged = async (): Promise<string | null> => {
+    for (const [rel, names] of listings) {
+      const now = Buffer.from((await worktreeList(join(cwd, rel.slice(0, -"/worktrees/".length)))).join("\n"));
+      if (!sameRefFileState(now, names)) return `${rel.slice(0, -1)} changed (a worktree was added or removed)`;
+    }
+    return null;
+  };
+  type Lockable = { rel: string; read?: { rel: string; expected: RefFileState }; item?: GitWrite };
+  const takeAny = (l: Lockable) => (l.item ? take(l.item) : takeRead(l.read!));
   try {
-    // 1. every lock that can be taken now, sorted; nothing in the folder changes yet
-    for (const it of [...items].filter((i) => !deferred.has(i)).sort(byName)) {
-      const why = await take(it);
+    // 1. every lock that can be taken now, writes and reads in one sorted pass (git's order: no
+    //    deadlock with a git that locks several refs); nothing in the folder changes yet
+    const first: Lockable[] = [
+      ...items.filter((i) => !deferred.has(i)).map((item) => ({ rel: item.rel, item })),
+      ...readDeps.filter((r) => !deferredReads.has(r)).map((read) => ({ rel: read.rel, read })),
+    ];
+    for (const l of first.sort(byName)) {
+      const why = await takeAny(l);
       if (why) return await stop(why);
     }
+    const listed = await listingsChanged();
+    if (listed) return await stop(listed);
     // the folder changes from step 2 on (step 2 and 3 run only for deletions a lock or a rename
     // waits for; else step 4): the previous versions are saved and recorded first
     await persist();
@@ -3290,13 +3529,16 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
       }
     }
     // 3. the locks that had to wait for a deletion; the emptied folders must be gone
-    for (const w of [...deferred].sort(byName)) {
-      const why = await take(w);
+    const later: Lockable[] = [...[...deferred].map((item) => ({ rel: item.rel, item })), ...[...deferredReads].map((read) => ({ rel: read.rel, read }))];
+    for (const l of later.sort(byName)) {
+      const why = await takeAny(l);
       if (why) return await stop(why);
     }
     for (const w of overDir) {
       if ((await readRawEntry(join(cwd, w.rel))) !== null) return await stop(`${w.rel} changed`);
     }
+    const listing = await listingsChanged();
+    if (listing) return await stop(listing);
     // 4. every lock is held: the other deletions, then the new versions in git's order; then the deletions' locks
     for (const d of deletes) {
       if (blocking.has(d)) continue;
@@ -3309,6 +3551,8 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
       held.delete(lockOf(w.rel));
       installed.set(w.rel, { data: next.data, mode: next.mode & 0o7777, git: w.git });
     }
+    // the renames and deletions on disk before anything clears the record
+    await syncParents();
     // everything is written: a deletion's lock that cannot be removed is reported, nothing is undone
     for (const d of deletes) {
       if (held.has(lockOf(d.rel))) await unlockWarn(lockOf(d.rel));
@@ -3327,6 +3571,8 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
     throw e;
   } finally {
     for (const l of [...held]) await unlockWarn(l);
+    // a folder made only for a read lock is empty again (one holding a new ref stays)
+    if (readLocks.size) await removeCreatedDirs();
   }
 }
 

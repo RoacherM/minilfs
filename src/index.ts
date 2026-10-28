@@ -444,6 +444,7 @@ export default function minilfsExtension(pi: ExtensionAPI) {
           `project ${s.project} · volume ${s.volume}`,
           `branch ${s.workBranch} (alias: ${s.logicalBranch}, base ${s.baseBranch} @ ${s.baseRef.slice(0, 12)}) · head ${(s.headCommit ?? "none").slice(0, 12)}`,
           s.blocked ? `blocked: ${s.blocked.reason}` : "",
+          s.recoveryDir ? `apply blocked: an earlier apply could not finish your folder's git metadata (previous versions in ${s.recoveryDir}); check it, then /minilfs recover --clear` : "",
         ].filter(Boolean).join("\n"));
       }
       if (sub === "history") {

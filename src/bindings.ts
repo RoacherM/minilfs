@@ -1,8 +1,8 @@
 // Project & session bindings (adapted from dsh/packages/host/src/binding.js),
 // plus per-project file locks and host-index manifests for P0-1 / P0-6 / P1-6.
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { acquireLock, acquireLockSync } from "./lock.ts";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 export interface ProjectRecord {
   name: string;
@@ -14,6 +14,8 @@ export interface ProjectRecord {
   mainStale?: boolean;
   /** an apply could not put the folder's git metadata back; its previous versions are here: apply refuses while it exists */
   recoveryDir?: string | null;
+  /** the folder's recovery markers (`<git dir>/minilfs-recovery`, relative to the folder) recorded with recoveryDir */
+  recoveryMarkers?: string[];
   created: number;
   updatedAt: number;
 }
@@ -54,6 +56,19 @@ interface BindingsData {
   projects: Record<string, ProjectRecord>;
   workspaces: Record<string, { lastUsed: string | null }>;
   sessions: Record<string, SessionBinding>;
+}
+
+/**
+ * Writes `target` so that once this returns it survives a power loss: the bytes are fsynced in a
+ * temporary file, renamed over `target`, and the folder holding it is fsynced (the rename itself).
+ */
+export function writeFileAtomicSync(target: string, data: string | Buffer, mode = 0o644): void {
+  const tmp = `${target}.${process.pid}.tmp`;
+  const fd = openSync(tmp, "w", mode);
+  try { writeFileSync(fd, data); fsyncSync(fd); } finally { closeSync(fd); }
+  renameSync(tmp, target);
+  const dfd = openSync(dirname(target), "r");
+  try { fsyncSync(dfd); } finally { closeSync(dfd); }
 }
 
 const NAME_RE = /^[a-z0-9](?:[a-z0-9_.-]{0,61}[a-z0-9])?$/;
@@ -111,9 +126,8 @@ export class BindingStore {
   }
 
   private save(): void {
-    const tmp = `${this.file}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify(this._data, null, 2) + "\n");
-    renameSync(tmp, this.file);
+    // durable: the pending git recovery (recoveryDir) and mainStale guard the folder after a power loss
+    writeFileAtomicSync(this.file, JSON.stringify(this._data, null, 2) + "\n");
     const stat = statSync(this.file);
     this.stamp = `${stat.ino}:${stat.size}:${stat.mtimeMs}`;
   }
@@ -187,13 +201,21 @@ export class BindingStore {
     });
   }
 
-  setRecoveryDir(name: string, dir: string | null): void {
+  /** Records (or, with null, forgets) a pending git recovery and the folder's markers of it. */
+  setRecoveryDir(name: string, dir: string | null, markers?: string[]): void {
     this.update((d) => {
-      if (!d.projects[name]) return;
-      if (dir) d.projects[name].recoveryDir = dir;
-      else delete d.projects[name].recoveryDir;
+      const p = d.projects[name];
+      if (!p) return;
+      if (dir) {
+        p.recoveryDir = dir;
+        if (markers) p.recoveryMarkers = [...new Set([...(p.recoveryMarkers ?? []), ...markers])];
+      } else {
+        delete p.recoveryDir;
+        delete p.recoveryMarkers;
+      }
     });
   }
+
 
   removeProject(name: string): void {
     this.update((d) => {
@@ -230,9 +252,6 @@ export class BindingStore {
   }
 
   writeHostIndex(projectName: string, index: HostIndex): void {
-    const f = this.manifestFile(projectName);
-    const tmp = `${f}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify(index));
-    renameSync(tmp, f);
+    writeFileAtomicSync(this.manifestFile(projectName), JSON.stringify(index));
   }
 }

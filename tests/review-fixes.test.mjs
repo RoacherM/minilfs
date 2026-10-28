@@ -1713,6 +1713,180 @@ try {
     assert.match(o.text(), /^CACHED:\s*$/m, `the index is the lead's (nothing staged by a half join): ${o.text()}`);
   });
 
+  await step("P1 what the ref graph check read (HEAD, a symbolic ref on a chain, packed-refs) is locked and re-checked until the git metadata is written", async () => {
+    const repo = async (name, prep) => {
+      const cwd = project();
+      const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+      g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1"); g("branch", "topic"); g("branch", "other");
+      prep?.(g, cwd);
+      const s = await open(cwd, name);
+      return { cwd, g, s };
+    };
+    /** runs `act` (the folder's git, between the check and the writes) when apply opens its first lock in .git */
+    const racing = async (s, cwd, act) => {
+      const realOpen = fsp.open;
+      let fired = null;
+      fsp.open = async (...args) => {
+        const p = String(args[0]);
+        if (!fired && p.startsWith(join(cwd, ".git/")) && p.endsWith(".lock")) { fired = p.slice(cwd.length + 1); act(); }
+        return realOpen.apply(fsp, args);
+      };
+      try { return { ap: await s.apply(), fired }; } finally { fsp.open = realOpen; }
+    };
+    const noLocks = (cwd) => assert.equal(spawnSync("find", [join(cwd, ".git"), "-name", "*.lock"], { encoding: "utf8" }).stdout.trim(), "", "no lock left");
+    // 1. the user checks out topic while apply deletes it: HEAD would name nothing
+    let { cwd, g, s } = await repo("p1a");
+    await s.mutate("1", "bash", () => s.exec("git branch -D topic >/dev/null", cwd, out()));
+    let { ap, fired } = await racing(s, cwd, () => writeFileSync(join(cwd, ".git/HEAD"), "ref: refs/heads/topic\n"));
+    assert.ok(fired, "the race ran");
+    assert.match(ap.warnings.join("\n"), /moved while applying \(\.git\/HEAD changed\)/, `${fired}: ${ap.warnings.join("\n")}`);
+    assert.equal(g("rev-parse", "--verify", "-q", "HEAD").status, 0, "HEAD still names a commit");
+    assert.equal(existsSync(join(cwd, ".git/refs/heads/topic")), true, "topic kept");
+    noLocks(cwd);
+    // 2. an unchanged symbolic ref (alias -> other) is pointed at topic meanwhile
+    ({ cwd, g, s } = await repo("p1b", (g) => g("symbolic-ref", "refs/heads/alias", "refs/heads/other")));
+    await s.mutate("1", "bash", () => s.exec("git branch -D topic >/dev/null", cwd, out()));
+    ({ ap, fired } = await racing(s, cwd, () => writeFileSync(join(cwd, ".git/refs/heads/alias"), "ref: refs/heads/topic\n")));
+    assert.match(ap.warnings.join("\n"), /moved while applying \(\.git\/refs\/heads\/alias changed\)/, `${fired}: ${ap.warnings.join("\n")}`);
+    assert.equal(existsSync(join(cwd, ".git/refs/heads/topic")), true, "topic kept");
+    noLocks(cwd);
+    // 3. HEAD is on x, a loose ref the Branch deletes that a packed line backs; the user drops that line meanwhile
+    ({ cwd, g, s } = await repo("p1c", (g, dir) => {
+      g("branch", "x"); g("pack-refs", "--all");
+      writeFileSync(join(dir, ".git/refs/heads/x"), `${g("rev-parse", "main").stdout.trim()}\n`);
+      g("checkout", "-q", "x");
+    }));
+    assert.equal(existsSync(join(cwd, ".git/refs/heads/x")), true, "x is loose, and packed");
+    await s.mutate("1", "bash", () => s.exec("rm .git/refs/heads/x", cwd, out()));
+    const packed = readFileSync(join(cwd, ".git/packed-refs"), "utf8");
+    ({ ap, fired } = await racing(s, cwd, () => writeFileSync(join(cwd, ".git/packed-refs"), packed.split("\n").filter((l) => !l.endsWith(" refs/heads/x")).join("\n"))));
+    assert.match(ap.warnings.join("\n"), /moved while applying \(\.git\/packed-refs changed\)/, `${fired}: ${ap.warnings.join("\n")}`);
+    assert.equal(g("rev-parse", "--verify", "-q", "HEAD").status, 0, "HEAD still names a commit");
+    noLocks(cwd);
+    // 4. no race: the same delete applies, and the read locks leave nothing behind
+    ({ cwd, g, s } = await repo("p1d", (g) => g("symbolic-ref", "refs/heads/alias", "refs/heads/other")));
+    await s.mutate("1", "bash", () => s.exec("git branch -D topic >/dev/null", cwd, out()));
+    ap = await s.apply();
+    assert.deepEqual(ap.warnings, [], ap.warnings.join("; "));
+    assert.equal(existsSync(join(cwd, ".git/refs/heads/topic")), false, "topic deleted");
+    assert.equal(g("symbolic-ref", "refs/heads/alias").stdout.trim(), "refs/heads/other");
+    noLocks(cwd);
+  });
+
+  await step("P2 the folder records a pending git recovery in .git/minilfs-recovery: a moved folder opens, adopts it, apply refuses, sync keeps the folder's git out of main, recover --clear clears it", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c0"); g("commit", "-q", "--allow-empty", "-m", "c1"); g("branch", "a"); g("branch", "b");
+    const c1 = g("rev-parse", "HEAD").stdout.trim();
+    const s = await open(cwd, "p2");
+    await s.mutate("1", "bash", () => s.exec("git branch -f a HEAD~1 && git branch -f b HEAD~1", cwd, out()));
+    const realRename = fsp.rename, realOpen = fsp.open;
+    let failed = false, hit = 0;
+    fsp.rename = async (...args) => {
+      if (String(args[1]).endsWith(".git/refs/heads/b") && hit++ === 0) { failed = true; throw Object.assign(new Error("disk full"), { code: "ENOSPC" }); }
+      return realRename.apply(fsp, args);
+    };
+    fsp.open = async (...args) => {
+      if (failed && String(args[0]).endsWith(".git/refs/heads/a.lock")) throw Object.assign(new Error("i/o error"), { code: "EIO" });
+      return realOpen.apply(fsp, args);
+    };
+    let err = null;
+    try { await s.apply().catch((e) => { err = e; }); } finally { fsp.rename = realRename; fsp.open = realOpen; }
+    assert.equal(err?.code, "RollbackIncomplete", String(err));
+    const recDir = s.bindings.byName(s.project).recoveryDir;
+    const marker = join(cwd, ".git/minilfs-recovery");
+    assert.equal(existsSync(marker), true, "the folder records the pending recovery");
+    assert.equal(readFileSync(marker, "utf8").trim(), recDir, "naming the saved versions");
+    const { gitPathKind, isProtectedPath } = await import("../src/gitpaths.ts");
+    assert.equal(gitPathKind(".git/minilfs-recovery"), "protected");
+    assert.equal(isProtectedPath(".git/minilfs-recovery"), true);
+    // the marker alone blocks apply (a binding write lost to a power loss)
+    s.bindings.setRecoveryDir(s.project, null);
+    await assert.rejects(s.apply(), (e) => e.code === "RecoveryPending" && e.message.includes(recDir));
+    await s.close();
+    // the folder moves: it opens as a new project that adopts the folder's record
+    const moved = `${cwd}-moved`;
+    await fsp.rename(cwd, moved);
+    const s2 = await open(moved, "p2-moved");
+    assert.notEqual(s2.project, s.project, "a new project");
+    assert.equal(s2.bindings.byName(s2.project).recoveryDir, recDir, "adopted into the project record");
+    assert.equal(s2.recoveryDir, recDir);
+    await assert.rejects(s2.apply(), (e) => e.code === "RecoveryPending" && e.message.includes(recDir));
+    assert.match(await executeLayerfsAction(s2, { action: "status" }, { role: "lead" }), /APPLY BLOCKED.*recover clear=true/s);
+    const o = out();
+    await s2.mutate("1", "bash", () => s2.exec("test -e .git/minilfs-recovery && echo MARKER:yes || echo MARKER:no", moved, o));
+    assert.match(o.text(), /MARKER:no/, "never imported into main or the Branch");
+    // host drift while pending: sources sync, the folder's git stays out of main
+    writeFileSync(join(moved, "a.txt"), "changed\n");
+    writeFileSync(join(moved, ".git/refs/heads/zz"), `${c1}\n`);
+    const sync = await s2.syncHostDriftIntoMain();
+    assert.deepEqual(sync.synced, ["a.txt"], JSON.stringify(sync.synced));
+    // the user checked the folder's git and clears it: marker, record and saved versions go, main is resynced
+    assert.match(await executeLayerfsAction(s2, { action: "recover", clear: true }, { role: "lead" }), /Cleared/);
+    assert.equal(existsSync(join(moved, ".git/minilfs-recovery")), false, "marker removed");
+    assert.equal(s2.bindings.byName(s2.project).recoveryDir, undefined);
+    assert.equal(s2.bindings.byName(s2.project).mainStale, true, "main resyncs from the folder");
+    assert.equal(existsSync(recDir), false, "saved versions removed");
+    assert.equal(s2.recoveryDir, null);
+    const sync2 = await s2.syncHostDriftIntoMain();
+    assert.ok(sync2.synced.includes(".git/refs/heads/zz"), JSON.stringify(sync2.synced));
+    assert.ok(!sync2.synced.some((p) => p.endsWith("minilfs-recovery")));
+    await s2.apply();
+  });
+
+  await step("P3 the recovery state is on disk (fsync) before the first change in the folder, and the changes are on disk before it is cleared", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c0"); g("commit", "-q", "--allow-empty", "-m", "c1"); g("branch", "a");
+    const s = await open(cwd, "p3");
+    await s.mutate("1", "bash", () => s.exec("git branch -f a HEAD~1", cwd, out()));
+    const fs = (await import("node:fs")).default; // the module object (writable); syncBuiltinESMExports updates the named exports
+    const { syncBuiltinESMExports } = await import("node:module");
+    const events = [];
+    const fdPath = new Map();
+    const probe = await fsp.open(join(cwd, "a.txt"), "r");
+    const proto = Object.getPrototypeOf(probe);
+    await probe.close();
+    const real = { open: fsp.open, rename: fsp.rename, rm: fsp.rm, sync: proto.sync, openSync: fs.openSync, fsyncSync: fs.fsyncSync };
+    fsp.open = async (...args) => { const fh = await real.open.apply(fsp, args); fdPath.set(fh.fd, String(args[0])); return fh; };
+    proto.sync = function (...args) { events.push(["sync", fdPath.get(this.fd)]); return real.sync.apply(this, args); };
+    fsp.rename = async (...args) => { events.push(["rename", String(args[1])]); return real.rename.apply(fsp, args); };
+    fsp.rm = async (...args) => { events.push(["rm", String(args[0])]); return real.rm.apply(fsp, args); };
+    fs.openSync = (...args) => { const fd = real.openSync(...args); fdPath.set(`s${fd}`, String(args[0])); return fd; };
+    fs.fsyncSync = (fd) => { events.push(["fsyncSync", fdPath.get(`s${fd}`)]); return real.fsyncSync(fd); };
+    syncBuiltinESMExports();
+    let ap;
+    try { ap = await s.apply(); } finally {
+      Object.assign(fsp, { open: real.open, rename: real.rename, rm: real.rm });
+      proto.sync = real.sync;
+      fs.openSync = real.openSync; fs.fsyncSync = real.fsyncSync;
+      syncBuiltinESMExports();
+    }
+    assert.deepEqual(ap.warnings, [], ap.warnings.join("; "));
+    const ref = join(cwd, ".git/refs/heads/a");
+    const at = (pred, what) => { const i = events.findIndex(pred); assert.ok(i >= 0, `${what} happened: ${JSON.stringify(events.map((e) => `${e[0]} ${String(e[1]).replace(base, "")}`))}`); return i; };
+    const firstChange = at((e) => e[0] === "rename" && e[1] === ref, "the ref renamed into place");
+    const recDir = events.find((e) => e[0] === "sync" && /\/recovery\/[^/]+\/manifest\.json$/.test(e[1] ?? ""))?.[1]?.replace(/\/manifest\.json$/, "");
+    assert.ok(recDir, "manifest.json fsynced");
+    const before = [
+      [(e) => e[0] === "sync" && e[1] === join(recDir, "preimages/.git/refs/heads/a"), "preimage fsynced"],
+      [(e) => e[0] === "sync" && e[1] === join(recDir, "manifest.json"), "manifest fsynced"],
+      [(e) => e[0] === "sync" && e[1] === recDir, "recovery folder fsynced"],
+      [(e) => e[0] === "sync" && e[1] === join(cwd, ".git/minilfs-recovery"), "folder marker fsynced"],
+      [(e) => e[0] === "sync" && e[1] === join(cwd, ".git"), ".git fsynced (the marker's name)"],
+      [(e) => e[0] === "fsyncSync" && /bindings\.json\.\d+\.tmp$/.test(e[1] ?? ""), "bindings.json fsynced"],
+      [(e) => e[0] === "fsyncSync" && e[1] === join(config.root, "state"), "bindings.json's folder fsynced"],
+      [(e) => e[0] === "sync" && e[1] === `${ref}.lock`, "the new ref's bytes fsynced"],
+    ];
+    for (const [pred, what] of before) assert.ok(at(pred, what) < firstChange, `${what} before the first change`);
+    const parentSync = events.findIndex((e, i) => i > firstChange && e[0] === "sync" && e[1] === join(cwd, ".git/refs/heads"));
+    assert.ok(parentSync > firstChange, "refs/heads fsynced after the rename");
+    const cleared = at((e) => e[0] === "rm" && e[1] === join(cwd, ".git/minilfs-recovery"), "marker removed");
+    const recGone = at((e) => e[0] === "rm" && e[1] === recDir, "saved versions removed");
+    assert.ok(parentSync < cleared && parentSync < recGone, "the change is on disk before the recovery state goes");
+    assert.equal(existsSync(join(cwd, ".git/minilfs-recovery")), false);
+  });
+
   await step("too-large first import is refused before copying, naming the largest folders", async () => {
     const cwd = project();
     mkdirSync(join(cwd, "big"));

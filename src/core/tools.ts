@@ -144,6 +144,7 @@ export async function executeLayerfsAction(
       `unapplied changes: ${s.unapplied ? "yes" : "no"}`,
       unappliedMergesNote(s),
       s.blocked ? `BLOCKED: ${s.blocked.reason}` : "",
+      s.recoveryDir ? `APPLY BLOCKED: an earlier apply could not finish the folder's git metadata; previous versions in ${s.recoveryDir}. After the user checked the folder's git: action=recover clear=true (lead only).` : "",
     ].filter(Boolean).join("\n");
   }
   if (action === "diff") {
