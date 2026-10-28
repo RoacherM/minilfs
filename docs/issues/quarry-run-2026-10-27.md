@@ -320,3 +320,14 @@ retries; m1 fixed; m2 implemented with a cache caveat. Push-ready: no; must chan
 | Q1 | the M2 put-back takes the packed preimage only when packed-refs was rewritten, not when the Branch deleted the file: a worktree seen by the final scan on a branch that lived only in packed-refs stays dangling | Major |
 | Q2 | an apply interrupted after renaming objects but before syncing their folders leaves unfenced entries; the retry sees those objects as unchanged, skips the fence, makes the refs durable and clears recovery | Major |
 | Q3 | a lost non-durable host-index checkpoint (read back as `{}`) hides user deletions from main; the comment "a stale index only costs a rescan" is wrong | Minor |
+
+## 13. Review of the seventh round (afce9dc..d407762) by auto/gpt-6-1-sol (high), 2026-10-27
+
+Implementation by auto/claude-opus-5-5 (1 commit; full suite: elevate 37, review-fixes 84, …, all
+pass). Verdicts: Q1 Q2 Q3 fixed. **Push-ready: yes.**
+
+| # | Finding | Severity |
+| --- | --- | --- |
+| R1 | the object fence fsyncs every ancestor up to the project folder; an unreadable ancestor (EACCES on open "r") stops apply after sources landed, before metadata (reported partial apply). Preflight the fence opens before the first host mutation | Minor |
+
+Round summary (Majors per review): 13 → 7 → 2 → 3 → 3 → 2 → 0.
