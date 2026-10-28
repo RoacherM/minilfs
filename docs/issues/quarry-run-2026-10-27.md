@@ -295,3 +295,16 @@ Push-ready: no; must change P1–P3.
 | P7 | rescue fallback of a fallback root leaves the recognised namespace | Minor |
 | P8 | error responses omit accumulated lock warnings | Minor |
 | P9 | `clearRecovery` clears the guard before marking main stale (two writes) | Minor |
+
+## 11. Review of the fifth round (8d18dc7..3fa6a86) by auto/gpt-6-1-sol (high), 2026-10-27
+
+Implementation by auto/claude-opus-5-5 (2 commits; full suite: elevate 37, review-fixes 76, …, all
+pass). Verdicts: P1 P2 P3 partial; P4–P9 fixed. Push-ready: no; must change M1–M3.
+
+| # | Finding | Severity |
+| --- | --- | --- |
+| M1 | a live parent session does not adopt a nested repo's marker written later by another session; its apply then truncates (`"w"`) and later deletes that marker. Check every affected repo's marker before metadata mutation; create markers exclusively (`wx`) | Major |
+| M2 | `git worktree add` can publish a new worktree HEAD on a branch after the last worktree-list check, while apply deletes that branch. No lock covers it | Major |
+| M3 | git objects installed by `put()` (tmp, chmod, rename) are not fsynced before dependent refs/index are made durable and recovery is cleared | Major |
+| m1 | a marker that is a directory: its subtree is imported into main, and clear cannot remove it | Minor |
+| m2 | the full host index is rewritten and now fsynced after every applied file: O(N·S) bytes, 2 fsyncs per file | Minor |
