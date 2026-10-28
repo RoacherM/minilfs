@@ -12,7 +12,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { LayerfsConfig } from "../config.ts";
 import { bothSpellings, buildSeatbeltProfile } from "../seatbelt.ts";
-import { killAll, leftovers, listOwnProcesses, nowUs, procStartTimes } from "./proc-scan.ts";
+import { identifyListed, killAll, leftovers, listOwnProcesses, nowUs } from "./proc-scan.ts";
 
 /** After the shell exits, how long its output may keep draining before the pipe is cut. */
 const PIPE_DRAIN_MS = 2000;
@@ -322,39 +322,49 @@ export class LocalNativeDriver implements ExecutionDriver {
     await this.reapWorkspaceHolders(wsReal).catch(() => {});
   }
 
+  /**
+   * SIGKILLs the processes using the mount, each identified first (identifyListed: started before
+   * lsof ran, then re-checked right before the signal by killAll). When they cannot be identified
+   * (no python3, a timeout, bad output) nothing is signalled and this throws: the caller's unmount
+   * falls back to discard and the forced OS unmount, which never hit an unrelated process.
+   */
   async reapWorkspaceHolders(wsReal: string): Promise<void> {
     const spellings = bothSpellings(wsReal);
+    let unverified = 0;
     for (const p of spellings) {
       // `lsof <mount point>` lists every process using that file system without walking it;
       // `+D` walked the whole tree over NFS before every unmount (1 s per 20k files).
+      const before = nowUs();
       const r = await run("lsof", ["-t", p], { timeoutMs: 5000 }).catch(() => null);
       if (r?.stdout && r.stdout.length > 0) {
-        const pids = r.stdout.toString().split(/\s+/).map(Number).filter((n) => n > 0 && n !== process.pid);
+        const pids = r.stdout.toString().split(/\s+/).map(Number).filter((n) => Number.isInteger(n) && n > 1 && n !== process.pid);
         if (!pids.length) continue;
-        // identify each holder (pid + start time) and signal it only while it is still that process
-        const rows = procStartTimes(pids);
-        if (rows) killAll([...rows.values()]);
-        else for (const n of pids) try { process.kill(n, "SIGKILL"); } catch {} // no libproc lookup here: as before
+        const rows = identifyListed(pids, before);
+        if (!rows) { unverified += pids.length; continue; }
+        killAll(rows);
       }
     }
+    if (unverified) throw new Error(`${unverified} process(es) holding the mount could not be verified (no libproc lookup); none was signalled: holders could not be verified`);
   }
 
   async stopDaemons(localDir?: string): Promise<void> {
-    const pattern = localDir ? `layerfs-daemon --config ${localDir}/` : "layerfs-daemon --config ";
-    const r = await run("pgrep", ["-f", pattern]).catch(() => null);
-    if (r?.code === 0 && r.stdout.length > 0) {
-      const pids = r.stdout.toString().split(/\s+/).filter(Boolean);
-      for (const pid of pids) {
-        const n = Number(pid);
-        if (n > 0 && n !== process.pid) {
-          try {
-            process.kill(n, "SIGTERM");
-          } catch {}
-        }
-      }
-      await new Promise((r) => setTimeout(r, 100));
-    }
+    await stopDaemonProcesses(localDir);
   }
+}
+
+/**
+ * SIGTERMs the LayerFS daemons of `localDir` (all when not given): pgrep by command line, each pid
+ * identified (started before pgrep ran, a layerfs-daemon executable) and re-checked right before
+ * the signal; when they cannot be identified nothing is signalled.
+ */
+export async function stopDaemonProcesses(localDir?: string): Promise<void> {
+  const pattern = localDir ? `layerfs-daemon --config ${localDir}/` : "layerfs-daemon --config ";
+  const before = nowUs();
+  const r = await run("pgrep", ["-f", pattern]).catch(() => null);
+  if (r?.code !== 0 || !r.stdout.length) return;
+  const pids = r.stdout.toString().split(/\s+/).map(Number).filter((n) => Number.isInteger(n) && n > 1 && n !== process.pid);
+  const rows = identifyListed(pids, before)?.filter((p) => /layerfs-daemon$/.test(p.exe)) ?? [];
+  if (killAll(rows, "SIGTERM")) await new Promise((r) => setTimeout(r, 100));
 }
 
 const customDrivers = new Map<string, ExecutionDriver>();

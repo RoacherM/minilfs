@@ -1487,6 +1487,34 @@ try {
     assert.equal(s.bindings.byName(s.project).recoveryDir, undefined, "the binding forgot the folder");
   });
 
+  await step("F7 a git join whose ref update fails and whose index cannot be put back is discarded: the Branch's .git (index) stays the kept side's", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+    const lead = await open(cwd, "f7-lead"), w1 = await open(cwd, "f7-w1");
+    const env = "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t;";
+    await w1.mutate("1", "bash", () => w1.exec(`${env} echo w > w.txt && git add w.txt && git commit -qm by-w`, cwd, out()));
+    // the lead commits after w1 (its .git wins) and leaves its branch locked: the join's update-ref fails
+    await lead.mutate("2", "bash", () => lead.exec(`${env} echo l > l.txt && git add l.txt && git commit -qm by-lead && : > .git/refs/heads/main.lock`, cwd, out()));
+    // and putting the index back fails too (cp and mv onto .git/index refused)
+    const bin = join(base, "f7-bin");
+    mkdirSync(bin, { recursive: true });
+    for (const tool of ["cp", "mv"]) {
+      writeFileSync(join(bin, tool), `#!/bin/sh\ncase "$*" in *.git/index) echo "${tool}: refused" >&2; exit 1;; esac\nexec /bin/${tool} "$@"\n`);
+      chmodSync(join(bin, tool), 0o755);
+    }
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${bin}:${savedPath}`;
+    let m;
+    try { m = await lead.mergeBranch(w1.workBranch); } finally { process.env.PATH = savedPath; }
+    assert.ok(m.merged, JSON.stringify(m.conflicts));
+    assert.match(m.gitNote ?? "", /could not be joined automatically/, m.gitNote);
+    const o = out();
+    await lead.mutate("3", "bash", () => lead.exec("rm -f .git/refs/heads/main.lock; git log --format=%s -1; echo CACHED:$(git diff --cached --name-only | tr '\\n' ' ')", cwd, o));
+    assert.match(o.text(), /^by-lead$/m, `no join commit: ${o.text()}`);
+    assert.match(o.text(), /^CACHED:\s*$/m, `the index is the lead's (nothing staged by a half join): ${o.text()}`);
+  });
+
   await step("too-large first import is refused before copying, naming the largest folders", async () => {
     const cwd = project();
     mkdirSync(join(cwd, "big"));

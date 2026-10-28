@@ -7,7 +7,7 @@ import { ensureBundle, missingBundleFiles } from "./bundle.ts";
 import { BindingStore, type HostEntry, type HostIndex, type ProjectRecord, type SessionBinding } from "./bindings.ts";
 import type { LayerfsConfig } from "./config.ts";
 import { createProjectClient, ensureNativeDirs, initProjectClient, type NativeSpec, type ProjectClient } from "./core/client.ts";
-import { resolveExecutionDriver, type ExecutionDriver } from "./core/driver.ts";
+import { resolveExecutionDriver, stopDaemonProcesses, type ExecutionDriver } from "./core/driver.ts";
 import { run } from "./core/exec-helper.ts";
 import { bothSpellings, buildSeatbeltProfile } from "./seatbelt.ts";
 import { allocateRescueRef, decideGitPath, expectedType, GIT_APPLY_ORDER, GIT_JOIN_HINT, gitChangeSummary, gitPathKind, gitSig, isProtectedPath, isValidGitRefName, parseIndexEntries, isSafeRefName, MERGE_UNITS, resolveGitPath, scanGitLayout, type GitLayout, type GitPathKind } from "./gitpaths.ts";
@@ -170,22 +170,60 @@ const sha = (b: Buffer | string) => createHash("sha256").update(b).digest("hex")
  * The outside-read helper (run under sandbox-exec): `<op> <path>`; prints the bytes, `1`/`0`, or
  * NUL-separated names; on failure prints `<ERRNO>:<message>` to stderr. sysopen needs
  * file-read-data (unlike stat), so Seatbelt's denial applies to directories too; O_NONBLOCK: a FIFO
- * never hangs the call.
+ * never hangs the call. A read is bounded: at most OUTSIDE_READ_MAX bytes (EFBIG beyond, also for a
+ * file that grows while read), no device but /dev/null (/dev/zero, /dev/random never end; a disk
+ * is no file), nothing but regular files and /dev/null (a FIFO or socket: EINVAL).
  */
+const OUTSIDE_READ_MAX = 64 * 1024 * 1024;
 const OUTSIDE_READ_PL = String.raw`
 use Fcntl qw(O_RDONLY O_NONBLOCK);
-my ($op, $p) = @ARGV;
+my ($op, $p, $max) = @ARGV;
 sub fail { my ($c) = grep { $!{$_} } keys %!; print STDERR (($c || "EACCES") . ":$!\n"); exit 1 }
+sub refuse { print STDERR "$_[0]\n"; exit 1 }
 binmode(STDOUT);
 if ($op eq "readdir") { opendir(my $d, $p) or fail(); print join("\0", sort grep { $_ ne "." && $_ ne ".." } readdir($d)); exit 0 }
 sysopen(my $f, $p, O_RDONLY | O_NONBLOCK) or fail();
-if ($op eq "isDir") { print((-d $f) ? "1" : "0"); exit 0 }
+my @st = stat($f) or fail();
+if ($op eq "isDir") { print((-d _) ? "1" : "0"); exit 0 }
 if ($op eq "read") {
-  if (-d $f) { print STDERR "EISDIR:Is a directory\n"; exit 1 }
-  binmode($f); local $/; my $d = <$f>; fail() if !defined $d; print $d;
+  refuse("EISDIR:Is a directory") if -d _;
+  if (-c _ || -b _) {
+    my @dn = stat("/dev/null"); # the same node (device, inode, device number): /dev/null itself
+    refuse("EINVAL:not a regular file (a device)") unless @dn && $st[0] == $dn[0] && $st[1] == $dn[1] && $st[6] == $dn[6];
+    exit 0;
+  }
+  refuse("EINVAL:not a regular file") unless -f _;
+  refuse("EFBIG:larger than $max bytes") if $st[7] > $max;
+  binmode($f);
+  my $buf = "";
+  while (1) {
+    my $r = sysread($f, $buf, 1 << 20, length($buf));
+    fail() if !defined $r;
+    last if $r == 0;
+    refuse("EFBIG:larger than $max bytes") if length($buf) > $max;
+  }
+  print $buf;
 }
 exit 0;
 `;
+/** Outside reads running at once (each is a sandbox-exec + perl process); more wait their turn. */
+const OUTSIDE_READ_CONCURRENCY = 8;
+const outsideReadSlots = { active: 0, waiting: [] as Array<() => void> };
+/** Runs `fn` when fewer than OUTSIDE_READ_CONCURRENCY outside reads run (FIFO). */
+export async function withOutsideReadSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (outsideReadSlots.active >= OUTSIDE_READ_CONCURRENCY) await new Promise<void>((r) => outsideReadSlots.waiting.push(r));
+  else outsideReadSlots.active++;
+  try {
+    return await fn();
+  } finally {
+    // the slot passes straight to the next waiter (active unchanged), else it is freed
+    const next = outsideReadSlots.waiting.shift();
+    if (next) next();
+    else outsideReadSlots.active--;
+  }
+}
+/** For tests: how many outside reads run now, and the most seen at once since the last reset. */
+export const outsideReadStats = { peak: 0 };
 
 /**
  * Native LayerFS v1.1.0 Session (official @layerfs/agent, pure sandbox model):
@@ -1047,7 +1085,10 @@ export class LayerfsSession {
     const branchName = hOurs.replace(/^refs\/heads\//, "");
     const message = `Merge ${label} into ${branchName} (minilfs: LayerFS merged the files)`;
     let result: JoinResult = { mode: "fail", why: "not run" };
-    await this.withMountedBranch(target, true, `git: join ${label} into ${branchName}`, async (wsPath) => {
+    // committed only after a join that worked: a failed one (whatever it left in .git, an index it
+    // could not put back included) is discarded, so the Store keeps .git exactly as before the join
+    const joinedOk = () => result.mode !== "fail" && result.mode !== "skip";
+    await this.withMountedBranch(target, joinedOk, `git: join ${label} into ${branchName}`, async (wsPath) => {
       const scratchDir = join(this.config.root, "scratch", this.projectRecord.name, "join");
       await fsp.mkdir(scratchDir, { recursive: true });
       const profile = buildSeatbeltProfile({
@@ -1062,8 +1103,15 @@ export class LayerfsSession {
       const r = await run("/usr/bin/sandbox-exec", ["-p", profile, "/bin/bash", "-c", GIT_JOIN_SCRIPT, "minilfs-join", oOurs, oTheirs, hOurs, message], { cwd: wsPath, env, timeoutMs: 120_000 });
       result = parseJoin(r.stdout.toString());
       if (result.mode === "fail") this.log(`git join: ${r.stdout.toString().slice(-300)} ${r.stderr.slice(-300)}`);
+      // the index copy the script kept: the Workspace is discarded, so the Store's index is already the original
+      const kept = /^restore-index (\/(private\/)?tmp\/minilfs-join-orig-index\.[A-Za-z0-9]+)$/.exec(result.why ?? "");
+      if (kept) {
+        this.log(`git join could not put the Workspace's index back (${result.why}); the Workspace is discarded, the Branch's .git is unchanged`);
+        await fsp.rm(kept[1], { force: true }).catch(() => {});
+        result = { mode: "fail", why: "the branch could not be moved and the join's index change could not be undone in its Workspace, so the join was discarded" };
+      }
     });
-    return { result, head: this.lastStoreCommit?.head ?? null, branch: branchName };
+    return { result, head: joinedOk() ? (this.lastStoreCommit?.head ?? null) : null, branch: branchName };
   }
 
   private persistSessionBinding(): void {
@@ -1350,8 +1398,11 @@ export class LayerfsSession {
   private async runOutsideRead(op: "read" | "access" | "isDir" | "readdir", hostPath: string): Promise<Buffer> {
     await this.resolveOutsideRead(hostPath); // fast refusal, also for paths that do not exist yet
     const abs = resolve(this.cwd, hostPath); // not the realpath: the kernel resolves symlinks at open
-    const r = await run("/usr/bin/sandbox-exec", ["-p", this.outsideReadProfile(), "/usr/bin/perl", "-e", OUTSIDE_READ_PL, op, abs], {
-      env: { PATH: "/usr/bin:/bin", LANG: "C" }, timeoutMs: 120_000,
+    const r = await withOutsideReadSlot(() => {
+      outsideReadStats.peak = Math.max(outsideReadStats.peak, outsideReadSlots.active);
+      return run("/usr/bin/sandbox-exec", ["-p", this.outsideReadProfile(), "/usr/bin/perl", "-e", OUTSIDE_READ_PL, op, abs, String(OUTSIDE_READ_MAX)], {
+        env: { PATH: "/usr/bin:/bin", LANG: "C" }, timeoutMs: 120_000,
+      });
     });
     if (r.code === 0) return r.stdout;
     const m = /^([A-Z][A-Z0-9]*):(.*)$/m.exec(r.stderr);
@@ -1732,20 +1783,23 @@ export class LayerfsSession {
   }
 
   /** Mounts `branch`, runs `fn`, optionally commits, reaps holders of `ws.path`, and unmounts immediately. */
+  /** `commitAfter` as a function: commit only when fn succeeded and it answers true for fn's value, else discard. */
   private async withMountedBranch<T>(
     branch: string,
-    commitAfter: boolean,
+    commitAfter: boolean | ((value: T) => boolean),
     message: string,
     fn: (wsPath: string, ws: Workspace) => Promise<T>,
   ): Promise<T> {
     const { ws, wsReal: wsPath } = await this.mountWorkspace(branch);
     let keepMounted = false;
+    let discard = !commitAfter;
     try {
       let value!: T;
       let fnErr: unknown = null;
       let failed = false;
       try { value = await fn(wsPath, ws); } catch (e) { fnErr = e; failed = true; }
-      if (commitAfter) {
+      if (typeof commitAfter === "function" && (failed || !commitAfter(value))) discard = true;
+      else if (commitAfter) {
         // one commit, whatever fn did: a second one after a failed commit could resend a landed one
         try {
           await this.commitWorkspaceOnce(ws, branch, failed ? `${message} (failed)` : message, message);
@@ -1757,7 +1811,7 @@ export class LayerfsSession {
       if (failed) throw fnErr;
       return value;
     } finally {
-      if (!keepMounted) await this.releaseWorkspace(ws, wsPath, !commitAfter);
+      if (!keepMounted) await this.releaseWorkspace(ws, wsPath, discard);
     }
   }
 
@@ -1928,9 +1982,13 @@ export class LayerfsSession {
     return { removedPath: target };
   }
 
-  /** Kills processes still using the Workspace mount (the driver's reaper, one implementation). */
+  /**
+   * Kills processes still using the Workspace mount (the driver's reaper, one implementation). One
+   * that cannot be identified is not signalled (logged); releaseWorkspace then unmounts with discard
+   * and, failing that, forces the OS unmount and keeps the lease.
+   */
   private async reapHolders(wsPath: string): Promise<void> {
-    await this.driver.reapWorkspaceHolders?.(wsPath);
+    await this.driver.reapWorkspaceHolders?.(wsPath)?.catch((e: any) => this.log(`${e?.message ?? e} (${wsPath})`));
   }
 
   // ---------------------------------------------------------------- mutation queue & checkpoint gate
@@ -2862,7 +2920,8 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
     return null;
   };
   const unlock = async (rel: string) => {
-    if (held.delete(lockOf(rel))) await fsp.rm(lockOf(rel), { force: true });
+    // forgotten only once removed: a lock whose removal failed is still ours for the rollback
+    if (held.has(lockOf(rel))) { await fsp.rm(lockOf(rel), { force: true }); held.delete(lockOf(rel)); }
   };
   const removeCreatedDirs = async () => {
     for (const d of [...createdDirs].sort((a, b) => depth(b) - depth(a))) await fsp.rmdir(join(cwd, d)).catch(() => {});
@@ -3366,16 +3425,5 @@ async function forceUnmount(wsReal: string): Promise<void> {
 export async function stopNativeDaemons(localDir?: string): Promise<void> {
   // the root's store workers first (they hold the Stores), then the daemons; <root>/local is localDir
   if (localDir) stopWorkers(dirname(localDir));
-  const pattern = localDir ? `layerfs-daemon --config ${localDir}/` : "layerfs-daemon --config ";
-  const r = await run("pgrep", ["-f", pattern]).catch(() => null);
-  if (r?.code === 0 && r.stdout.length > 0) {
-    const pids = r.stdout.toString().split(/\s+/).filter(Boolean);
-    for (const pid of pids) {
-      const n = Number(pid);
-      if (n > 0 && n !== process.pid) {
-        try { process.kill(n, "SIGTERM"); } catch {}
-      }
-    }
-    await new Promise((r) => setTimeout(r, 100));
-  }
+  await stopDaemonProcesses(localDir);
 }

@@ -50,6 +50,9 @@ for p in buf[:n]:
 print(json.dumps(out))
 `;
 
+/** The interpreter for SCAN_PY (a seam for tests: a lookup that cannot run must signal nothing). */
+export const procScan = { python: "/usr/bin/python3" };
+
 /** A process; (pid, startSec, startUsec) identifies it (a pid alone may be reused). */
 export interface ProcRow { pid: number; ppid: number; pgid: number; startSec: number; startUsec: number; exe: string; cwd: string }
 
@@ -58,7 +61,7 @@ const rowsOf = (stdout: string): ProcRow[] =>
 
 /** This user's processes (empty when python3/libproc is unavailable). */
 export async function listOwnProcesses(): Promise<ProcRow[]> {
-  const r = await run("/usr/bin/python3", ["-c", SCAN_PY], { timeoutMs: 10_000 }).catch(() => null);
+  const r = await run(procScan.python, ["-c", SCAN_PY], { timeoutMs: 10_000 }).catch(() => null);
   if (!r || r.code !== 0) return [];
   try {
     return rowsOf(r.stdout.toString());
@@ -74,7 +77,7 @@ export function procStartTime(pid: number): ProcRow | null {
 
 /** These processes of this user (libproc, one look), by pid; absent: gone or another user's. null: cannot look (no python3). */
 export function procStartTimes(pids: number[]): Map<number, ProcRow> | null {
-  const r = spawnSync("/usr/bin/python3", ["-c", SCAN_PY, ...pids.map(String)], { encoding: "utf8", timeout: 10_000 });
+  const r = spawnSync(procScan.python, ["-c", SCAN_PY, ...pids.map(String)], { encoding: "utf8", timeout: 10_000 });
   if (r.status !== 0) return null;
   try {
     return new Map(rowsOf(r.stdout).map((row) => [row.pid, row]));
@@ -93,7 +96,20 @@ export const nowUs = () => {
   const fine = performance.timeOrigin + performance.now();
   return Math.floor((Math.abs(fine - wall) < 1 ? fine : wall) * 1000);
 };
-const startUs = (r: ProcRow) => r.startSec * 1_000_000 + (r.startUsec ?? 0);
+export const startUs = (r: Pick<ProcRow, "startSec" | "startUsec">) => r.startSec * 1_000_000 + (r.startUsec ?? 0);
+
+/**
+ * The processes a listing (lsof, pgrep) named, identified: each pid looked up (libproc) and kept
+ * only when its process started before `beforeUs` (taken before the listing ran), so a pid that a
+ * new process reused after the listing is never taken for the one listed. null when the lookup
+ * cannot run: then nothing may be signalled.
+ */
+export function identifyListed(pids: number[], beforeUs: number): ProcRow[] | null {
+  if (!pids.length) return [];
+  const rows = procStartTimes(pids);
+  if (!rows) return null;
+  return [...rows.values()].filter((r) => startUs(r) < beforeUs);
+}
 
 /**
  * The processes a call left behind: its process group, plus launchd orphans started at or after
@@ -111,7 +127,9 @@ export function leftovers(rows: ProcRow[], opts: { pgid?: number; sinceUs: numbe
 
 /**
  * Signals each process that is still the one found: its (pid, start time) is looked up again right
- * before (time has passed since the listing; the pid may now be another process). Never this
+ * before (time has passed since the listing; the pid may now be another process), in one libproc
+ * call for the whole batch (one python per pid would be too slow with many holders), with nothing
+ * else between that lookup and the signals. A lookup that cannot run signals nothing. Never this
  * process or its parent. Returns how many were signalled.
  */
 export function killAll(rows: Array<Pick<ProcRow, "pid" | "startSec" | "startUsec">>, sig: NodeJS.Signals = "SIGKILL"): number {

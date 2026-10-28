@@ -15,8 +15,10 @@
 //                                             LayerFS already resolved the files, the commit records it
 // The index is set to the new head's tree first (`git read-tree`, the work tree untouched), then the
 // branch moves (`update-ref` against its old value); if that fails the index is put back byte for
-// byte from a copy (staged changes kept), so a failed join leaves no half state. `git status` then
-// shows exactly the changes neither side committed.
+// byte from a copy (staged changes kept), so a failed join leaves no half state; when even that
+// fails the copy is kept and reported (`restore-index <copy>`). Either way minilfs commits the
+// Workspace only after a join that succeeded, so a failed one never reaches the Store. `git status`
+// then shows exactly the changes neither side committed.
 // The script runs with bash under the session's Seatbelt profile, with hooks, fsmonitor, automatic
 // gc and every attribute driver off: no attribute source (attr.tree = the empty tree for the
 // Branch's .gitattributes, core.attributesFile and the system file off) and, since
@@ -99,7 +101,16 @@ if [ "$new" != "$cur" ]; then
     rm -f "$orig_idx"; echo "JOIN fail read-tree"; exit 0
   fi
   if ! g update-ref -m "minilfs: $MSG" "$BRANCH" "$new" $cur; then
-    if [ "$had_idx" -eq 1 ]; then cp -p "$orig_idx" .git/index 2>/dev/null || true; else rm -f .git/index; fi
+    # put the index back the way git writes it: the copy into index.lock (taken exclusively), then
+    # renamed over the index; the copy is kept, and the failure reported, unless that worked
+    if [ "$had_idx" -eq 1 ]; then
+      if ! ( set -C; : > .git/index.lock ) 2>/dev/null; then echo "JOIN fail restore-index $orig_idx"; exit 0; fi
+      if ! { cat "$orig_idx" > .git/index.lock && mv -f .git/index.lock .git/index; } 2>/dev/null || ! cmp -s "$orig_idx" .git/index; then
+        rm -f .git/index.lock 2>/dev/null; echo "JOIN fail restore-index $orig_idx"; exit 0
+      fi
+    elif ! rm -f .git/index 2>/dev/null || [ -e .git/index ]; then
+      echo "JOIN fail restore-index .git/index"; exit 0
+    fi
     rm -f "$orig_idx"; echo "JOIN fail update-ref"; exit 0
   fi
   rm -f "$orig_idx"
@@ -111,12 +122,14 @@ echo "JOIN $mode $new"
 
 export interface JoinResult { mode: "uptodate" | "ff" | "merged" | "worktree" | "skip" | "fail"; commit?: string; why?: string }
 
-/** The last JOIN line of the script's output. */
+/** The last JOIN line of the script's output (the reason whole: `restore-index <backup>`). Anything else is a failure. */
 export function parseJoin(stdout: string): JoinResult {
   const line = String(stdout).split("\n").filter((l) => l.startsWith("JOIN ")).pop();
-  if (!line) return { mode: "fail", why: "no output" };
-  const [, mode, rest] = line.split(" ");
+  const m = line ? /^JOIN (\S+)(?: (.*))?$/.exec(line) : null;
+  if (!m) return { mode: "fail", why: "no output" };
+  const [, mode, rest = ""] = m;
   if (mode === "skip" || mode === "fail") return { mode, why: rest };
+  if (!["uptodate", "ff", "merged", "worktree"].includes(mode) || !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(rest)) return { mode: "fail", why: `bad output: ${line!.slice(0, 80)}` };
   return { mode: mode as JoinResult["mode"], commit: rest };
 }
 

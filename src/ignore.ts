@@ -94,8 +94,19 @@ export class IgnoreRules {
 
   /** Reads git's view: work tree top, case rule, global and repo excludes, tracked files. */
   async load(): Promise<void> {
+    // the folder's own repository, as the user's git sees it: global config (core.excludesFile) kept,
+    // but nothing from this process's environment (GIT_DIR, GIT_INDEX_FILE, GIT_WORK_TREE, GIT_CONFIG_*
+    // would point git elsewhere), no hooks, no fsmonitor (a command the repo's config could name)
+    const env: NodeJS.ProcessEnv = {
+      PATH: process.env.PATH || "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+      HOME: homedir(),
+      ...(process.env.XDG_CONFIG_HOME ? { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME } : {}),
+      TMPDIR: "/private/tmp",
+      LANG: "C",
+      GIT_TERMINAL_PROMPT: "0",
+    };
     const git = async (args: string[]) => {
-      const r = await run("git", ["-C", this.root, ...args], { timeoutMs: 10_000 }).catch(() => null);
+      const r = await run("git", ["-C", this.root, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args], { env, timeoutMs: 10_000 }).catch(() => null);
       return r?.code === 0 ? r.stdout.toString() : null;
     };
     const top = (await git(["rev-parse", "--show-toplevel"]))?.trim();

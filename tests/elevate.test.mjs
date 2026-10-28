@@ -505,6 +505,38 @@ try {
     assert.ok(Math.abs(samples.at(-1) / 1000 - Date.now()) < 50, "the wall clock");
   });
 
+  await step("F4 mount holders that cannot be identified are never signalled; a pid listed before its process started is not that process", async () => {
+    const { spawn } = await import("node:child_process");
+    const { realpathSync } = await import("node:fs");
+    const ps = await import("../src/core/proc-scan.ts");
+    const { LocalNativeDriver } = await import("../src/core/driver.ts");
+    mkdirSync(join(dir, "f4-hold"), { recursive: true });
+    const holdDir = realpathSync(join(dir, "f4-hold"));
+    const child = spawn("/bin/sleep", ["600.41"], { cwd: holdDir, stdio: "ignore" });
+    const gone = new Promise((r) => child.once("exit", r));
+    const realPython = ps.procScan.python;
+    try {
+      await new Promise((r) => setTimeout(r, 150));
+      const drv = new LocalNativeDriver();
+      // the lookup cannot run (no python3): nothing is signalled, the caller hears why
+      ps.procScan.python = "/nonexistent/python3";
+      assert.equal(ps.procStartTimes([child.pid]), null);
+      await assert.rejects(drv.reapWorkspaceHolders(holdDir), /holders could not be verified/);
+      await new Promise((r) => setTimeout(r, 100));
+      assert.equal(child.exitCode === null && child.signalCode === null, true, "the unverified holder still runs");
+      assert.equal(ps.killAll([{ pid: child.pid, startSec: 0, startUsec: 0 }]), 0, "killAll without a lookup signals nothing");
+      ps.procScan.python = realPython;
+      // a listing taken before the process started never names it
+      const row = ps.procStartTime(child.pid);
+      assert.deepEqual(ps.identifyListed([child.pid], ps.startUs(row)), [], "started at/after the listing: not the listed one");
+      assert.equal(ps.identifyListed([child.pid], ps.nowUs()).length, 1);
+      // verified: the holder is killed
+      await drv.reapWorkspaceHolders(holdDir);
+      await gone;
+      assert.equal(child.signalCode, "SIGKILL");
+    } finally { ps.procScan.python = realPython; try { child.kill("SIGKILL"); } catch {} }
+  });
+
   await step("S13 sessionAlive checks the recorded start time for this process's own pid too", async () => {
     const { hostname } = await import("node:os");
     const { procStartTime } = await import("../src/core/proc-scan.ts");
@@ -626,6 +658,75 @@ try {
       assert.equal((await s.readFile(join(t, "empty"))).length, 0);
     } finally { rmSync(t, { recursive: true, force: true }); }
   });
+  await step("F7 git join: when the index cannot be put back after a failed ref update, the copy is kept and the failure says where (never deleted)", async () => {
+    const { execSync, spawnSync } = await import("node:child_process");
+    const { readFileSync, chmodSync } = await import("node:fs");
+    const { GIT_JOIN_SCRIPT, parseJoin } = await import("../src/gitjoin.ts");
+    const genv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "a", GIT_AUTHOR_EMAIL: "a@b", GIT_COMMITTER_NAME: "a", GIT_COMMITTER_EMAIL: "a@b" };
+    const sh = (cwd, c) => execSync(c, { cwd, env: genv, encoding: "utf8", shell: "/bin/bash" }).trim();
+    const d = join(dir, "f7"); mkdirSync(d, { recursive: true });
+    sh(d, "git init -q -b main && printf base > a.txt && git add -A && git commit -qm base");
+    sh(d, "git checkout -q -b w && echo w > w.txt && git add -A && git commit -qm by-w"); const theirs = sh(d, "git rev-parse HEAD");
+    sh(d, "git checkout -q main && echo l > l.txt && git add -A && git commit -qm by-l"); const ours = sh(d, "git rev-parse HEAD");
+    sh(d, "echo staged > staged.txt && git add staged.txt");
+    const before = readFileSync(join(d, ".git/index"));
+    // the ref update fails (its lock is held); `mv` onto .git/index fails (a wrapper first on PATH)
+    writeFileSync(join(d, ".git/refs/heads/main.lock"), "");
+    const bin = join(dir, "f7-bin"); mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, "mv"), '#!/bin/sh\ncase "$*" in *.git/index) echo "mv: refused" >&2; exit 1;; esac\nexec /bin/mv "$@"\n');
+    chmodSync(join(bin, "mv"), 0o755);
+    const run = (path) => parseJoin(spawnSync("/bin/bash", ["-c", GIT_JOIN_SCRIPT, "_", ours, theirs, "refs/heads/main", "Merge w into main"], { cwd: d, env: { ...genv, PATH: path }, encoding: "utf8" }).stdout);
+    let r = run(`${bin}:${process.env.PATH}`);
+    assert.equal(r.mode, "fail");
+    const m = /^restore-index (\/tmp\/minilfs-join-orig-index\.\S+)$/.exec(r.why ?? "");
+    assert.ok(m, `the reason names the kept copy: ${JSON.stringify(r)}`);
+    assert.ok(readFileSync(m[1]).equals(before), "the copy holds the index from before the join");
+    assert.equal(existsSync(join(d, ".git/index.lock")), false, "no index.lock left");
+    assert.equal(sh(d, "git rev-parse refs/heads/main"), ours, "the branch did not move");
+    rmSync(m[1], { force: true });
+    // a plain failed ref update still puts the index back byte for byte and removes the copy
+    sh(d, "git read-tree HEAD && git add staged.txt");
+    const before2 = readFileSync(join(d, ".git/index"));
+    r = run(process.env.PATH);
+    assert.deepEqual(r, { mode: "fail", why: "update-ref" });
+    assert.ok(readFileSync(join(d, ".git/index")).equals(before2));
+    // parseJoin keeps the whole reason; a garbled success line is a failure
+    assert.deepEqual(parseJoin("JOIN fail restore-index /tmp/x y\n"), { mode: "fail", why: "restore-index /tmp/x y" });
+    assert.equal(parseJoin("JOIN merged not-an-oid\n").mode, "fail");
+    assert.equal(parseJoin(`JOIN ff ${"a".repeat(40)}\n`).commit, "a".repeat(40));
+  });
+
+  await step("m outside reads: /dev/null is empty, /dev/zero and a 65 MiB file refused, at most 8 run at once; IgnoreRules.load ignores GIT_DIR/GIT_INDEX_FILE", async () => {
+    const { resolveConfig } = await import("../src/config.ts");
+    const { truncateSync, writeFileSync: wf } = await import("node:fs");
+    const { execSync } = await import("node:child_process");
+    const t = `/tmp/minilfs-m-${Date.now().toString(36)}`;
+    mkdirSync(join(t, "proj"), { recursive: true });
+    try {
+      const s = new ws.LayerfsSession(join(t, "proj"), "m", { ...resolveConfig({}), root: join(t, "root") });
+      assert.equal((await s.readFile("/dev/null")).length, 0);
+      await assert.rejects(s.readFile("/dev/zero"), (e) => e.code === "EINVAL");
+      wf(join(t, "big"), ""); truncateSync(join(t, "big"), 65 * 1024 * 1024);
+      await assert.rejects(s.readFile(join(t, "big")), (e) => e.code === "EFBIG");
+      wf(join(t, "small"), "x\n");
+      ws.outsideReadStats.peak = 0;
+      const all = await Promise.all(Array.from({ length: 20 }, () => s.readFile(join(t, "small"))));
+      assert.ok(all.every((b) => b.toString() === "x\n"));
+      assert.ok(ws.outsideReadStats.peak >= 2 && ws.outsideReadStats.peak <= 8, `peak ${ws.outsideReadStats.peak}`);
+      // IgnoreRules: the environment's git variables do not move git away from the folder's repository
+      const repo = join(t, "repo"); mkdirSync(repo);
+      execSync("git init -q && echo x > tracked.txt && echo 'ign/' > .gitignore && git add -A", { cwd: repo, env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" } });
+      const { IgnoreRules } = await import("../src/ignore.ts");
+      const saved = { GIT_DIR: process.env.GIT_DIR, GIT_INDEX_FILE: process.env.GIT_INDEX_FILE };
+      process.env.GIT_DIR = "/nonexistent"; process.env.GIT_INDEX_FILE = "/nonexistent";
+      const rules = new IgnoreRules(repo);
+      try { await rules.load(); } finally { for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
+      assert.equal(rules.active, true, "the folder's repository was found");
+      assert.equal(rules.isIgnored("ign/x"), true);
+      assert.equal(rules.isIgnored("tracked.txt"), false);
+    } finally { rmSync(t, { recursive: true, force: true }); }
+  });
+
   await step("R14 prelude timeout: 124 only when the limit fired, a command's own SIGTERM exit stays 143", async () => {
     const { spawnSync } = await import("node:child_process");
     const { buildNativeShellPrelude } = await import("../src/core/driver.ts");
