@@ -331,3 +331,11 @@ pass). Verdicts: Q1 Q2 Q3 fixed. **Push-ready: yes.**
 | R1 | the object fence fsyncs every ancestor up to the project folder; an unreadable ancestor (EACCES on open "r") stops apply after sources landed, before metadata (reported partial apply). Preflight the fence opens before the first host mutation | Minor |
 
 Round summary (Majors per review): 13 → 7 → 2 → 3 → 3 → 2 → 0.
+
+## 14. src/gitapply.ts split and R1 (1d302d4..9c47610), reviewed by auto/gpt-6-1-sol (high), 2026-10-28
+
+- 2efb1b0 refactor: pure move verified independently (zero byte differences; no missing imports;
+  single LayerfsError class). workspace.ts 4158 → 3183 lines; gitapply.ts 977; errors.ts 9.
+- 9c47610 fix R1: the object fence's folders are opened before the first host write; an unreadable
+  one refuses the apply with nothing written. Approved.
+- Full suite passes (review-fixes 85/85). No findings. **Push-ready: yes.**
