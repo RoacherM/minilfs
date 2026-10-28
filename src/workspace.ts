@@ -487,11 +487,13 @@ export class LayerfsSession {
   async syncHostDriftIntoMain(options: { full?: boolean } = {}): Promise<{ synced: string[] }> {
     return this.bindings.withProjectLock(this.projectRecord.name, async (guard) => {
       // in memory too: an apply whose bindings write failed still resyncs main
-      const full = options.full || Boolean(this.bindings.byName(this.projectRecord.name)?.mainStale || this.projectRecord.mainStale);
+      // and when the folder's index is missing or unreadable: an empty one would hide every deletion from main
+      const hostIdx = this.bindings.readHostIndexOrNull(this.projectRecord.name);
+      const full = options.full || Boolean(this.bindings.byName(this.projectRecord.name)?.mainStale || this.projectRecord.mainStale) || hostIdx === null;
       // an apply could not finish the folder's git metadata: main keeps its own until the user clears
       // that (then main is resynced in full, git included); the folder's half-written git never
       // spreads to main and the Branches forked from it
-      const prev = full ? await this.mainIndex() : this.bindings.readHostIndex(this.projectRecord.name);
+      const prev = full ? await this.mainIndex() : hostIdx!;
       const scanned = await scanHostDirectory(this.cwd, this.hostSkip, full ? {} : prev, true);
       const curr = scanned.index;
       // (the scan saw markers in nested repositories too)
@@ -2404,7 +2406,15 @@ export class LayerfsSession {
         this.adoptRecovery(foreign[0].dir, foreign.map((x) => x.m));
         throw recoveryPendingError(foreign[0].dir);
       }
-      const hostIndex = this.bindings.readHostIndex(this.projectRecord.name);
+      // a missing or unreadable index: this apply writes one holding only what it applied, so main
+      // stays marked stale (a full resync next, never a comparison with that partial index)
+      const readIndex = this.bindings.readHostIndexOrNull(this.projectRecord.name);
+      const hostIndex = readIndex ?? {};
+      /** main was already behind the folder: it stays marked until a full resync (syncHostDriftIntoMain) */
+      const wasMainStale = Boolean(this.bindings.byName(this.projectRecord.name)?.mainStale || this.projectRecord.mainStale);
+      /** this apply marked main stale (durably, before the folder first changed): cleared once it ends with main caught up */
+      let markedStale = false;
+      let publishFailed = false;
       const tmps: string[] = [];
       const checkTarget = async (rel: string) => {
         const target = join(this.cwd, rel);
@@ -2415,9 +2425,22 @@ export class LayerfsSession {
       /** set before the folder is first changed: a stop after it leaves main behind the folder */
       let hostTouched = false;
       /**
+       * Before the folder first changes: main is marked stale durably (a failed bindings write stops
+       * the apply before anything changed), so a power loss mid-apply resyncs main in full, never
+       * from a checkpoint of the folder's index that did not reach the disk.
+       */
+      const touchHost = () => {
+        if (hostTouched) return;
+        if (!wasMainStale) { this.bindings.setMainStale(this.projectRecord.name, true); markedStale = true; }
+        this.projectRecord.mainStale = true;
+        hostTouched = true;
+      };
+      /**
        * The folder's index while files land: a checkpoint without fsync every INDEX_CHECKPOINT_FILES
-       * files or INDEX_CHECKPOINT_MS (a stale index only costs a rescan: its entries are signatures),
-       * durable at every recovery transition, at the end, and when apply stops.
+       * files or INDEX_CHECKPOINT_MS, durable at every recovery transition, at the end, and when
+       * apply stops. A checkpoint lost to a power loss is safe only because main was marked stale
+       * durably first (touchHost): the next start compares the folder with main in full, as it does
+       * when the index is missing or unreadable (syncHostDriftIntoMain), so no deletion is hidden.
        */
       let indexChanges = 0, indexWrittenAt = Date.now(), indexUndurable = false;
       const flushIndex = (durable: boolean) => {
@@ -2427,11 +2450,22 @@ export class LayerfsSession {
         indexWrittenAt = Date.now();
         indexUndurable = !durable;
       };
-      /** folders holding git objects put() installed, or a folder it made for them: fsynced before any ref or index names them */
+      /**
+       * The folders holding every git object the Branch has (installed now, or found in place: an
+       * earlier apply that stopped after renaming it), up to the folder (that apply may have made
+       * them, a nested repository's git dir too): fsynced before any ref or index names them. An object found in place had its bytes fsynced before that rename
+       * (put(), writeFileDurable); only its folder entry may still be in the OS cache, so its folders
+       * are fsynced, not the file again.
+       */
       const objectDirs = new Set<string>();
+      for (const f of found) {
+        if (f.git !== "object" || !f.next) continue;
+        for (let d = dirname(join(this.cwd, f.rel)); d.startsWith(`${this.cwd}/`); d = dirname(d)) objectDirs.add(d);
+        objectDirs.add(this.cwd);
+      }
       const put = async (rel: string, next: Next, git: GitPathKind = "none") => {
         const target = join(this.cwd, rel);
-        hostTouched = true;
+        touchHost();
         if (!next) {
           await fsp.rm(target, { force: true });
           delete hostIndex[rel];
@@ -2446,7 +2480,6 @@ export class LayerfsSession {
           // a git object (loose object, pack and its .idx, lfs object): its bytes and its folder entry
           // are made durable before the refs and the index naming it (fsynced; the folders below)
           const durable = git === "object";
-          if (durable) for (let d = dirname(target); d.startsWith(`${this.cwd}/`) && !existsSync(d); d = dirname(d)) objectDirs.add(dirname(d));
           await fsp.mkdir(dirname(target), { recursive: true });
           const tmp = join(dirname(target), `.${posix.basename(rel)}.minilfs-${randomBytes(4).toString("hex")}`);
           tmps.push(tmp);
@@ -2457,7 +2490,6 @@ export class LayerfsSession {
           }
           await fsp.rename(tmp, target);
           tmps.pop();
-          if (durable) objectDirs.add(dirname(target));
           const st = await fsp.lstat(target);
           hostIndex[rel] = { ...fileSig(next.data, next.mode), mode: next.mode & 0o7777, mtimeMs: st.mtimeMs, size: st.size };
         }
@@ -2477,7 +2509,10 @@ export class LayerfsSession {
           await put(rel, next, git);
         }
         // the objects' folder entries on disk before writeGitLocked makes a ref or the index naming them durable
-        for (const d of objectDirs) await fsyncDir(d);
+        // (deepest first; a folder that does not exist holds no object)
+        for (const d of [...objectDirs].sort((a, b) => b.length - a.length)) {
+          await fsyncDir(d).catch((e: any) => (e?.code === "ENOENT" || e?.code === "ENOTDIR" ? undefined : Promise.reject(e)));
+        }
         if (gitMeta.length) {
           guard();
           const dropMeta = (why: string) => {
@@ -2490,7 +2525,7 @@ export class LayerfsSession {
           const reads: GitReads = new Map();
           const missing = await gitObjectsMissing(this.cwd, gitMeta, layout, reads);
           const locked = gitMeta.filter((g) => g.git !== "soft");
-          if (!missing) hostTouched = true;
+          if (!missing) touchHost();
           const restored: string[] = [];
           const moved = missing ? null : await writeGitLocked(this.cwd, locked, layout, {
             root: join(this.config.root, "recovery"),
@@ -2573,11 +2608,16 @@ export class LayerfsSession {
           }
         }
       } catch (e: any) {
+        publishFailed = true;
         this.markMainStale();
         result.warnings.push(`your folder is updated, but LayerFS main could not be updated (${e?.code ?? "Error"}: ${String(e?.message ?? e).slice(0, 160)}); the next session will resync main from your folder`);
       }
 
       if (gitDiverged) this.markMainStale();
+      else if (markedStale && !publishFailed && readIndex) {
+        // main holds what the folder got (the folder's index is durable): the mark this apply set goes
+        try { this.bindings.setMainStale(this.projectRecord.name, false); this.projectRecord.mainStale = false; } catch (e: any) { this.log(`could not clear main's stale mark: ${e?.message ?? e}`); }
+      }
       this.baseBranch = nextBase;
       this.baseRef = fb.head ?? fb.base;
       // the folder now matches snapRef (the work branch's head, pinned under the mutex)
@@ -3675,7 +3715,8 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
         for (const line of (b?.toString("utf8") ?? "").split("\n")) { const m = /^([0-9a-f]+) (\S+)$/.exec(line); if (m) out.set(m[2], m[1]); }
         return out;
       };
-      const packedBefore = installed.has(packedRel) ? packedOf(prev.get(packedRel)?.data) : null;
+      // rewritten or deleted here (the Branch's packed-refs gone: its refs live loose or nowhere)
+      const packedBefore = installed.has(packedRel) || unlinked.has(packedRel) ? packedOf(prev.get(packedRel)?.data) : null;
       for (const id of await worktreeList(join(cwd, common))) {
         const wt = `worktrees/${id}`;
         let text = await refFileState(join(cwd, common, wt, "HEAD"));

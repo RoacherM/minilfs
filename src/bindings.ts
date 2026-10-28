@@ -259,9 +259,17 @@ export class BindingStore {
   }
 
   readHostIndex(projectName: string): HostIndex {
+    return this.readHostIndexOrNull(projectName) ?? {};
+  }
+
+  /** null when the folder's index is missing or unreadable (e.g. a checkpoint lost to a power loss): compare with main in full */
+  readHostIndexOrNull(projectName: string): HostIndex | null {
     const f = this.manifestFile(projectName);
-    if (!existsSync(f)) return {};
-    try { return JSON.parse(readFileSync(f, "utf8")); } catch { return {}; }
+    if (!existsSync(f)) return null;
+    try {
+      const idx = JSON.parse(readFileSync(f, "utf8"));
+      return idx && typeof idx === "object" && !Array.isArray(idx) ? idx : null;
+    } catch { return null; }
   }
 
   /** `durable` false: a checkpoint without fsync (apply while files land; see writeFileAtomicSync) */

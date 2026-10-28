@@ -2112,6 +2112,133 @@ try {
     assert.ok(!events.some((e) => e[0] === "sync" && /\/src\/(\.app\.js\.minilfs-|app\.js$)/.test(e[1] ?? "")), "working-tree files are not fsynced");
   });
 
+  await step("Q1 a worktree added on a branch that lived only in packed-refs, while apply deletes packed-refs: the branch is put back loose", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1"); g("branch", "topic"); g("pack-refs", "--all", "--prune");
+    const topic = g("rev-parse", "topic").stdout.trim();
+    writeFileSync(join(cwd, ".git/refs/heads/main"), `${topic}\n`); // main loose again (the Store keeps no empty refs/ folder)
+    assert.equal(existsSync(join(cwd, ".git/refs/heads/topic")), false, "topic only packed");
+    const s = await open(cwd, "q1");
+    // topic deleted, packed-refs gone (the Branch deletes the file)
+    const o = out();
+    await s.mutate("1", "bash", () => s.exec("git branch -D topic >/dev/null && rm -f .git/packed-refs && echo OK", cwd, o));
+    assert.match(o.text(), /OK/, o.text());
+    const realRm = fsp.rm;
+    let fired = false;
+    fsp.rm = async (...args) => {
+      const r = await realRm.apply(fsp, args);
+      if (!fired && String(args[0]) === join(cwd, ".git/packed-refs")) {
+        fired = true; // git worktree add, between apply's last listing check and its renames
+        mkdirSync(join(cwd, ".git/worktrees/wt-new"), { recursive: true });
+        writeFileSync(join(cwd, ".git/worktrees/wt-new/HEAD"), "ref: refs/heads/topic\n");
+        writeFileSync(join(cwd, ".git/worktrees/wt-new/commondir"), "../..\n");
+        writeFileSync(join(cwd, ".git/worktrees/wt-new/gitdir"), `${cwd}-wt-new/.git\n`);
+      }
+      return r;
+    };
+    let ap;
+    try { ap = await s.apply(); } finally { fsp.rm = realRm; }
+    assert.ok(fired, "the race ran");
+    assert.equal(existsSync(join(cwd, ".git/packed-refs")), false, "packed-refs deleted");
+    assert.match(ap.warnings.join("\n"), /worktree wt-new.*refs\/heads\/topic.*restored/, ap.warnings.join("\n"));
+    assert.equal(readFileSync(join(cwd, ".git/refs/heads/topic"), "utf8"), `${topic}\n`, "topic put back loose");
+    assert.equal(g("rev-parse", "--verify", "-q", "topic").stdout.trim(), topic);
+    assert.equal(spawnSync("find", [join(cwd, ".git"), "-name", "*.lock"], { encoding: "utf8" }).stdout.trim(), "", "no lock left");
+  });
+
+  await step("Q2 objects an interrupted apply left in place (seen as unchanged): their folders are fsynced before the ref naming them", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+    const s = await open(cwd, "q2");
+    const env = "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t;";
+    const o = out();
+    await s.mutate("1", "bash", () => s.exec(`${env} echo 'export const x = 2;' > src/app.js && git commit -qam c2 && git rev-parse HEAD && git rev-list --objects HEAD~1..HEAD | cut -d' ' -f1`, cwd, o));
+    const lines = o.text().trim().split("\n");
+    const c2 = lines[0];
+    const oids = lines.slice(1).filter((l) => /^[0-9a-f]{40}$/.test(l));
+    assert.ok(oids.length >= 3, o.text());
+    // the first apply renamed the objects into place, then stopped (the ref never written)
+    for (const oid of oids) {
+      const rel = `.git/objects/${oid.slice(0, 2)}/${oid.slice(2)}`;
+      const bytes = await s.readFile(join(cwd, rel));
+      mkdirSync(join(cwd, ".git/objects", oid.slice(0, 2)), { recursive: true });
+      writeFileSync(join(cwd, rel), bytes, { mode: 0o444 });
+    }
+    const events = [];
+    const fdPath = new Map();
+    const probe = await fsp.open(join(cwd, "a.txt"), "r");
+    const proto = Object.getPrototypeOf(probe);
+    await probe.close();
+    const real = { open: fsp.open, rename: fsp.rename, sync: proto.sync };
+    fsp.open = async (...args) => { const fh = await real.open.apply(fsp, args); fdPath.set(fh.fd, String(args[0])); return fh; };
+    proto.sync = function (...args) { events.push(["sync", fdPath.get(this.fd)]); return real.sync.apply(this, args); };
+    fsp.rename = async (...args) => { events.push(["rename", String(args[0]), String(args[1])]); return real.rename.apply(fsp, args); };
+    let ap;
+    try { ap = await s.apply(); } finally { Object.assign(fsp, { open: real.open, rename: real.rename }); proto.sync = real.sync; }
+    assert.deepEqual(ap.warnings, [], ap.warnings.join("; "));
+    assert.equal(g("rev-parse", "main").stdout.trim(), c2);
+    const ref = events.findIndex((e) => e[0] === "rename" && e[2] === join(cwd, ".git/refs/heads/main"));
+    assert.ok(ref >= 0, "main renamed into place");
+    assert.ok(!events.some((e) => e[0] === "rename" && /\/\.git\/objects\//.test(e[2])), "the objects in place are not written again");
+    for (const oid of oids) {
+      const dir = join(cwd, ".git/objects", oid.slice(0, 2));
+      const synced = events.findIndex((e) => e[0] === "sync" && e[1] === dir);
+      assert.ok(synced >= 0 && synced < ref, `.git/objects/${oid.slice(0, 2)} fsynced before the ref`);
+    }
+    const objs = events.findIndex((e) => e[0] === "sync" && e[1] === join(cwd, ".git/objects"));
+    assert.ok(objs >= 0 && objs < ref, ".git/objects fsynced before the ref");
+  });
+
+  await step("Q3 a missing or unreadable folder index never hides a deletion from main; apply marks main stale durably before the folder first changes", async () => {
+    const cwd = project();
+    let s = await open(cwd, "q3a");
+    const inMain = (p) => s.lfs.fs.stat("main", p).then(() => true, () => false);
+    assert.equal(s.bindings.byName(s.project).mainStale ?? false, false);
+    // 1. the index unreadable (a checkpoint lost to a power loss), main not marked stale: a deletion still reaches main
+    rmSync(join(cwd, "a.txt"));
+    writeFileSync(s.bindings.manifestFile(s.project), "{corrupt");
+    let sync = await s.syncHostDriftIntoMain();
+    assert.ok(sync.synced.includes("a.txt"), JSON.stringify(sync.synced));
+    assert.equal(await inMain("/a.txt"), false, "a.txt removed from main");
+    // and missing
+    rmSync(join(cwd, "run.sh"));
+    rmSync(s.bindings.manifestFile(s.project));
+    sync = await s.syncHostDriftIntoMain();
+    assert.ok(sync.synced.includes("run.sh"), JSON.stringify(sync.synced));
+    assert.equal(await inMain("/run.sh"), false, "run.sh removed from main");
+    // 2. apply stops on its 2nd file: main was marked stale on disk before the 1st file landed
+    s = await open(cwd, "q3b");
+    await s.mutate("1", "write", () => s.writeFile(join(cwd, "aa1.txt"), "1\n"));
+    await s.mutate("2", "write", () => s.writeFile(join(cwd, "zz2.txt"), "2\n"));
+    const onDisk = () => JSON.parse(readFileSync(s.bindings.file, "utf8")).projects[s.project].mainStale ?? false;
+    assert.equal(onDisk(), false);
+    const realRename = fsp.rename;
+    let staleAtFirst = null;
+    fsp.rename = async (...args) => {
+      if (String(args[1]) === join(cwd, "aa1.txt")) staleAtFirst = onDisk();
+      if (String(args[1]) === join(cwd, "zz2.txt")) throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+      return realRename.apply(fsp, args);
+    };
+    try { await assert.rejects(s.apply(), (e) => e.result?.applied?.includes("aa1.txt")); } finally { fsp.rename = realRename; }
+    assert.equal(staleAtFirst, true, "main marked stale durably before the first file changed");
+    assert.equal(onDisk(), true);
+    // 3. a full resync clears it; an apply that ends with main caught up clears its own mark
+    await s.syncHostDriftIntoMain();
+    assert.equal(onDisk(), false);
+    s = await open(cwd, "q3c");
+    await s.mutate("3", "write", () => s.writeFile(join(cwd, "cc3.txt"), "3\n"));
+    const ap = await s.apply();
+    assert.deepEqual(ap.applied, ["cc3.txt"]);
+    assert.equal(onDisk(), false, "a finished apply leaves main unmarked");
+    // 4. an apply that starts from an unreadable index leaves main marked (its index holds only what it applied)
+    await s.mutate("4", "write", () => s.writeFile(join(cwd, "dd4.txt"), "4\n"));
+    writeFileSync(s.bindings.manifestFile(s.project), "{corrupt");
+    await s.apply();
+    assert.equal(onDisk(), true, "main resyncs in full");
+  });
+
   await step("m1 a recovery marker that is a folder: its subtree never reaches main; clear quarantines it (renamed .bad-<time>, reported), never deletes it", async () => {
     const cwd = project();
     const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
