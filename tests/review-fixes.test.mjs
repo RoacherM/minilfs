@@ -1988,6 +1988,130 @@ try {
     assert.match(err.message, /warnings: .*updated \.git\/refs\/heads\/a .*kept/, err.message);
   });
 
+  await step("M1 a nested repository's marker written by another session is adopted, never truncated or removed: before the apply, under the locks, and at the exclusive create", async () => {
+    const env = "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t;";
+    const foreign = `/tmp/foreign-rec-${id}`;
+    const setup = async (name) => {
+      const cwd = project();
+      const gi = (dir, ...a) => spawnSync("git", ["-C", dir, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+      gi(cwd, "init", "-q", "-b", "main"); gi(cwd, "add", "-A"); gi(cwd, "commit", "-qm", "c1");
+      const sub = join(cwd, "sub");
+      mkdirSync(sub);
+      writeFileSync(join(sub, "s.txt"), "s\n");
+      gi(sub, "init", "-q", "-b", "main"); gi(sub, "add", "-A"); gi(sub, "commit", "-qm", "s1");
+      const s1 = gi(sub, "rev-parse", "HEAD").stdout.trim();
+      const s = await open(cwd, name);
+      const o = out();
+      await s.mutate("1", "bash", () => s.exec(`${env} cd sub && git commit -q --allow-empty -m s2 && echo OK`, cwd, o));
+      assert.match(o.text(), /OK/, o.text());
+      return { cwd, s, s1, subMain: () => gi(sub, "rev-parse", "main").stdout.trim(), marker: join(sub, ".git/minilfs-recovery") };
+    };
+    const noLocks = (cwd) => assert.equal(spawnSync("find", [cwd, "-name", "*.lock"], { encoding: "utf8" }).stdout.trim(), "", "no lock left");
+    const adopted = async (s, marker, run) => {
+      let err = null;
+      await run().catch((e) => { err = e; });
+      assert.equal(err?.code, "RecoveryPending", String(err?.stack ?? err));
+      assert.equal(s.recoveryDir, foreign, "the other session's recovery is adopted");
+      assert.equal(readFileSync(marker, "utf8"), `${foreign}\n`, "its marker is intact");
+      assert.equal(existsSync(join(s.cwd, ".git/minilfs-recovery")), false, "no marker of ours left");
+    };
+    // 1. written before the apply: refused before anything is written
+    let { cwd, s, s1, subMain, marker } = await setup("m1a");
+    writeFileSync(marker, `${foreign}\n`);
+    await adopted(s, marker, () => s.apply());
+    assert.equal(subMain(), s1, "the nested repository's branch untouched");
+    // 2. written once apply took its first lock there: seen under the locks, before any change
+    ({ cwd, s, s1, subMain, marker } = await setup("m1b"));
+    const realOpen = fsp.open;
+    let fired = false;
+    fsp.open = async (...args) => {
+      const p = String(args[0]);
+      if (!fired && p.startsWith(join(cwd, "sub/.git/")) && p.endsWith(".lock")) { fired = true; writeFileSync(marker, `${foreign}\n`); }
+      return realOpen.apply(fsp, args);
+    };
+    try { await adopted(s, marker, () => s.apply()); } finally { fsp.open = realOpen; }
+    assert.ok(fired, "the race ran");
+    assert.equal(subMain(), s1, "the nested repository's branch untouched");
+    noLocks(cwd);
+    // 3. written between that check and our create: the exclusive create fails, ours are undone
+    ({ cwd, s, s1, subMain, marker } = await setup("m1c"));
+    fired = false;
+    fsp.open = async (...args) => {
+      if (!fired && String(args[0]) === marker) { fired = true; writeFileSync(marker, `${foreign}\n`); }
+      return realOpen.apply(fsp, args);
+    };
+    try { await adopted(s, marker, () => s.apply()); } finally { fsp.open = realOpen; }
+    assert.ok(fired, "the race ran");
+    assert.equal(subMain(), s1, "the nested repository's branch untouched");
+    noLocks(cwd);
+    const recRoot = join(config.root, "recovery");
+    assert.deepEqual(existsSync(recRoot) ? readdirSync(recRoot).filter((d) => d.startsWith(`${s.project}-`)) : [], [], "our saved versions removed");
+  });
+
+  await step("M2 a worktree added on a branch apply is deleting, after the last listing check: the branch is put back, with a warning", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1"); g("branch", "topic");
+    const topic = readFileSync(join(cwd, ".git/refs/heads/topic"), "utf8");
+    const s = await open(cwd, "m2");
+    await s.mutate("1", "bash", () => s.exec("git branch -D topic >/dev/null", cwd, out()));
+    const realRm = fsp.rm;
+    let fired = false;
+    fsp.rm = async (...args) => {
+      const r = await realRm.apply(fsp, args);
+      if (!fired && String(args[0]) === join(cwd, ".git/refs/heads/topic")) {
+        fired = true; // git worktree add, between apply's last listing check and its renames
+        mkdirSync(join(cwd, ".git/worktrees/wt-new"), { recursive: true });
+        writeFileSync(join(cwd, ".git/worktrees/wt-new/HEAD"), "ref: refs/heads/topic\n");
+        writeFileSync(join(cwd, ".git/worktrees/wt-new/commondir"), "../..\n");
+        writeFileSync(join(cwd, ".git/worktrees/wt-new/gitdir"), `${cwd}-wt-new/.git\n`);
+      }
+      return r;
+    };
+    let ap;
+    try { ap = await s.apply(); } finally { fsp.rm = realRm; }
+    assert.ok(fired, "the race ran");
+    assert.match(ap.warnings.join("\n"), /worktree wt-new.*refs\/heads\/topic.*restored/, ap.warnings.join("\n"));
+    assert.equal(readFileSync(join(cwd, ".git/refs/heads/topic"), "utf8"), topic, "topic put back");
+    assert.equal(spawnSync("find", [join(cwd, ".git"), "-name", "*.lock"], { encoding: "utf8" }).stdout.trim(), "", "no lock left");
+    assert.equal(s.bindings.byName(s.project).mainStale, true, "main resyncs from the folder");
+  });
+
+  await step("M3 git objects installed by apply are fsynced (bytes and folder entries) before the refs naming them; working-tree files are not", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+    const s = await open(cwd, "m3");
+    const env = "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t;";
+    const o = out();
+    await s.mutate("1", "bash", () => s.exec(`${env} echo 'export const x = 2;' > src/app.js && git commit -qam c2 && git rev-parse HEAD`, cwd, o));
+    const c2 = o.text().trim().split("\n").pop();
+    const events = [];
+    const fdPath = new Map();
+    const probe = await fsp.open(join(cwd, "a.txt"), "r");
+    const proto = Object.getPrototypeOf(probe);
+    await probe.close();
+    const real = { open: fsp.open, rename: fsp.rename, sync: proto.sync };
+    fsp.open = async (...args) => { const fh = await real.open.apply(fsp, args); fdPath.set(fh.fd, String(args[0])); return fh; };
+    proto.sync = function (...args) { events.push(["sync", fdPath.get(this.fd)]); return real.sync.apply(this, args); };
+    fsp.rename = async (...args) => { events.push(["rename", String(args[0]), String(args[1])]); return real.rename.apply(fsp, args); };
+    let ap;
+    try { ap = await s.apply(); } finally { Object.assign(fsp, { open: real.open, rename: real.rename }); proto.sync = real.sync; }
+    assert.deepEqual(ap.warnings, [], ap.warnings.join("; "));
+    assert.equal(g("rev-parse", "main").stdout.trim(), c2);
+    const ref = events.findIndex((e) => e[0] === "rename" && e[2] === join(cwd, ".git/refs/heads/main"));
+    assert.ok(ref >= 0, "main renamed into place");
+    const objects = events.filter((e) => e[0] === "rename" && /\/\.git\/objects\/[0-9a-f]{2}\/[0-9a-f]{38}$/.test(e[2]));
+    assert.ok(objects.length >= 3, `new objects installed: ${objects.length}`);
+    for (const [, tmp, dst] of objects) {
+      const synced = events.findIndex((e) => e[0] === "sync" && e[1] === tmp);
+      assert.ok(synced >= 0 && synced < ref, `${dst.slice(cwd.length)}'s bytes fsynced before the ref`);
+      const dir = events.findIndex((e, i) => i > events.indexOf(objects.find((x) => x[2] === dst)) && e[0] === "sync" && e[1] === join(dst, ".."));
+      assert.ok(dir >= 0 && dir < ref, `${dst.slice(cwd.length)}'s folder fsynced before the ref`);
+    }
+    assert.ok(!events.some((e) => e[0] === "sync" && /\/src\/(\.app\.js\.minilfs-|app\.js$)/.test(e[1] ?? "")), "working-tree files are not fsynced");
+  });
+
   await step("too-large first import is refused before copying, naming the largest folders", async () => {
     const cwd = project();
     mkdirSync(join(cwd, "big"));

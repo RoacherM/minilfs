@@ -2078,7 +2078,14 @@ export class LayerfsSession {
    */
   get recoveryDir(): string | null {
     if (!this.bindings || !this.projectRecord) return null;
-    return this.bindings.byName(this.projectRecord.name)?.recoveryDir ?? readFolderRecoveryMarker(this.cwd);
+    const rec = this.bindings.byName(this.projectRecord.name);
+    if (rec?.recoveryDir) return rec.recoveryDir;
+    // the folder's markers: the top-level one, those recorded, those a scan saw in nested repositories
+    for (const m of new Set([`.git/${RECOVERY_MARKER}`, ...(rec?.recoveryMarkers ?? []), ...this.nestedMarkers])) {
+      const dir = readFolderRecoveryMarker(this.cwd, m);
+      if (dir) return dir;
+    }
+    return null;
   }
 
   /** Removes the per-project scratch build cache directory (`<root>/scratch/<project>`). */
@@ -2255,12 +2262,7 @@ export class LayerfsSession {
       // (a missing folder is not "dealt with": only the user says so, with recover --clear)
       // the folder's own marker counts too (a folder moved, or a binding write lost to a power loss)
       const recDir = this.recoveryDir;
-      if (recDir) {
-        const how = "then run /minilfs recover --clear (or the minilfs tool with action=recover clear=true) to apply again";
-        throw new LayerfsError("RecoveryPending", existsSync(recDir)
-          ? `an earlier apply could not finish putting your folder's git metadata (refs, HEAD, index) back; their previous versions are saved in ${recDir} (see manifest.json there). Check the folder's git, restore what is needed from that folder, ${how}.`
-          : `an earlier apply did not finish changing your folder's git metadata (refs, HEAD, index); its saved previous versions (${recDir}) are gone. Check the folder's git (git status, git fsck), ${how}.`);
-      }
+      if (recDir) throw recoveryPendingError(recDir);
       const result: ApplyResult = { applied: [], skipped: [], conflicts: [], unchanged: [], warnings: [] };
       const snapRef = this.headCommit ?? this.baseRef;
       this.seq++;
@@ -2386,6 +2388,14 @@ export class LayerfsSession {
         ...plan.filter((p) => p.next).sort((a, b) => depth(a.rel) - depth(b.rel)),
         ...gitObjects.sort((a, b) => depth(a.rel) - depth(b.rel)),
       ];
+      // another session's pending recovery in a repository this apply writes to (a nested repository
+      // opened as its own project, whose apply could not finish): adopted, nothing written. Checked
+      // again under git's locks and at the exclusive create of each marker (writeGitLocked)
+      const foreign = foundRecoveryMarkers(this.cwd, recoveryMarkersFor(this.cwd, gitMeta.filter((g) => g.git !== "soft").map((g) => g.rel)));
+      if (foreign.length) {
+        this.adoptRecovery(foreign[0].dir, foreign.map((x) => x.m));
+        throw recoveryPendingError(foreign[0].dir);
+      }
       const hostIndex = this.bindings.readHostIndex(this.projectRecord.name);
       const tmps: string[] = [];
       const checkTarget = async (rel: string) => {
@@ -2396,7 +2406,9 @@ export class LayerfsSession {
       };
       /** set before the folder is first changed: a stop after it leaves main behind the folder */
       let hostTouched = false;
-      const put = async (rel: string, next: Next) => {
+      /** folders holding git objects put() installed, or a folder it made for them: fsynced before any ref or index names them */
+      const objectDirs = new Set<string>();
+      const put = async (rel: string, next: Next, git: GitPathKind = "none") => {
         const target = join(this.cwd, rel);
         hostTouched = true;
         if (!next) {
@@ -2410,13 +2422,21 @@ export class LayerfsSession {
           const st = await fsp.lstat(target);
           hostIndex[rel] = { ...linkSig(next.target), mtimeMs: st.mtimeMs, size: st.size };
         } else {
+          // a git object (loose object, pack and its .idx, lfs object): its bytes and its folder entry
+          // are made durable before the refs and the index naming it (fsynced; the folders below)
+          const durable = git === "object";
+          if (durable) for (let d = dirname(target); d.startsWith(`${this.cwd}/`) && !existsSync(d); d = dirname(d)) objectDirs.add(dirname(d));
           await fsp.mkdir(dirname(target), { recursive: true });
           const tmp = join(dirname(target), `.${posix.basename(rel)}.minilfs-${randomBytes(4).toString("hex")}`);
           tmps.push(tmp);
-          await fsp.writeFile(tmp, next.data, { mode: next.mode & 0o7777 });
-          await fsp.chmod(tmp, next.mode & 0o7777);
+          if (durable) await writeFileDurable(tmp, next.data, next.mode & 0o7777);
+          else {
+            await fsp.writeFile(tmp, next.data, { mode: next.mode & 0o7777 });
+            await fsp.chmod(tmp, next.mode & 0o7777);
+          }
           await fsp.rename(tmp, target);
           tmps.pop();
+          if (durable) objectDirs.add(dirname(target));
           const st = await fsp.lstat(target);
           hostIndex[rel] = { ...fileSig(next.data, next.mode), mode: next.mode & 0o7777, mtimeMs: st.mtimeMs, size: st.size };
         }
@@ -2424,7 +2444,7 @@ export class LayerfsSession {
         this.bindings.writeHostIndex(this.projectRecord.name, hostIndex);
       };
       try {
-        for (const { rel, next, host } of ordered) {
+        for (const { rel, next, host, git } of ordered) {
           guard();
           const target = await checkTarget(rel);
           const now = await hostState(target);
@@ -2432,8 +2452,10 @@ export class LayerfsSession {
             result.conflicts.push(rel);
             throw new LayerfsError("ChangedDuringApply", `${rel} changed on disk while applying`);
           }
-          await put(rel, next);
+          await put(rel, next, git);
         }
+        // the objects' folder entries on disk before writeGitLocked makes a ref or the index naming them durable
+        for (const d of objectDirs) await fsyncDir(d);
         if (gitMeta.length) {
           guard();
           const dropMeta = (why: string) => {
@@ -2447,16 +2469,21 @@ export class LayerfsSession {
           const missing = await gitObjectsMissing(this.cwd, gitMeta, layout, reads);
           const locked = gitMeta.filter((g) => g.git !== "soft");
           if (!missing) hostTouched = true;
+          const restored: string[] = [];
           const moved = missing ? null : await writeGitLocked(this.cwd, locked, layout, {
             root: join(this.config.root, "recovery"),
             project: this.projectRecord.name,
             warnings: result.warnings,
+            restored,
             setRecoveryDir: (dir, markers) => { this.bindings.setRecoveryDir(this.projectRecord.name, dir, markers); this.projectRecord.recoveryDir = dir; },
           }, reads);
+          // a ref put back for a worktree added meanwhile: the folder keeps a ref main does not have
+          if (restored.length) gitDiverged = true;
           if (missing) dropMeta(`the Branch's git names objects your folder does not have (${missing})`);
           else if (moved) dropMeta(`your folder's git moved while applying (${moved})`);
           else {
             for (const g of locked) {
+              if (restored.includes(g.rel)) { result.skipped.push(g.rel); continue; } // the folder kept it (see the warning)
               result.applied.push(g.rel);
               if (!g.next) delete hostIndex[g.rel];
               else {
@@ -2467,7 +2494,8 @@ export class LayerfsSession {
             this.bindings.writeHostIndex(this.projectRecord.name, hostIndex);
             // logs and messages: only where the folder still has the base version
             // deletions first, deepest first, so a log namespace change (logs/refs/heads/foo -> foo/bar) works
-            const soft = gitMeta.filter((x) => x.git === "soft");
+            // (a ref put back for a new worktree keeps its log)
+            const soft = gitMeta.filter((x) => x.git === "soft" && !(x.next === null && restored.includes(x.rel.replace(/(^|\/)logs\/(refs\/)/, "$1$2"))));
             for (const g of [...soft.filter((x) => !x.next).sort((a, b) => depth(b.rel) - depth(a.rel)), ...soft.filter((x) => x.next)]) {
               const now = await hostState(join(this.cwd, g.rel));
               if (now !== "other" && sameSig(now, g.host)) await put(g.rel, g.next);
@@ -2487,6 +2515,8 @@ export class LayerfsSession {
           try { this.bindings.setRecoveryDir(this.projectRecord.name, e.recoveryDir); } catch {}
         }
         try { this.bindings.writeHostIndex(this.projectRecord.name, hostIndex); } catch (we: any) { this.log(`could not save the folder's index: ${we?.message ?? we}`); }
+        // another session's pending recovery, adopted under the locks: apply refuses, as up front
+        if (e?.code === "RecoveryPending") { e.result = result; throw e; }
         const err = new LayerfsError(e?.code ?? "PartialApply", `apply stopped after ${result.applied.length} file(s): ${e?.message ?? e}`);
         (err as any).result = result;
         throw err;
@@ -2529,6 +2559,13 @@ export class LayerfsSession {
       this.persistSessionBinding();
       return result;
     });
+  }
+
+  /** Records another session's pending recovery (found in the folder's markers) for this project: apply refuses until it is cleared. */
+  private adoptRecovery(dir: string, markers: string[]): void {
+    this.bindings.setRecoveryDir(this.projectRecord.name, dir, markers);
+    this.projectRecord.recoveryDir = dir;
+    this.log(`the folder records a pending git recovery (${dir}): apply refuses until /minilfs recover --clear`);
   }
 
   /** main lags the folder: resync it next time. In memory first, so a failed bindings write still counts (and never hides the caller's error). */
@@ -3171,7 +3208,11 @@ async function gitObjectsMissing(cwd: string, meta: GitWrite[], layout?: GitLayo
  * Where writeGitLocked saves the folder's git metadata before changing it, where it reports, and how
  * it records (and, once the folder is whole again, forgets) the pending recovery for the project.
  */
-type GitRecovery = { root: string; project: string; warnings: string[]; setRecoveryDir: (dir: string | null, markers?: string[]) => void };
+type GitRecovery = {
+  root: string; project: string; warnings: string[]; setRecoveryDir: (dir: string | null, markers?: string[]) => void;
+  /** filled with the deletions put back for a worktree added meanwhile (the folder keeps them) */
+  restored?: string[];
+};
 
 /**
  * The folder's own record of a pending git recovery: `<git dir>/minilfs-recovery` (its text: the
@@ -3190,6 +3231,29 @@ export function readFolderRecoveryMarker(cwd: string, rel = `.git/${RECOVERY_MAR
   if (!st.isFile()) return m;
   try { return readFileSync(m, "utf8").trim() || m; } catch { return m; }
 }
+
+/** Apply refuses: an earlier apply's git recovery (the saved versions in `recDir`) is pending. */
+function recoveryPendingError(recDir: string): LayerfsError {
+  const how = "then run /minilfs recover --clear (or the minilfs tool with action=recover clear=true) to apply again";
+  return new LayerfsError("RecoveryPending", existsSync(recDir)
+    ? `an earlier apply could not finish putting your folder's git metadata (refs, HEAD, index) back; their previous versions are saved in ${recDir} (see manifest.json there). Check the folder's git, restore what is needed from that folder, ${how}.`
+    : `an earlier apply did not finish changing your folder's git metadata (refs, HEAD, index); its saved previous versions (${recDir}) are gone. Check the folder's git (git status, git fsck), ${how}.`);
+}
+
+/**
+ * The folder's markers a write of these git paths records (`<git dir>/minilfs-recovery`, see
+ * RECOVERY_MARKER): in the top-level .git (the folder's identity) and in every other .git a path is
+ * in (a nested repository; a submodule's or linked worktree's git dir lives inside its .git). Only
+ * folders named .git: the ones hostSkip, the recoveryDir getter and clearRecovery recognise.
+ */
+function recoveryMarkersFor(cwd: string, rels: string[]): string[] {
+  return [...new Set([".git", ...rels.map((r) => splitGitPath(r)?.dir).filter((d): d is string => Boolean(d))])]
+    .filter((d) => lstatSync(join(cwd, d), { throwIfNoEntry: false })?.isDirectory())
+    .map((d) => `${d}/${RECOVERY_MARKER}`);
+}
+/** The markers among `markers` the folder has (another session's pending recovery), with the recovery folder each names. */
+const foundRecoveryMarkers = (cwd: string, markers: string[]) =>
+  markers.map((m) => ({ m, dir: readFolderRecoveryMarker(cwd, m) })).filter((x): x is { m: string; dir: string } => Boolean(x.dir));
 
 /** Makes `dir`'s entries (a rename, a new or removed name in it) durable. */
 async function fsyncDir(dir: string): Promise<void> {
@@ -3317,6 +3381,7 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
     const dirs = new Set<string>();
     for (const it of items) dirs.add(posix.dirname(it.rel));
     for (const d of createdDirs) dirs.add(posix.dirname(d));
+    for (const d of restoredDirs) dirs.add(d);
     for (const d of dirs) {
       // a folder removed meanwhile (a namespace change emptied it): its parent holds the removal
       for (let cur = d; ; cur = posix.dirname(cur)) {
@@ -3473,11 +3538,16 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
    * The folder's markers (`<git dir>/minilfs-recovery`, see RECOVERY_MARKER): in the top-level .git
    * (the folder's identity) and in every other .git a written path is in (a nested repository).
    */
-  const markers = [...new Set([".git", ...items.map((i) => splitGitPath(i.rel)?.dir).filter((d): d is string => Boolean(d))])]
-    .filter((d) => lstatSync(join(cwd, d), { throwIfNoEntry: false })?.isDirectory())
-    .map((d) => `${d}/${RECOVERY_MARKER}`);
+  const markers = recoveryMarkersFor(cwd, items.map((i) => i.rel));
+  /** the markers this call created (exclusively): the only ones it ever removes */
+  const createdMarkers: string[] = [];
+  /** another session's pending recovery in a marker of `markers`: adopted for the project; apply refuses */
+  const adoptForeign = (found: Array<{ m: string; dir: string }>) => {
+    recovery.setRecoveryDir(found[0].dir, found.map((x) => x.m));
+    return recoveryPendingError(found[0].dir);
+  };
   const removeMarkers = async () => {
-    for (const m of markers) await fsp.rm(join(cwd, m), { force: true });
+    for (const m of [...createdMarkers]) { await fsp.rm(join(cwd, m), { force: true }); createdMarkers.splice(createdMarkers.indexOf(m), 1); }
     for (const m of markers) await fsyncDir(join(cwd, posix.dirname(m))).catch(() => {});
   };
   const persist = async () => {
@@ -3497,14 +3567,30 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
       await fsp.mkdir(dir, { recursive: true });
       await writeFileDurable(join(dir, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
       for (const d of [...dirs].sort((a, b) => b.length - a.length)) await fsyncDir(d);
-      for (const m of markers) await writeFileDurable(join(cwd, m), `${dir}\n`);
+      // created exclusively: a marker another session wrote meanwhile (a nested repository's own
+      // apply) is never overwritten: adopted, and this apply stops before any change
+      for (const m of markers) {
+        const fh = await fsp.open(join(cwd, m), "wx", 0o644).catch((e: any) => (e?.code === "EEXIST" ? null : Promise.reject(e)));
+        if (!fh) {
+          const err = adoptForeign([{ m, dir: readFolderRecoveryMarker(cwd, m) ?? join(cwd, m) }]);
+          (err as any).adopted = true;
+          throw err;
+        }
+        createdMarkers.push(m);
+        try {
+          await fh.writeFile(`${dir}\n`);
+          await fh.chmod(0o644);
+          await fh.sync();
+        } finally { await fh.close(); }
+      }
       for (const m of markers) await fsyncDir(join(cwd, posix.dirname(m)));
       recovery.setRecoveryDir(dir, markers);
       recDir = dir;
-    } catch (e) {
+    } catch (e: any) {
       // the record goes before the markers and the folder: a record whose folder is gone still blocks apply (never the reverse)
+      // (an adopted record is another session's: kept)
       let cleared = true;
-      try { recovery.setRecoveryDir(null); } catch { cleared = false; }
+      if (!e?.adopted) try { recovery.setRecoveryDir(null); } catch { cleared = false; }
       if (cleared) {
         await removeMarkers().catch(() => {});
         await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -3547,6 +3633,49 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
     }
     return null;
   };
+  /** folders of refs restoreForNewWorktrees wrote that no item names (made durable with the others) */
+  const restoredDirs = new Set<string>();
+  /** see the call in step 4: a deleted ref a worktree HEAD names now comes back */
+  const restoreForNewWorktrees = async () => {
+    const commons = new Set(listings.map(([rel]) => rel.slice(0, -"/worktrees/".length)));
+    for (const common of commons) {
+      const packedRel = `${common}/packed-refs`;
+      const packedOf = (b: Buffer | undefined | null) => {
+        const out = new Map<string, string>();
+        for (const line of (b?.toString("utf8") ?? "").split("\n")) { const m = /^([0-9a-f]+) (\S+)$/.exec(line); if (m) out.set(m[2], m[1]); }
+        return out;
+      };
+      const packedBefore = installed.has(packedRel) ? packedOf(prev.get(packedRel)?.data) : null;
+      for (const id of await worktreeList(join(cwd, common))) {
+        const wt = `worktrees/${id}`;
+        let text = await refFileState(join(cwd, common, wt, "HEAD"));
+        for (let hop = 0; hop < SYMREF_MAX_HOPS && Buffer.isBuffer(text); hop++) {
+          const m = /^ref:\s*(\S+)$/.exec(text.toString("utf8").trim());
+          if (!m || !isValidGitRefName(m[1])) break;
+          const target = m[1];
+          const rel = `${common}/${isWorktreeLocalRef(target) ? `${wt}/${target}` : target}`;
+          text = await refFileState(join(cwd, rel));
+          if (text !== null) continue; // there (loose): follow it
+          const packedNow = isWorktreeLocalRef(target) ? new Map<string, string>() : packedOf(await fsp.readFile(join(cwd, packedRel)).catch(() => null));
+          if (packedNow.has(target)) break; // a packed line still holds it
+          let old: { data: Buffer; mode: number } | null = null;
+          if (unlinked.has(rel)) old = prev.get(rel) ?? null;
+          else if (packedBefore?.has(target) && !isWorktreeLocalRef(target)) old = { data: Buffer.from(`${packedBefore.get(target)}\n`), mode: 0o644 };
+          if (!old) break; // not deleted here (packed, or unborn): nothing of ours to put back
+          await ensureDir(posix.dirname(rel));
+          const fh = held.has(lockOf(rel)) ? await fsp.open(lockOf(rel), "w", old.mode & 0o7777) : await relock(rel, old.mode & 0o7777);
+          held.add(lockOf(rel));
+          await putBack(fh, rel, old);
+          held.delete(lockOf(rel));
+          unlinked.delete(rel);
+          restoredDirs.add(posix.dirname(rel));
+          recovery.restored?.push(rel);
+          recovery.warnings.push(`worktree ${id} checked out ${target} while apply was deleting it; ${target} was restored`);
+          break;
+        }
+      }
+    }
+  };
   type Lockable = { rel: string; read?: { rel: string; expected: RefFileState }; item?: GitWrite };
   const takeAny = (l: Lockable) => (l.item ? take(l.item) : takeRead(l.read!));
   try {
@@ -3562,6 +3691,10 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
     }
     const listed = await listingsChanged();
     if (listed) return await stop(listed);
+    // a marker another session wrote since applyLocked checked (a nested repository's own apply that
+    // could not finish): adopted, nothing changed; persist() creates ours exclusively after this
+    const foreign = foundRecoveryMarkers(cwd, markers);
+    if (foreign.length) throw adoptForeign(foreign);
     // the folder changes from step 2 on (step 2 and 3 run only for deletions a lock or a rename
     // waits for; else step 4): the previous versions are saved and recorded first
     await persist();
@@ -3600,6 +3733,12 @@ async function writeGitLocked(cwd: string, items: GitWrite[], layout: GitLayout 
       held.delete(lockOf(w.rel));
       installed.set(w.rel, { data: next.data, mode: next.mode & 0o7777, git: w.git });
     }
+    // A linked worktree's HEAD has no lock to hold before it exists: `git worktree add` after the
+    // last listing check can put one on a branch deleted here. Re-checked now, after the deletions
+    // and renames, and such a branch is put back from its previous version. This narrows the
+    // window, it does not close it: a worktree added after this check still dangles. git's own
+    // `git branch -d` has the same window (worktree.c reads the worktree HEADs without a lock).
+    await restoreForNewWorktrees();
     // the renames and deletions on disk before anything clears the record
     await syncParents();
     // everything is written: a deletion's lock that cannot be removed is reported, nothing is undone
