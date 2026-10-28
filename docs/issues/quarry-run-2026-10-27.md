@@ -277,3 +277,21 @@ no; must change N1 and N2.
 | N7 | outside `readdir` unbounded; ref names > 255 chars and `.LOCK` rejected beyond check-ref-format | Minor |
 
 N5 accepted as a documented limitation (fourth round): a submodule whose name holds `rebase-merge/`, `rebase-apply/`, `sequencer/` or `rr-cache/` has its refs and index read as transient (never applied), so a fake git layout there can never lower transient to an applied ref or index (comment in `classifyGitTail`, src/gitpaths.ts).
+
+## 10. Review of the fourth round (ab1ed08..4fce1c4) by auto/gpt-6-1-sol (high), 2026-10-27
+
+Implementation by auto/claude-opus-5-5 (2 commits; full suite: elevate 35, review-fixes 69, …, all
+pass). Verdicts: N1 incomplete, N2 partial, N3 N4 partial, N5 documented, N6 N7 addressed.
+Push-ready: no; must change P1–P3.
+
+| # | Finding | Severity |
+| --- | --- | --- |
+| P1 | validation reads HEAD and symrefs before locks; only changed items are locked: the user checks out `topic` between validation and the deletion of `topic` → HEAD dangles. Lock and re-check the graph's read dependencies (unchanged HEADs, symbolic predecessors, packed-refs) | Major |
+| P2 | a folder moved after `RollbackIncomplete` imports as a new project without `recoveryDir`: guard bypassed. Key pending recovery to the folder's identity (e.g. `.git` dev+ino), check before a fresh import | Major |
+| P3 | recovery files and the binding are written without fsync; target renames are not made durable before clearing recovery: power loss can lose the guard while keeping partial metadata | Major |
+| P4 | case-insensitive loose-ref aliases (`Main` vs `main`) not modelled | Minor |
+| P5 | linked-worktree `refs/worktree/*` resolved in the common dir | Minor |
+| P6 | dangling `refs/remotes/*/HEAD` after a prune refuses all metadata; unborn HEAD not re-checked when another branch gains its first commit | Minor |
+| P7 | rescue fallback of a fallback root leaves the recognised namespace | Minor |
+| P8 | error responses omit accumulated lock warnings | Minor |
+| P9 | `clearRecovery` clears the guard before marking main stale (two writes) | Minor |
