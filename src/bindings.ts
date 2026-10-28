@@ -61,12 +61,14 @@ interface BindingsData {
 /**
  * Writes `target` so that once this returns it survives a power loss: the bytes are fsynced in a
  * temporary file, renamed over `target`, and the folder holding it is fsynced (the rename itself).
+ * Not `durable`: the same atomic replace without the fsyncs (a checkpoint a crash may lose).
  */
-export function writeFileAtomicSync(target: string, data: string | Buffer, mode = 0o644): void {
+export function writeFileAtomicSync(target: string, data: string | Buffer, mode = 0o644, durable = true): void {
   const tmp = `${target}.${process.pid}.tmp`;
   const fd = openSync(tmp, "w", mode);
-  try { writeFileSync(fd, data); fsyncSync(fd); } finally { closeSync(fd); }
+  try { writeFileSync(fd, data); if (durable) fsyncSync(fd); } finally { closeSync(fd); }
   renameSync(tmp, target);
+  if (!durable) return;
   const dfd = openSync(dirname(target), "r");
   try { fsyncSync(dfd); } finally { closeSync(dfd); }
 }
@@ -262,7 +264,8 @@ export class BindingStore {
     try { return JSON.parse(readFileSync(f, "utf8")); } catch { return {}; }
   }
 
-  writeHostIndex(projectName: string, index: HostIndex): void {
-    writeFileAtomicSync(this.manifestFile(projectName), JSON.stringify(index));
+  /** `durable` false: a checkpoint without fsync (apply while files land; see writeFileAtomicSync) */
+  writeHostIndex(projectName: string, index: HostIndex, durable = true): void {
+    writeFileAtomicSync(this.manifestFile(projectName), JSON.stringify(index), 0o644, durable);
   }
 }

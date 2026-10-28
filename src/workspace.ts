@@ -609,7 +609,8 @@ export class LayerfsSession {
     // the folder's record of a pending git recovery is the folder's own: never in main, a Branch or
     // apply; one seen in a nested repository's .git is adopted too (adoptFolderRecovery)
     return (rel, isDir) => {
-      if (!isDir && isRecoveryMarker(rel)) { if (rel !== `.git/${RECOVERY_MARKER}`) this.nestedMarkers.add(rel); return true; }
+      // (a marker that is a folder, and a quarantined one, are skipped whole: their files never reach main)
+      if (isRecoveryMarkerTree(rel)) { if (isRecoveryMarker(rel) && rel !== `.git/${RECOVERY_MARKER}`) this.nestedMarkers.add(rel); return true; }
       return isExcludedPath(rel, patterns) || (isDir && isExcludedPath(`${rel}/x`, patterns));
     };
   }
@@ -2049,17 +2050,24 @@ export class LayerfsSession {
    * the pending recovery (and removes its saved versions) so apply runs again. main is resynced
    * from the folder next time (the folder's git may differ from what apply recorded).
    */
-  async clearRecovery(): Promise<{ cleared: string | null }> {
+  async clearRecovery(): Promise<{ cleared: string | null; renamed: string[] }> {
     return this.bindings.withProjectLock(this.projectRecord.name, async () => {
       const rec = this.bindings.byName(this.projectRecord.name);
       const recDir = this.recoveryDir;
       // the folder's markers first (a marker left alone would block apply again), then one binding
       // write that marks main stale and forgets the record (never one without the other), then the saved versions
-      const markers = new Set([`.git/${RECOVERY_MARKER}`, ...(rec?.recoveryMarkers ?? [])]);
+      const markers = new Set([`.git/${RECOVERY_MARKER}`, ...(rec?.recoveryMarkers ?? []), ...this.nestedMarkers]);
+      /** markers that were folders: never deleted (they hold someone's files), moved aside */
+      const renamed: string[] = [];
       for (const m of markers) {
         const abs = join(this.cwd, m);
         if (!isRecoveryMarker(m) || !(await assertInsideWorkspace(this.cwd, abs, true).then(() => true, () => false))) continue;
-        await fsp.rm(abs, { force: true });
+        const st = await fsp.lstat(abs).catch(() => null);
+        if (st?.isDirectory()) {
+          const bad = `${abs}.bad-${Date.now()}`;
+          await fsp.rename(abs, bad);
+          renamed.push(bad);
+        } else await fsp.rm(abs, { force: true });
         await fsyncDir(dirname(abs)).catch(() => {});
       }
       this.bindings.clearRecovery(this.projectRecord.name);
@@ -2068,7 +2076,7 @@ export class LayerfsSession {
       // the recovery folder only when it is one of ours (a marker's text names it; never anything else)
       const ours = recDir && resolve(recDir).startsWith(`${join(this.config.root, "recovery")}/`);
       if (ours) await fsp.rm(recDir, { recursive: true, force: true }).catch(() => {});
-      return { cleared: recDir };
+      return { cleared: recDir, renamed };
     });
   }
 
@@ -2406,6 +2414,19 @@ export class LayerfsSession {
       };
       /** set before the folder is first changed: a stop after it leaves main behind the folder */
       let hostTouched = false;
+      /**
+       * The folder's index while files land: a checkpoint without fsync every INDEX_CHECKPOINT_FILES
+       * files or INDEX_CHECKPOINT_MS (a stale index only costs a rescan: its entries are signatures),
+       * durable at every recovery transition, at the end, and when apply stops.
+       */
+      let indexChanges = 0, indexWrittenAt = Date.now(), indexUndurable = false;
+      const flushIndex = (durable: boolean) => {
+        if (!indexChanges && !(durable && indexUndurable)) return;
+        this.bindings.writeHostIndex(this.projectRecord.name, hostIndex, durable);
+        indexChanges = 0;
+        indexWrittenAt = Date.now();
+        indexUndurable = !durable;
+      };
       /** folders holding git objects put() installed, or a folder it made for them: fsynced before any ref or index names them */
       const objectDirs = new Set<string>();
       const put = async (rel: string, next: Next, git: GitPathKind = "none") => {
@@ -2441,7 +2462,8 @@ export class LayerfsSession {
           hostIndex[rel] = { ...fileSig(next.data, next.mode), mode: next.mode & 0o7777, mtimeMs: st.mtimeMs, size: st.size };
         }
         result.applied.push(rel);
-        this.bindings.writeHostIndex(this.projectRecord.name, hostIndex);
+        indexChanges++;
+        if (indexChanges >= INDEX_CHECKPOINT_FILES || Date.now() - indexWrittenAt >= INDEX_CHECKPOINT_MS) flushIndex(false);
       };
       try {
         for (const { rel, next, host, git } of ordered) {
@@ -2475,7 +2497,11 @@ export class LayerfsSession {
             project: this.projectRecord.name,
             warnings: result.warnings,
             restored,
-            setRecoveryDir: (dir, markers) => { this.bindings.setRecoveryDir(this.projectRecord.name, dir, markers); this.projectRecord.recoveryDir = dir; },
+            setRecoveryDir: (dir, markers) => {
+              try { flushIndex(true); } catch (we: any) { this.log(`could not save the folder's index: ${we?.message ?? we}`); }
+              this.bindings.setRecoveryDir(this.projectRecord.name, dir, markers);
+              this.projectRecord.recoveryDir = dir;
+            },
           }, reads);
           // a ref put back for a worktree added meanwhile: the folder keeps a ref main does not have
           if (restored.length) gitDiverged = true;
@@ -2490,8 +2516,9 @@ export class LayerfsSession {
                 const st = await fsp.lstat(join(this.cwd, g.rel)).catch(() => null);
                 if (st) hostIndex[g.rel] = { ...fileSig(g.next.data, g.next.mode), mtimeMs: st.mtimeMs, size: st.size };
               }
+              indexChanges++;
             }
-            this.bindings.writeHostIndex(this.projectRecord.name, hostIndex);
+            flushIndex(true);
             // logs and messages: only where the folder still has the base version
             // deletions first, deepest first, so a log namespace change (logs/refs/heads/foo -> foo/bar) works
             // (a ref put back for a new worktree keeps its log)
@@ -2503,6 +2530,7 @@ export class LayerfsSession {
             }
           }
         }
+        flushIndex(true);
         const gitSummary = gitChangeSummary(result.applied.filter((r) => gitPathKind(r) !== "none"), layout);
         if (gitSummary) result.git = gitSummary;
       } catch (e: any) {
@@ -2514,7 +2542,7 @@ export class LayerfsSession {
         if (e?.code === "RollbackIncomplete" && e.recoveryDir) {
           try { this.bindings.setRecoveryDir(this.projectRecord.name, e.recoveryDir); } catch {}
         }
-        try { this.bindings.writeHostIndex(this.projectRecord.name, hostIndex); } catch (we: any) { this.log(`could not save the folder's index: ${we?.message ?? we}`); }
+        try { indexChanges++; flushIndex(true); } catch (we: any) { this.log(`could not save the folder's index: ${we?.message ?? we}`); }
         // another session's pending recovery, adopted under the locks: apply refuses, as up front
         if (e?.code === "RecoveryPending") { e.result = result; throw e; }
         const err = new LayerfsError(e?.code ?? "PartialApply", `apply stopped after ${result.applied.length} file(s): ${e?.message ?? e}`);
@@ -3223,6 +3251,8 @@ type GitRecovery = {
 export const RECOVERY_MARKER = "minilfs-recovery";
 const RECOVERY_MARKER_RX = /(^|\/)\.git\/minilfs-recovery$/i;
 export const isRecoveryMarker = (rel: string) => RECOVERY_MARKER_RX.test(rel);
+/** A marker, a path below a marker that is a folder, or a quarantined one (`minilfs-recovery.bad-<time>`, see clearRecovery) and below. */
+export const isRecoveryMarkerTree = (rel: string) => /(^|\/)\.git\/minilfs-recovery(\.bad-[^/]+)?(\/|$)/i.test(rel);
 /** The recovery folder the folder's top-level marker (or the marker `rel`) names (the marker's own path when it names none), or null. */
 export function readFolderRecoveryMarker(cwd: string, rel = `.git/${RECOVERY_MARKER}`): string | null {
   const m = join(cwd, rel);
@@ -3966,6 +3996,9 @@ const STREAM_HASH_BYTES = 8 * 1024 * 1024;
 const SCAN_KEEP_BYTES = 64 * 1024 * 1024;
 /** Host sync writes changes through the Store (`fs.apply`) in batches of this many bytes/ops; larger drift goes through one mount. */
 const SYNC_STORE_BATCH_BYTES = 8 * 1024 * 1024;
+/** apply's checkpoints of the folder's index (no fsync) while files land: every this many files, or this often */
+const INDEX_CHECKPOINT_FILES = 200;
+const INDEX_CHECKPOINT_MS = 2000;
 const SYNC_STORE_MAX_FILES = 2000;
 async function streamSha(abs: string): Promise<string> {
   const h = createHash("sha256");

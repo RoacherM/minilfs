@@ -387,7 +387,8 @@ export async function executeLayerfsAction(
     }
     const r = await s.clearRecovery();
     hooks?.onStatusChange?.();
-    return `Cleared the pending git recovery${r.cleared ? ` (${r.cleared} removed)` : ""}; apply runs again, and main is resynced from the folder first.`;
+    const moved = r.renamed?.length ? ` A marker that was a folder was moved aside, not deleted: ${r.renamed.join(", ")}.` : "";
+    return `Cleared the pending git recovery${r.cleared ? ` (${r.cleared} removed)` : ""}; apply runs again, and main is resynced from the folder first.${moved}`;
   }
   if (action === "clean") {
     const res = await s.cleanScratch();

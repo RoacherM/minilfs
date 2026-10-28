@@ -2112,6 +2112,52 @@ try {
     assert.ok(!events.some((e) => e[0] === "sync" && /\/src\/(\.app\.js\.minilfs-|app\.js$)/.test(e[1] ?? "")), "working-tree files are not fsynced");
   });
 
+  await step("m1 a recovery marker that is a folder: its subtree never reaches main; clear quarantines it (renamed .bad-<time>, reported), never deletes it", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+    mkdirSync(join(cwd, ".git/minilfs-recovery/sub"), { recursive: true });
+    writeFileSync(join(cwd, ".git/minilfs-recovery/sub/file.txt"), "keep me\n");
+    const s = await open(cwd, "m1d");
+    const inMain = (p) => s.lfs.fs.stat("main", p).then(() => true, () => false);
+    assert.equal(await inMain("/.git/minilfs-recovery/sub/file.txt"), false, "not imported into main");
+    await s.syncHostDriftIntoMain({ full: true });
+    assert.equal(await inMain("/.git/minilfs-recovery/sub/file.txt"), false, "not synced into main");
+    assert.ok(s.recoveryDir, "a marker folder blocks apply");
+    const msg = await executeLayerfsAction(s, { action: "recover", clear: true }, { role: "lead" });
+    assert.equal(existsSync(join(cwd, ".git/minilfs-recovery")), false, "the marker is gone");
+    const bad = readdirSync(join(cwd, ".git")).filter((n) => /^minilfs-recovery\.bad-/.test(n));
+    assert.equal(bad.length, 1, readdirSync(join(cwd, ".git")).join(","));
+    assert.equal(readFileSync(join(cwd, ".git", bad[0], "sub/file.txt"), "utf8"), "keep me\n", "its content intact");
+    assert.ok(msg.includes(bad[0]), msg);
+    assert.equal(s.recoveryDir, null);
+    const sync = await s.syncHostDriftIntoMain();
+    assert.ok(!sync.synced.some((p) => p.includes("minilfs-recovery")), JSON.stringify(sync.synced));
+    assert.equal(await inMain(`/.git/${bad[0]}/sub/file.txt`), false, "the quarantined folder never reaches main");
+  });
+
+  await step("m2 apply checkpoints the folder's index without fsync while files land; the recovery transitions and the end are durable", async () => {
+    const cwd = project();
+    const s = await open(cwd, "m2i");
+    await s.mutate("1", "bash", () => s.exec("for i in $(seq 0 499); do echo $i > f$i.txt; done", cwd, out()));
+    const fs = (await import("node:fs")).default;
+    const { syncBuiltinESMExports } = await import("node:module");
+    const probe = await fsp.open(join(cwd, "a.txt"), "r");
+    const proto = Object.getPrototypeOf(probe);
+    await probe.close();
+    const real = { sync: proto.sync, fsyncSync: fs.fsyncSync };
+    let syncs = 0;
+    proto.sync = function (...args) { syncs++; return real.sync.apply(this, args); };
+    fs.fsyncSync = (fd) => { syncs++; return real.fsyncSync(fd); };
+    syncBuiltinESMExports();
+    let ap;
+    try { ap = await s.apply(); } finally { proto.sync = real.sync; fs.fsyncSync = real.fsyncSync; syncBuiltinESMExports(); }
+    assert.equal(ap.applied.length, 500);
+    assert.ok(syncs <= 10, `${syncs} fsyncs for 500 files`);
+    const idx = s.bindings.readHostIndex(s.project);
+    assert.ok(idx["f0.txt"] && idx["f499.txt"], "the index holds every applied file");
+  });
+
   await step("too-large first import is refused before copying, naming the largest folders", async () => {
     const cwd = project();
     mkdirSync(join(cwd, "big"));

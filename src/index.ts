@@ -519,7 +519,8 @@ export default function minilfsExtension(pi: ExtensionAPI) {
         if (!argv.includes("--clear")) return say(`An earlier apply could not finish putting your folder's git metadata back; its previous versions are in ${dir} (manifest.json lists them). Check the folder's git (git status, git fsck), restore what is needed, then run /minilfs recover --clear.`, "warning");
         const r = await s.clearRecovery();
         status(ctx, describe(s));
-        return say(`Cleared the pending git recovery${r.cleared ? ` (${r.cleared} removed)` : ""}; /minilfs apply runs again.`);
+        const moved = r.renamed?.length ? ` A marker that was a folder was moved aside, not deleted: ${r.renamed.join(", ")}.` : "";
+        return say(`Cleared the pending git recovery${r.cleared ? ` (${r.cleared} removed)` : ""}; /minilfs apply runs again.${moved}`);
       }
       if (sub === "apply") {
         if (role.role !== "lead") return say(ONLY_LEAD, "error");
