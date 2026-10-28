@@ -10,7 +10,7 @@ import { createProjectClient, ensureNativeDirs, initProjectClient, type NativeSp
 import { resolveExecutionDriver, type ExecutionDriver } from "./core/driver.ts";
 import { run } from "./core/exec-helper.ts";
 import { bothSpellings, buildSeatbeltProfile } from "./seatbelt.ts";
-import { decideGitPath, GIT_APPLY_ORDER, GIT_JOIN_HINT, gitChangeSummary, gitDirOf, gitPathKind, gitSig, isProtectedPath, parseIndexEntries, isSafeRefName, MERGE_UNITS, type GitPathKind } from "./gitpaths.ts";
+import { allocateRescueRef, decideGitPath, expectedType, GIT_APPLY_ORDER, GIT_JOIN_HINT, gitChangeSummary, gitPathKind, gitSig, isProtectedPath, isValidGitRefName, parseIndexEntries, isSafeRefName, MERGE_UNITS, resolveGitPath, scanGitLayout, type GitLayout, type GitPathKind } from "./gitpaths.ts";
 import { isOrphan, MountLeases } from "./mount-leases.ts";
 import { GIT_JOIN_SCRIPT, parseJoin, symbolicHead, type JoinResult } from "./gitjoin.ts";
 import { stopWorkers } from "./core/worker.ts";
@@ -867,7 +867,8 @@ export class LayerfsSession {
     const oidLen = /^\s*objectformat\s*=\s*sha256\s*$/im.test(cfg) ? 64 : 40;
     // every ref of the losing side and of the merged branch (packed-refs, then loose refs, which win), by full name
     const refs = await this.readGitRefs(losing, oidLen);
-    const existing = await this.readGitRefs(target, oidLen);
+    // every name the merged branch uses (also symbolic or unreadable refs and folders): a rescue never lands on one
+    const existing = await this.readGitRefs(target, oidLen, true);
     // the refs are named after the side they come from: the other Branch, or this session (the work branch before the merge)
     const safeLabel = (unit.kept === "ours" ? label : this.workBranch).replace(/[^A-Za-z0-9._-]/g, "-");
     const rawHead = (b: string) => this.lfs.fs.read(b, "/.git/HEAD").then((r: any) => String(r.text ?? "").trim(), () => "");
@@ -879,25 +880,20 @@ export class LayerfsSession {
     const candidates = [...refs].filter(([ref, oid]) => isSafeRefName(ref) && isOid(oid) && /^refs\/(heads|tags|minilfs)\//.test(ref) && existing.get(ref) !== oid)
       .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : x[1] < y[1] ? -1 : x[1] > y[1] ? 1 : 0));
     const detached = isOid(lostHead) && lostHead !== (await rawHead(target));
-    const needsCommit = (ref: string) => ref === "HEAD" || /^refs\/heads\//.test(ref) || /^refs\/minilfs\/[^/]+\/(heads\/|HEAD$)/.test(ref);
     const types = await this.branchObjectTypes(target, [...candidates.map(([, oid]) => oid), ...(detached ? [lostHead] : [])]);
-    const verified = (ref: string, oid: string) => { const t = types.get(oid); return Boolean(t) && (!needsCommit(ref) || t === "commit"); };
-    // a name the merged branch already uses for another commit is never overwritten nor skipped:
-    // the commit is kept as <name>-<oid12> (or <name>-<oid>)
-    const allocate = (dst: string, oid: string): string | null => {
-      for (const name of [dst, `${dst}-${oid.slice(0, 12)}`, `${dst}-${oid}`]) {
-        const cur = existing.get(name);
-        if (cur === oid) return null; // already kept there
-        if (!cur) { existing.set(name, oid); return name; }
-      }
-      return null;
-    };
+    // the type is checked for the ref's own name and for where it goes (a tag kept under refs/minilfs/<label>/tags is any type)
+    const verified = (ref: string, oid: string) => { const t = types.get(oid); return Boolean(t) && (expectedType(ref) === "any" || t === "commit"); };
     // where each ref goes in the merged .git, so nothing the losing side could reach is dropped (each
     // merge round keeps the earlier rescues): branch heads under refs/minilfs/<label>/heads/, earlier
     // rescues (refs/minilfs/*) at the same path, tags under their name (or refs/minilfs/<label>/tags/
     // when the kept side has that tag at another commit), a detached HEAD as refs/minilfs/<label>/HEAD
     const wanted: Array<[string, string]> = [];
-    const want = (dst: string, oid: string) => { const name = allocate(dst, oid); if (name) wanted.push([name, oid]); };
+    // a name the merged branch already uses (for another commit, or as a folder of refs or a ref
+    // above it) is never overwritten nor skipped: allocateRescueRef picks <name>-<oid12>, -<oid>, -<oid>-2, ...
+    const want = (dst: string, oid: string) => {
+      const a = allocateRescueRef(existing, dst, oid);
+      if (a.kind === "kept" && (expectedType(a.ref) === "any" || types.get(oid) === "commit")) wanted.push([a.ref, oid]);
+    };
     const base = new Map(existing);
     for (const [ref, oid] of candidates) {
       if (!verified(ref, oid)) continue;
@@ -906,7 +902,7 @@ export class LayerfsSession {
       } else if (ref.startsWith("refs/minilfs/")) {
         want(ref, oid);
       } else {
-        if (!base.get(ref)) want(ref, oid);
+        if (!base.has(ref) && !base.has(`${ref}/`)) want(ref, oid);
         else want(`refs/minilfs/${safeLabel}/tags/${ref.slice("refs/tags/".length)}`, oid);
       }
     }
@@ -965,7 +961,11 @@ export class LayerfsSession {
   }
 
   /** Every ref of `branch`'s git (packed-refs, then loose refs, which win) whose value is an oid of `oidLen` digits. */
-  private async readGitRefs(branch: string, oidLen: number): Promise<Map<string, string>> {
+  /**
+   * With `occupied`, also every name in use that is no oid ref (a symbolic ref, an unreadable file:
+   * value "") and every folder of refs (`<name>/`, value ""), so a new ref is never written over one.
+   */
+  private async readGitRefs(branch: string, oidLen: number, occupied = false): Promise<Map<string, string>> {
     const refs = new Map<string, string>();
     const isOid = (o: string) => o.length === oidLen && /^[0-9a-f]+$/.test(o);
     // packed-refs can exceed one fs.read window (2000 lines / 48 KiB): page through it
@@ -979,17 +979,21 @@ export class LayerfsSession {
     for (const line of packed.split("\n")) {
       const mm = /^([0-9a-f]+) (refs\/.+)$/.exec(line.trim());
       if (mm && isOid(mm[1])) refs.set(mm[2], mm[1]);
+      else if (mm && occupied) refs.set(mm[2], "");
     }
     const walk = async (dir: string, prefix: string) => {
       for (let pos = 0; ; ) {
         const page = await this.lfs.fs.list(branch, dir, 1000, pos).catch(() => null);
         for (const it of page?.items ?? []) {
           const sp = `${dir}/${it.name}`;
-          if (it.type === "dir") await walk(sp, `${prefix}${it.name}/`);
-          else if (it.type === "file") {
+          if (it.type === "dir") {
+            if (occupied) refs.set(`${prefix}${it.name}/`, "");
+            await walk(sp, `${prefix}${it.name}/`);
+          } else if (it.type === "file") {
             const oid = await this.lfs.fs.read(branch, sp).then((r: any) => String(r.text ?? "").trim(), () => "");
             if (isOid(oid)) refs.set(`${prefix}${it.name}`, oid);
-          }
+            else if (occupied) refs.set(`${prefix}${it.name}`, "");
+          } else if (occupied) refs.set(`${prefix}${it.name}`, ""); // a symlink or anything else: in use
         }
         if (!page?.hasMore || !(page?.items ?? []).length) break;
         pos = page.nextPagePos ?? (pos + page.items.length);
@@ -2123,10 +2127,13 @@ export class LayerfsSession {
 
       // 1. what the Branch has (one mount of the snapshot) and what the folder has now
       const found: Array<{ rel: string; kind: string; next: Next; host: HostEntry | null; hostRaw: RawEntry; git: GitPathKind }> = [];
+      /** the git dirs that exist in the Branch or the folder: which one a path belongs to (a submodule named a/logs) */
+      let layout: GitLayout = new Set();
       await this.withMountedBranch(snapBranch, false, "apply read", async (wsPath) => {
+        layout = scanGitLayout([wsPath, this.cwd], items.map((i) => i.path.replace(/^\/+/, "")));
         for (const it of items) {
           const rel = it.path.replace(/^\/+/, "");
-          const git = gitPathKind(rel);
+          const git = resolveGitPath(rel, layout).kind;
           // .lww, secrets, branch-only output, protected git files (config, hooks, ...) and git's
           // transient state (locks, in-progress operations, caches) never reach the folder
           if (rel === ".lww" || isProtectedPath(rel) || git === "transient" || this.hostSkip(rel, false)) {
@@ -2261,10 +2268,10 @@ export class LayerfsSession {
             result.warnings.push(`${why}: the files were applied, but no ref, HEAD or index was changed, so the Branch's commits are not on your branches (their objects were added; the changes show as uncommitted). Commit them in your folder, or sync the Branch and apply again.`);
           };
           for (const g of gitMeta) await checkTarget(g.rel);
-          const missing = await gitObjectsMissing(this.cwd, gitMeta);
+          const missing = await gitObjectsMissing(this.cwd, gitMeta, layout);
           const locked = gitMeta.filter((g) => g.git !== "soft");
           if (!missing) hostTouched = true;
-          const moved = missing ? null : await writeGitLocked(this.cwd, locked);
+          const moved = missing ? null : await writeGitLocked(this.cwd, locked, layout);
           if (missing) dropMeta(`the Branch's git names objects your folder does not have (${missing})`);
           else if (moved) dropMeta(`your folder's git moved while applying (${moved})`);
           else {
@@ -2287,7 +2294,7 @@ export class LayerfsSession {
             }
           }
         }
-        const gitSummary = gitChangeSummary(result.applied.filter((r) => gitPathKind(r) !== "none"));
+        const gitSummary = gitChangeSummary(result.applied.filter((r) => gitPathKind(r) !== "none"), layout);
         if (gitSummary) result.git = gitSummary;
       } catch (e: any) {
         for (const t of tmps) await fsp.rm(t, { force: true }).catch(() => {});
@@ -2618,20 +2625,18 @@ const cleanGitEnv = (home = "/var/empty"): NodeJS.ProcessEnv => ({
   GIT_ATTR_NOSYSTEM: "1",
   GIT_TERMINAL_PROMPT: "0",
 });
-/** A ref a symbolic ref may name: under refs/, no `.`/`..` component (it is looked up as a path). */
-const isRefTarget = (r: string) => /^refs\/\S+$/.test(r) && !/(^|\/)\.\.?(\/|$)/.test(r) && !r.includes("//");
-/** Refs that must name a commit: HEAD, branch heads (and minilfs's rescues of them). */
-const wantsCommit = (inner: string) => inner === "HEAD" || inner.startsWith("refs/heads/") || /^refs\/minilfs\/[^/]+\/(heads\/|HEAD$)/.test(inner);
-
 /**
- * What `name` (a ref of git dir `dir`) resolves to once `meta` is written: an oid, null (no such
- * ref), or "loop" (more than 5 symbolic hops). Planned refs first, then the folder's loose ref, then
+ * What `name` (a ref of git dir `dir`) resolves to once `meta` is written: `{ oid, chain }` (chain:
+ * every ref name visited, `name` first), null (no such ref, or a hop to a name git refuses), or
+ * "loop" (more than 5 symbolic hops). Planned refs first, then the folder's loose ref, then
  * packed-refs (the planned one, else the folder's), as git looks them up.
  */
-async function resolveRefAfter(cwd: string, dir: string, name: string, meta: GitWrite[]): Promise<string | null | "loop"> {
+async function resolveRefAfter(cwd: string, dir: string, name: string, meta: GitWrite[]): Promise<{ oid: string; chain: string[] } | null | "loop"> {
   const planned = (inner: string) => meta.find((g) => g.rel === `${dir}/${inner}`);
   const content = (g: GitWrite) => (g.next?.kind === "file" ? g.next.data.toString("utf8") : null);
+  const chain: string[] = [];
   for (let hop = 0; hop < 5; hop++) {
+    chain.push(name);
     const p = planned(name);
     const text = p ? content(p) : await fsp.readFile(join(cwd, dir, name), "utf8").catch(() => null);
     if (text === null) {
@@ -2639,13 +2644,13 @@ async function resolveRefAfter(cwd: string, dir: string, name: string, meta: Git
       const packed = pp ? (content(pp) ?? "") : await fsp.readFile(join(cwd, dir, "packed-refs"), "utf8").catch(() => "");
       for (const line of packed.split("\n")) {
         const m = /^([0-9a-f]+) (\S+)$/.exec(line);
-        if (m && m[2] === name) return m[1];
+        if (m && m[2] === name) return { oid: m[1], chain };
       }
       return null;
     }
     const m = /^ref: (\S+)$/.exec(text.trim());
-    if (!m) return text.trim();
-    if (!isRefTarget(m[1])) return null;
+    if (!m) return { oid: text.trim(), chain };
+    if (!isValidGitRefName(m[1])) return null;
     name = m[1];
   }
   return "loop";
@@ -2660,15 +2665,15 @@ async function resolveRefAfter(cwd: string, dir: string, name: string, meta: Git
  * what the folder's refs already reach). git runs with cleanGitEnv, no hooks, no fsmonitor. A ref
  * written by a file tool, or objects never added, would otherwise leave the folder's git broken.
  */
-async function gitObjectsMissing(cwd: string, meta: GitWrite[]): Promise<string | null> {
+async function gitObjectsMissing(cwd: string, meta: GitWrite[], layout?: GitLayout): Promise<string | null> {
   type Want = "commit" | "blob" | "any";
   type Dir = { want: Map<string, Set<Want>>; tips: Set<string>; peeled: Array<[string, string]>; symrefs: Array<[string, string]>; addsHeads: boolean };
   const byDir = new Map<string, Dir>();
   for (const g of meta) {
     if (g.git === "soft" || !g.next || g.next.kind !== "file") continue;
-    const dir = gitDirOf(g.rel, cwd);
+    // the same reading of the path as apply's (resolveGitPath with the layout), so its git dir is the one checked
+    const { gitDir: dir, tail: inner } = resolveGitPath(g.rel, layout);
     if (!dir) continue;
-    const inner = g.rel.slice(dir.length + 1);
     let d = byDir.get(dir);
     if (!d) byDir.set(dir, (d = { want: new Map(), tips: new Set(), peeled: [], symrefs: [], addsHeads: false }));
     const need = (oid: string, w: Want) => d!.want.set(oid, (d!.want.get(oid) ?? new Set<Want>()).add(w));
@@ -2693,22 +2698,24 @@ async function gitObjectsMissing(cwd: string, meta: GitWrite[]): Promise<string 
           continue;
         }
         const m = /^([0-9a-f]+) (\S+)$/.exec(line);
-        if (!m || !isRefTarget(m[2])) return `${g.rel} has a malformed line`;
-        need(m[1], wantsCommit(m[2]) ? "commit" : "any");
+        if (!m || !isValidGitRefName(m[2])) return `${g.rel} has a malformed line`;
+        need(m[1], expectedType(m[2]));
         d.tips.add(m[1]);
         if (m[2].startsWith("refs/heads/")) d.addsHeads = true;
         last = m[1];
       }
     } else {
       const t = text.trim();
+      // a loose ref git would refuse by name (refs/heads/a..b) breaks every git command that lists refs
+      if (inner !== "HEAD" && !isValidGitRefName(inner)) return `${g.rel} is not a valid ref name`;
       if (t.startsWith("ref:")) {
         const m = /^ref: (\S+)$/.exec(t);
-        if (!m || !isRefTarget(m[1])) return `${g.rel} is not a ref`;
+        if (!m || !isValidGitRefName(m[1])) return `${g.rel} is not a ref`;
         d.symrefs.push([inner, m[1]]);
         continue;
       }
       if (!/^[0-9a-f]+$/.test(t)) return `${g.rel} is not a ref`;
-      need(t, wantsCommit(inner) ? "commit" : "any");
+      need(t, expectedType(inner));
       d.tips.add(t);
       if (inner.startsWith("refs/heads/")) d.addsHeads = true;
     }
@@ -2731,9 +2738,12 @@ async function gitObjectsMissing(cwd: string, meta: GitWrite[]): Promise<string 
         unborn = target;
         continue;
       }
-      if (!isOid(r)) return `${dir}/${inner} names ${target}, which is not a ref`;
-      d.want.set(r, (d.want.get(r) ?? new Set<Want>()).add(inner === "HEAD" ? "commit" : "any"));
-      d.tips.add(r);
+      if (!isOid(r.oid)) return `${dir}/${inner} names ${target}, which is not a ref`;
+      // a branch (or HEAD) anywhere on the chain must end at a commit: refs/heads/x -> refs/tags/blob is refused
+      const chain = [inner, ...r.chain];
+      d.want.set(r.oid, (d.want.get(r.oid) ?? new Set<Want>()).add(chain.some((n) => expectedType(n) === "commit") ? "commit" : "any"));
+      d.tips.add(r.oid);
+      if (chain.some((n) => n.startsWith("refs/heads/"))) d.addsHeads = true;
     }
     const oids = [...d.want.keys()];
     const bad = oids.find((o) => !isOid(o));
@@ -2784,7 +2794,7 @@ async function gitObjectsMissing(cwd: string, meta: GitWrite[]): Promise<string 
  * the bytes it had (all or nothing). Returns why nothing was written (a lock git holds, a path that
  * moved), or null when all were written; an I/O error is thrown after the rollback.
  */
-async function writeGitLocked(cwd: string, items: GitWrite[]): Promise<string | null> {
+async function writeGitLocked(cwd: string, items: GitWrite[], layout?: GitLayout): Promise<string | null> {
   const depth = (r: string) => r.split("/").length;
   const below = (a: string, b: string) => a.startsWith(`${b}/`);
   const deletes = items.filter((i) => !i.next).sort((a, b) => depth(b.rel) - depth(a.rel));
@@ -2834,7 +2844,7 @@ async function writeGitLocked(cwd: string, items: GitWrite[]): Promise<string | 
       try {
         if ((await fsp.lstat(target).catch(() => null))?.isDirectory()) await fsp.rmdir(target);
         else await fsp.rm(target, { force: true });
-        if (!old) { await removeEmptyGitRefParents(cwd, rel); continue; }
+        if (!old) { await removeEmptyGitRefParents(cwd, rel, layout); continue; }
         await fsp.mkdir(dirname(target), { recursive: true });
         const tmp = join(dirname(target), `.${basename(rel)}.minilfs-${randomBytes(4).toString("hex")}`);
         await fsp.writeFile(tmp, old.data, { mode: old.mode });
@@ -2876,7 +2886,7 @@ async function writeGitLocked(cwd: string, items: GitWrite[]): Promise<string | 
     }
     for (const d of deletes) {
       await unlock(d.rel);
-      await removeEmptyGitRefParents(cwd, d.rel);
+      await removeEmptyGitRefParents(cwd, d.rel, layout);
     }
     return null;
   } catch (e) {
@@ -2888,8 +2898,8 @@ async function writeGitLocked(cwd: string, items: GitWrite[]): Promise<string | 
 }
 
 /** Removes folders a deleted ref leaves empty, below `<git dir>/refs/<kind>/` (never refs/, refs/heads/, ...). */
-async function removeEmptyGitRefParents(root: string, rel: string): Promise<void> {
-  const dir = gitDirOf(rel);
+async function removeEmptyGitRefParents(root: string, rel: string, layout?: GitLayout): Promise<void> {
+  const dir = resolveGitPath(rel, layout).gitDir;
   if (!dir) return;
   for (let d = posix.dirname(rel); ; d = posix.dirname(d)) {
     const inner = d.slice(dir.length + 1);

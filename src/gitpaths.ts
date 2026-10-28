@@ -89,14 +89,11 @@ export function splitGitPath(rel: string): { dir: string; inner: string } | null
 export type GitPathKind = "none" | "protected" | "transient" | "object" | "ref" | "head" | "index" | "soft";
 
 export function gitPathKind(rel: string): GitPathKind {
-  const g = splitGitPath(rel);
-  if (!g) return "none";
-  if (!g.inner) return "protected"; // the `.git` entry itself as a file or symlink (gitdir pointer)
-  if (/^modules\//.test(g.inner) && g.inner.split("/").some((c) => REFUSED_COMPONENT_RX.test(c))) return "protected";
-  if (new RegExp(DOT_COMPONENT_RX).test(g.inner)) return "protected";
-  if (!ALLOWED_RX.test(g.inner)) return "protected";
-  // the git directory this path belongs to may be nested (modules/<name>/, worktrees/<id>/): classify by the tail
-  const inner = innerOfGitDir(g.inner);
+  return resolveGitPath(rel).kind;
+}
+
+/** How a path below its own git directory (`refs/heads/x`, `index`, ...) is applied. */
+function classifyGitTail(inner: string): GitPathKind {
   if (/\.(lock|new)$/.test(inner)) return "transient"; // git's temp files: renamed over the real one
   if (/^(rebase-merge|rebase-apply|sequencer|rr-cache)(\/|$)/.test(inner)) return "transient";
   if (/^(FETCH_HEAD|MERGE_[A-Z_]+|AUTO_MERGE|SQUASH_MSG|CHERRY_PICK_HEAD|REVERT_HEAD|REBASE_HEAD|BISECT_[A-Z_]+|gc\.pid|gc\.log)$/.test(inner)) return "transient";
@@ -109,6 +106,63 @@ export function gitPathKind(rel: string): GitPathKind {
   if (inner === "index") return "index";
   if (/^refs\//.test(inner) || inner === "packed-refs") return "ref";
   return "soft";
+}
+
+/** The git directories that exist (HEAD a file, objects/ and refs/ folders), relative paths such as `.git/modules/a/logs`. */
+export type GitLayout = ReadonlySet<string>;
+/** A git path read as `<gitDir>/<tail>` and what apply does with it. */
+export interface ResolvedGitPath { gitDir: string | null; tail: string; kind: GitPathKind }
+
+/** How strictly apply treats a kind (higher: stricter); see resolveGitPath. */
+const STRICTNESS: Record<GitPathKind, number> = { none: 0, soft: 1, object: 2, ref: 3, index: 3, head: 3, protected: 4, transient: 5 };
+
+/**
+ * Which git directory `rel` belongs to and its kind. Protected is decided on the whole path (no
+ * layout can lift it). A submodule name may contain `/`, so `modules/a/logs/index` is the reflog
+ * folder of submodule `a` or the index of submodule `a/logs`: the reading by name (pickByName) and
+ * every reading whose git dir exists in `layout` (scanGitLayout over the Branch and the folder)
+ * are considered, and the strictest wins (transient: never applied; ref/HEAD/index: locked and
+ * checked; object, soft: unchecked), the most specific git dir among equals. A layout comes partly
+ * from the Branch (agent-made): a fake git dir (`refs/heads/{HEAD,objects,refs}`) can then only
+ * make a path stricter, never turn a ref into an unchecked log or object.
+ */
+export function resolveGitPath(rel: string, layout?: GitLayout): ResolvedGitPath {
+  const g = splitGitPath(rel);
+  if (!g) return { gitDir: null, tail: "", kind: "none" };
+  const protectedPath: ResolvedGitPath = { gitDir: g.dir, tail: g.inner, kind: "protected" };
+  if (!g.inner) return protectedPath; // the `.git` entry itself as a file or symlink (gitdir pointer)
+  if (/^modules\//.test(g.inner) && g.inner.split("/").some((c) => REFUSED_COMPONENT_RX.test(c))) return protectedPath;
+  if (new RegExp(DOT_COMPONENT_RX).test(g.inner)) return protectedPath;
+  if (!ALLOWED_RX.test(g.inner)) return protectedPath;
+  const all = candidateGitDirs(g.dir, g.inner);
+  const byName = pickByName(all);
+  if (!byName) return protectedPath;
+  let best: ResolvedGitPath = { ...byName, kind: classifyGitTail(byName.tail) };
+  for (const c of all) {
+    if (c === byName || !layout?.has(c.gitDir)) continue;
+    const kind = classifyGitTail(c.tail);
+    if (STRICTNESS[kind] > STRICTNESS[best.kind] || (STRICTNESS[kind] === STRICTNESS[best.kind] && c.gitDir.length > (best.gitDir?.length ?? 0))) best = { ...c, kind };
+  }
+  return best;
+}
+
+/**
+ * The git dirs among the candidate readings of `relPaths` that exist under any of `roots` (the
+ * Branch's mount and the folder), for resolveGitPath.
+ */
+export function scanGitLayout(roots: string[], relPaths: string[]): Set<string> {
+  const seen = new Set<string>();
+  const layout = new Set<string>();
+  for (const rel of relPaths) {
+    const g = splitGitPath(rel);
+    if (!g || !g.inner) continue;
+    for (const gitDir of [g.dir, ...candidateGitDirs(g.dir, g.inner).map((c) => c.gitDir)]) {
+      if (seen.has(gitDir)) continue;
+      seen.add(gitDir);
+      if (roots.some((r) => hasGitLayout(join(r, gitDir)))) layout.add(gitDir);
+    }
+  }
+  return layout;
 }
 
 const BODY_RX = new RegExp(`^(${GIT_ALLOWED_BODY})$`);
@@ -156,17 +210,18 @@ function pickGitDir(dir: string, inner: string, cwd?: string): { gitDir: string;
     const onDisk = all.filter((c) => hasGitLayout(join(cwd, c.gitDir)));
     if (onDisk.length) return onDisk[onDisk.length - 1];
   }
+  return pickByName(all);
+}
+
+/** By name only (see pickGitDir); an element of `all`. A transient folder (rebase-merge/, ...) is a namespace too. */
+function pickByName(all: Array<{ gitDir: string; tail: string }>): { gitDir: string; tail: string } | null {
+  if (!all.length) return null;
   const inNamespace = (c: { gitDir: string }, i: number) => all.slice(0, i).some((s) => {
     const rel = c.gitDir.slice(s.gitDir.length + 1);
-    return /^(logs|objects|info|lfs)(\/|$)/.test(rel) || /^refs\/[^/]+/.test(rel);
+    return /^(logs|objects|info|lfs|rebase-merge|rebase-apply|sequencer|rr-cache)(\/|$)/.test(rel) || /^refs\/[^/]+/.test(rel);
   });
   const ok = all.filter((c, i) => i === 0 || !inNamespace(c, i));
   return ok[ok.length - 1];
-}
-
-/** The path below its own git directory: `modules/a/b/refs/x` -> `refs/x` (see pickGitDir). */
-function innerOfGitDir(inner: string): string {
-  return pickGitDir("", inner)?.tail ?? inner;
 }
 
 /**
@@ -222,12 +277,12 @@ export function decideGitPath(kind: GitPathKind, host: string | null, base: stri
 }
 
 /** One line on the git metadata among changed paths (views hide `.git`; this says what apply does to it). */
-export function gitChangeSummary(paths: string[]): string {
+export function gitChangeSummary(paths: string[], layout?: GitLayout): string {
   const refs: string[] = [];
   let head = false, index = false, objects = 0, other = 0;
   for (const raw of paths) {
     const rel = String(raw).replace(/^\/+/, "");
-    const kind = gitPathKind(rel);
+    const kind = resolveGitPath(rel, layout).kind;
     if (kind === "none") continue;
     if (kind === "ref") refs.push(splitGitPath(rel)!.inner);
     else if (kind === "head") head = true;
@@ -358,7 +413,68 @@ export const GIT_JOIN_HINT = (ref: string) =>
  * comes from another Branch's `.git` and is shown in a command, so anything unusual is left out.
  */
 export function isSafeRefName(name: string): boolean {
-  return /^[A-Za-z0-9._\/-]{1,200}$/.test(name)
+  return /^[A-Za-z0-9._\/-]{1,200}$/.test(name) && !name.includes("@{")
     && !/(^|\/)\./.test(name) && !/\.\./.test(name) && !/\/\//.test(name)
     && !/(^\/|\/$|\.lock$|\.$|^-)/.test(name) && !/(^|\/)\.lock(\/|$)/.test(name);
+}
+
+/**
+ * A full ref name git accepts (the rules of `git check-ref-format`): under refs/, no control
+ * character, space or `~^:?*[\\`, no `..`, `@{`, `//`, trailing `/` or `.`, no component that starts
+ * with `.` or ends with `.lock`. A name git would refuse is never written to the folder (git would
+ * then fail on every command that lists refs).
+ */
+export function isValidGitRefName(ref: string): boolean {
+  if (!ref.startsWith("refs/") || ref.length <= 5 || ref.length > 255) return false;
+  if (/[\x00-\x20\x7f~^:?*[\\]/.test(ref)) return false;
+  if (ref.includes("..") || ref.includes("@{") || ref.includes("//") || ref.endsWith("/") || ref.endsWith(".")) return false;
+  return ref.split("/").every((c) => c.length > 0 && !c.startsWith(".") && !c.toLowerCase().endsWith(".lock"));
+}
+
+/**
+ * The object type a ref must name: HEAD, branch heads and minilfs's rescues of them a commit; any
+ * other ref (tags, notes, ...) anything. For a symbolic ref, every name on its chain counts
+ * (`refs/heads/x` -> `refs/tags/t` must still end at a commit).
+ */
+export function expectedType(inner: string): "commit" | "any" {
+  return inner === "HEAD" || inner.startsWith("refs/heads/") || /^refs\/minilfs\/[^/]+\/(heads\/|HEAD$)/.test(inner) ? "commit" : "any";
+}
+
+export type RescueAllocation = { kind: "kept" | "already"; ref: string };
+
+/**
+ * Where a rescued ref (`oid`, preferred name `dst`) goes among `existing` (full ref name -> oid, ""
+ * for a name in use that holds no oid; a key ending in `/` is a folder of refs; the chosen name is
+ * added): `dst`, then `dst-<oid12>`, `dst-<oid>`, `dst-<oid>-2`, `-3`, ... The first name that already
+ * holds `oid` means it is kept already; else the first that is free and is neither a folder of refs
+ * nor inside a ref (git keeps refs as paths: `foo` and `foo/bar` cannot both exist). A ref above
+ * `dst` blocks every suffix, so that component is renamed (`<ancestor>-<oid12>/...`) and the search
+ * restarts. Always answers (`existing` is finite): nothing is dropped.
+ */
+export function allocateRescueRef(existing: Map<string, string>, dst: string, oid: string): RescueAllocation {
+  const names = function* (d: string) {
+    yield d;
+    yield `${d}-${oid.slice(0, 12)}`;
+    yield `${d}-${oid}`;
+    for (let n = 2; ; n++) yield `${d}-${oid}-${n}`;
+  };
+  for (;;) {
+    let ancestor: string | null = null;
+    for (const cand of names(dst)) {
+      if (existing.get(cand) === oid) return { kind: "already", ref: cand };
+      let clash = false;
+      for (const k of existing.keys()) {
+        if (!k.endsWith("/") && cand.startsWith(`${k}/`)) { ancestor = k; break; }
+        if (k === cand || k.startsWith(`${cand}/`)) clash = true;
+      }
+      if (ancestor) break;
+      if (!clash) {
+        existing.set(cand, oid);
+        return { kind: "kept", ref: cand };
+      }
+    }
+    // the suffix never leaves the ancestor's subtree (a suffix has no `/`): rename that component
+    if (!ancestor || ancestor.split("/").length < 2) throw new Error(`no place for ${dst}: ${ancestor} is a ref`);
+    dst = `${ancestor}-${oid.slice(0, 12)}${dst.slice(ancestor.length)}`;
+  }
 }

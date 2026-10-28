@@ -263,6 +263,45 @@ try {
     assert.equal(core.gitPathKind(".git/modules/x/refs/heads/index"), "ref");
   });
 
+  await step("F3 F5 F6 git paths: expectedType on every ref kind; the rescue allocator always answers and avoids D/F names; resolveGitPath reads the layout; check-ref-format names", async () => {
+    const g = await import("../src/gitpaths.ts");
+    // F3
+    for (const r of ["HEAD", "refs/heads/x", "refs/minilfs/w1/heads/x", "refs/minilfs/w1/HEAD"]) assert.equal(g.expectedType(r), "commit", r);
+    for (const r of ["refs/tags/t", "refs/notes/commits", "refs/minilfs/w1/tags/t"]) assert.equal(g.expectedType(r), "any", r);
+    // F5: dst, dst-oid12 and dst-oid all hold other objects -> dst-oid-2, never null
+    const oid = "1".repeat(40), other = "2".repeat(40), dst = "refs/minilfs/w1/heads/foo";
+    let ex = new Map([[dst, other], [`${dst}-${oid.slice(0, 12)}`, other], [`${dst}-${oid}`, other]]);
+    assert.deepEqual(g.allocateRescueRef(ex, dst, oid), { kind: "kept", ref: `${dst}-${oid}-2` });
+    assert.equal(ex.get(`${dst}-${oid}-2`), oid, "the chosen name is taken from now on");
+    assert.deepEqual(g.allocateRescueRef(ex, dst, oid), { kind: "already", ref: `${dst}-${oid}-2` });
+    // a descendant (folder of refs) or an ancestor (a ref above it) occupies the name
+    ex = new Map([[`${dst}/bar`, other]]);
+    assert.deepEqual(g.allocateRescueRef(ex, dst, oid), { kind: "kept", ref: `${dst}-${oid.slice(0, 12)}` });
+    ex = new Map([[`${dst}/bar`, other], [`${dst}-${oid.slice(0, 12)}/x`, other]]);
+    assert.deepEqual(g.allocateRescueRef(ex, dst, oid), { kind: "kept", ref: `${dst}-${oid}` }, "both folders of refs skipped");
+    // an ancestor ref (refs/minilfs/w1/heads/foo is a file, dst below it): every candidate is below it too
+    ex = new Map([[dst, other]]);
+    assert.deepEqual(g.allocateRescueRef(ex, `${dst}/sub`, oid), { kind: "kept", ref: `${dst}-${oid.slice(0, 12)}/sub` }, "the blocking component is renamed");
+    ex = new Map([["refs/minilfs/w1/heads/", ""], [`${dst}/`, ""], [`${dst}/x`, other]]);
+    assert.deepEqual(g.allocateRescueRef(ex, dst, oid), { kind: "kept", ref: `${dst}-${oid.slice(0, 12)}` }, "a folder of refs (key with /) is no ancestor ref");
+    // F6: a submodule named a/logs is its own git dir once the layout says so
+    const t = join(dir, "f6");
+    for (const d of [".git/modules/a/logs/objects", ".git/modules/a/logs/refs/heads", ".git/modules/a/objects", ".git/modules/a/refs"]) mkdirSync(join(t, d), { recursive: true });
+    writeFileSync(join(t, ".git/modules/a/logs/HEAD"), "ref: refs/heads/main\n");
+    const layout = g.scanGitLayout([t], [".git/modules/a/logs/index", ".git/modules/a/logs/refs/heads/main"]);
+    assert.ok(layout.has(".git/modules/a/logs"), [...layout].join(","));
+    assert.deepEqual(g.resolveGitPath(".git/modules/a/logs/index", layout), { gitDir: ".git/modules/a/logs", tail: "index", kind: "index" });
+    assert.equal(g.resolveGitPath(".git/modules/a/logs/index").kind, "soft", "by name alone: a reflog folder");
+    // a made-up git dir can only make a path stricter: a ref of x never becomes a log or an object
+    const fake = new Set([".git/modules/x/refs/heads/logs"]);
+    assert.equal(g.resolveGitPath(".git/modules/x/refs/heads/logs/refs/y", fake).kind, "ref");
+    assert.equal(g.resolveGitPath(".git/modules/x/rebase-merge/s/HEAD", new Set([".git/modules/x/rebase-merge/s"])).kind, "transient");
+    // m: check-ref-format
+    for (const bad of ["refs/heads/a..b", "refs/heads/a@{0}", "refs/heads/foo.lock", "refs/heads/foo.lock/bar", "refs/heads/.hidden", "refs/heads/a b", "refs/heads/a:b", "refs/heads/x/", "refs/heads/x.", "heads/x", "refs/heads/a\\b"]) assert.equal(g.isValidGitRefName(bad), false, bad);
+    for (const ok of ["refs/heads/feat/x-1", "refs/tags/v1.2", "refs/minilfs/s-1/heads/main"]) assert.equal(g.isValidGitRefName(ok), true, ok);
+    assert.equal(g.isSafeRefName("a@{0}"), false);
+  });
+
   await step("config: a bad number is a start problem, never NaN; new defaults fit a full-tree import", async () => {
     const { resolveConfig } = await import("../src/config.ts");
     const c = resolveConfig({ MINILFS_INIT_TIMEOUT_MS: "5min", MINILFS_MAX_IMPORT_FILES: "-1" });

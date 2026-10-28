@@ -23,9 +23,17 @@ export {
 } from "../workspace.ts";
 
 export {
+  allocateRescueRef,
   decideGitPath,
+  expectedType,
   gitChangeSummary,
   gitPathKind,
+  isValidGitRefName,
+  resolveGitPath,
+  scanGitLayout,
+  type GitLayout,
+  type RescueAllocation,
+  type ResolvedGitPath,
   gitSig,
   indexEntries,
   parseIndexEntries,

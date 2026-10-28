@@ -1305,6 +1305,87 @@ try {
     assert.match(o.text(), /FSCK-OK/);
   });
 
+  await step("F3 a symbolic branch ref that ends at a blob (1 or 2 hops) is refused; the folder gets no such branch", async () => {
+    for (const [name, script] of [
+      ["symbranch", "git tag tblob $(git rev-parse HEAD:a.txt) && git symbolic-ref refs/heads/symbranch refs/tags/tblob"],
+      ["sym2", "git tag tblob $(git rev-parse HEAD:a.txt) && git symbolic-ref refs/tags/sym1 refs/tags/tblob && git symbolic-ref refs/heads/sym2 refs/tags/sym1"],
+    ]) {
+      const cwd = project();
+      const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+      g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+      const s = await open(cwd, `f3-${name}`);
+      const o = out();
+      await s.mutate("1", "bash", () => s.exec(`${script} && cat .git/refs/heads/${name}`, cwd, o));
+      assert.match(o.text(), /^ref: refs\/tags\//m, o.text());
+      const ap = await s.apply();
+      assert.match(ap.warnings.join("\n"), /is a blob, not a commit/, `${name}: ${ap.warnings.join("\n")}`);
+      assert.equal(existsSync(join(cwd, `.git/refs/heads/${name}`)), false, `${name} not created in the folder`);
+      assert.equal(spawnSync("git", ["-C", cwd, "fsck", "--no-progress"]).status, 0);
+    }
+  });
+
+  await step("F6 a submodule git dir named a/logs: its index is checked and locked as an index, not applied as a log", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+    mkdirSync(join(cwd, ".git/modules/a"), { recursive: true });
+    const sub = join(cwd, ".git/modules/a/logs");
+    assert.equal(spawnSync("git", ["init", "-q", "--bare", sub]).status, 0);
+    const gs = (...a) => spawnSync("git", ["--git-dir", sub, "--work-tree", cwd, ...a], { encoding: "utf8" });
+    const realBlob = gs("hash-object", "-w", join(cwd, "a.txt")).stdout.trim();
+    gs("update-index", "--add", "--cacheinfo", `100644,${realBlob},a.txt`);
+    // a commit, so refs/ and objects/ are not empty folders (git needs them to see a repository)
+    const tree = gs("write-tree").stdout.trim();
+    const sc = spawnSync("git", ["--git-dir", sub, "-c", "user.email=t@t", "-c", "user.name=t", "commit-tree", tree, "-m", "s"], { encoding: "utf8" }).stdout.trim();
+    gs("update-ref", "refs/heads/main", sc);
+    const before = readFileSync(join(sub, "index"));
+    const s = await open(cwd, "f6");
+    const bogus = "ab".repeat(20);
+    const ob = out();
+    await s.mutate("1", "bash", () => s.exec(`git --git-dir=.git/modules/a/logs --work-tree=. update-index --add --cacheinfo 100644,${bogus},x.txt; echo rc=$?`, cwd, ob));
+    assert.match(ob.text(), /rc=0/, ob.text());
+    const ap = await s.apply();
+    assert.match(ap.warnings.join("\n"), /missing in \.git\/modules\/a\/logs/, ap.warnings.join("\n"));
+    assert.ok(readFileSync(join(sub, "index")).equals(before), "the submodule's index is unchanged");
+    assert.ok(!gs("ls-files").stdout.includes("x.txt"));
+  });
+
+  await step("F5 a rescue whose name is a folder of refs on the kept side goes beside it (no failed rescue, nothing dropped)", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+    const c0 = g("rev-parse", "HEAD").stdout.trim();
+    const lead = await open(cwd, "f5-lead"), w1 = await open(cwd, "f5-w1");
+    const env = "export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t;";
+    const label = w1.workBranch;
+    const o1 = out();
+    await w1.mutate("1", "bash", () => w1.exec(`${env} git checkout -q -b foo && echo f > f.txt && git add f.txt && git commit -qm on-foo && git rev-parse HEAD && git checkout -q main`, cwd, o1));
+    const cf = o1.text().trim().split("\n")[0];
+    // the lead already has refs/minilfs/<w1>/heads/foo/bar (a folder where foo would go), and commits after w1 (its .git wins)
+    await lead.mutate("2", "bash", () => lead.exec(`${env} git update-ref refs/minilfs/${label}/heads/foo/bar ${c0} && echo l > l.txt && git add l.txt && git commit -qm by-lead`, cwd, out()));
+    const m = await lead.mergeBranch(w1.workBranch);
+    assert.ok(m.merged, JSON.stringify(m.conflicts));
+    assert.doesNotMatch(m.gitNote ?? "", /failed/, m.gitNote);
+    const o = out();
+    await lead.mutate("3", "bash", () => lead.exec("git for-each-ref --format='%(objectname) %(refname)'; git fsck --no-progress >/dev/null 2>&1 && echo FSCK-OK", cwd, o));
+    const lines = o.text().split("\n");
+    assert.ok(lines.includes(`${cf} refs/minilfs/${label}/heads/foo-${cf.slice(0, 12)}`), `foo kept beside the folder: ${o.text()}`);
+    assert.ok(lines.includes(`${c0} refs/minilfs/${label}/heads/foo/bar`), `the lead's ref untouched: ${o.text()}`);
+    assert.match(o.text(), /FSCK-OK/);
+  });
+
+  await step("m packed-refs or a loose ref with a name git refuses (a..b) is not applied", async () => {
+    const cwd = project();
+    const g = (...a) => spawnSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...a], { encoding: "utf8" });
+    g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "c1");
+    const head = g("rev-parse", "HEAD").stdout.trim();
+    const s = await open(cwd, "m-ref");
+    await s.mutate("1", "write", () => s.writeFile(join(cwd, ".git/packed-refs"), `# pack-refs with: peeled fully-peeled sorted \n${head} refs/heads/a..b\n`));
+    const ap = await s.apply();
+    assert.match(ap.warnings.join("\n"), /packed-refs has a malformed line/, ap.warnings.join("\n"));
+    assert.equal(existsSync(join(cwd, ".git/packed-refs")), false);
+  });
+
   await step("too-large first import is refused before copying, naming the largest folders", async () => {
     const cwd = project();
     mkdirSync(join(cwd, "big"));
